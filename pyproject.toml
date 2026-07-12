@@ -23,10 +23,14 @@ dependencies = [
     "scikit-image>=0.25.2",
     "scikit-learn>=1.3",
     "scipy>=1.11",
-    "torch>=2.6.0",
+    "flash-attn==2.8.4; sys_platform == 'win32' and python_version == '3.11'",
+    "torch>=2.6.0; sys_platform != 'win32'",
+    "torch==2.13.0; sys_platform == 'win32'",
     "torchinfo>=1.8.0",
-    "torchvision>=0.21.0",
+    "torchvision>=0.21.0; sys_platform != 'win32'",
+    "torchvision==0.28.0; sys_platform == 'win32'",
     "transformers>=4.49.0",
+    "triton-windows; sys_platform == 'win32'",
     "verovio==5.0.0",
     "wand>=0.6.13",
     "wandb>=0.19.6",
@@ -50,3 +54,19 @@ include = ["musvit", "experiments", "README.md", "pyproject.toml"]
 
 [tool.uv]
 package = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+flash-attn = [
+    { url = "https://github.com/sdbds/flash-attention-for-windows/releases/download/2.8.4/flash_attn-2.8.4+cu130torch2.13.0cxx11abiFALSEfullbackward-cp311-cp311-win_amd64.whl", marker = "sys_platform == 'win32' and python_version == '3.11'" },
+]
+torch = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'win32'" },
+]
+torchvision = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'win32'" },
+]

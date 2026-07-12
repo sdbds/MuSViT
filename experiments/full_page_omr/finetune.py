@@ -27,7 +27,8 @@ DATASETS_TYPE = {
 def main(config: ExperimentConfig, experiment_name,
          foundation_architecture="ViTMAEBase", foundation_weights="carlospm12/LSMT-MAE-Base-1024-16",
          finetuning_technique="CL", from_checkpoint: str | None = None, resolution: int | None = None,
-         max_steps: int = -1, train: bool = True, starting_weights: str | None = None):
+         max_steps: int = -1, train: bool = True, starting_weights: str | None = None,
+         attention_backend: str = "auto"):
     if resolution is None:
         _globals.resolution = 1024
     else:
@@ -45,10 +46,12 @@ def main(config: ExperimentConfig, experiment_name,
     set_up_processor(model=foundation_weights)
 
     logger.info(f"Creating MuSViT ({foundation_architecture}) from the weights: {foundation_weights}")
+    logger.info(f"Decoder attention backend policy: {attention_backend}")
     config = SMTFoundationConfig(foundation_architecture=foundation_architecture, foundation_weights=foundation_weights,
                                  maxh=resolution, maxw=resolution, maxlen=7512, out_categories=len(data.train_dataset.w2i),
                                  padding_token=0, in_channels=3, w2i=data.train_dataset.w2i, i2w=data.train_dataset.i2w,
-                                 d_model=256, dim_ff=256, num_dec_layers=8)
+                                 d_model=256, dim_ff=256, num_dec_layers=8,
+                                 attention_backend=attention_backend)
     model = SMTFoundationModelForCausalLM(config)
 
     if starting_weights is None:
@@ -70,6 +73,7 @@ def main(config: ExperimentConfig, experiment_name,
 
     trainer = Trainer(max_epochs=100000, max_steps=max_steps,
                       check_val_every_n_epoch=3500,
+                      num_sanity_val_steps=0,
                       callbacks=[epoch_checkpointer, checkpointer, early_stopping], logger=wandb_logger,
                       precision='16-mixed')
 
@@ -94,7 +98,8 @@ def main(config: ExperimentConfig, experiment_name,
 def launch(config_path: str, experiment_name: str,
            foundation_architecture="ViTMAEBase", foundation_weights="carlospm12/LSMT-MAE-Base-1024-16",
            finetuning: str = "CL", from_checkpoint: str | None = None, resolution: int | None = None,
-           max_steps: int = -1, train: bool = True, starting_weights: str | None = None, learning_rate: float | None = None):
+           max_steps: int = -1, train: bool = True, starting_weights: str | None = None,
+           learning_rate: float | None = None, attention_backend: str = "auto"):
     with open(config_path, 'r') as file:
         config_dict = json.load(file)
         config = experiment_config_from_dict(config_dict)
@@ -105,7 +110,8 @@ def launch(config_path: str, experiment_name: str,
     main(config=config, experiment_name=experiment_name,
          foundation_architecture=foundation_architecture,
          foundation_weights=foundation_weights, finetuning_technique=finetuning, from_checkpoint=from_checkpoint,
-         resolution=resolution, max_steps=max_steps, train=train, starting_weights=starting_weights)
+         resolution=resolution, max_steps=max_steps, train=train, starting_weights=starting_weights,
+         attention_backend=attention_backend)
 
 
 if __name__ == "__main__":

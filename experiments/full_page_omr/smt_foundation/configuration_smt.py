@@ -6,7 +6,8 @@ class SMTFoundationConfig(PretrainedConfig):
     def __init__(self, foundation_architecture=None, foundation_weights=None,
                  maxh=512, maxw=512, maxlen=1512, out_categories=2512, padding_token=0, 
                  in_channels=1, w2i={}, i2w={}, out_dir="SMIR", 
-                 d_model=256, dim_ff=256, num_dec_layers=8, _attn_implementation_internal=None, **kwargs):
+                 d_model=256, dim_ff=256, num_dec_layers=8, attention_backend="auto",
+                 _attn_implementation_internal=None, **kwargs):
         self.architectures = ["SMT"]
         self.maxh = maxh
         self.maxw = maxw
@@ -20,6 +21,7 @@ class SMTFoundationConfig(PretrainedConfig):
         self.d_model = d_model
         self.dim_ff = dim_ff
         self.num_dec_layers = num_dec_layers
+        self.attention_backend = attention_backend
         self.foundation_architecture = foundation_architecture
         self.foundation_weights = foundation_weights
         self._attn_implementation_internal = _attn_implementation_internal
