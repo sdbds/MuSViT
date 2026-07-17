@@ -15,7 +15,8 @@ $Config = @{
     finetuning             = "CL"     # Supported: CL, SR, CL1
     encoder_training_mode  = "fine_tune" # Supported: fine_tune, linear_probe
     resolution             = $null    # $null uses the experiment default (1024)
-    max_steps              = -1       # -1 lets Lightning train without a step limit
+    max_steps              = 320000   # Absolute Trainer endpoint for the v2 baseline
+    validation_every_n_batches = 10000 # Validate by cumulative training batches
     checkpoint_every_n_epochs = 100   # Periodic full checkpoint interval
     learning_rate          = $null    # $null uses the experiment default (1e-4)
     attention_backend      = "auto"   # auto: FA2 -> SDPA -> eager fallback
@@ -191,6 +192,18 @@ if (-not [int]::TryParse([string]$Config.checkpoint_every_n_epochs, [ref]$Checkp
 }
 $Config.checkpoint_every_n_epochs = $CheckpointEveryNEpochs
 
+$ValidationEveryNBatches = 0
+if (-not [int]::TryParse([string]$Config.validation_every_n_batches, [ref]$ValidationEveryNBatches) -or $ValidationEveryNBatches -lt 1) {
+    throw "validation_every_n_batches must be a positive integer."
+}
+$Config.validation_every_n_batches = $ValidationEveryNBatches
+
+$MaxSteps = 0
+if (-not [int]::TryParse([string]$Config.max_steps, [ref]$MaxSteps) -or $MaxSteps -lt 1) {
+    throw "max_steps must be a positive integer for production training."
+}
+$Config.max_steps = $MaxSteps
+
 $SupportedFinetuningModes = @("CL", "SR", "CL1")
 if ($Config.finetuning -notin $SupportedFinetuningModes) {
     throw "Unsupported finetuning mode '$($Config.finetuning)'. Choose: $($SupportedFinetuningModes -join ', ')."
@@ -222,6 +235,7 @@ $UvArgs = [System.Collections.ArrayList]::new()
 [void]$UvArgs.Add("--finetuning=$($Config.finetuning)")
 [void]$UvArgs.Add("--encoder_training_mode=$($Config.encoder_training_mode)")
 [void]$UvArgs.Add("--max_steps=$($Config.max_steps)")
+[void]$UvArgs.Add("--validation_every_n_batches=$($Config.validation_every_n_batches)")
 [void]$UvArgs.Add("--checkpoint_every_n_epochs=$($Config.checkpoint_every_n_epochs)")
 [void]$UvArgs.Add("--train=$($Features.train.ToString().ToLowerInvariant())")
 [void]$UvArgs.Add("--attention_backend=$($Config.attention_backend)")

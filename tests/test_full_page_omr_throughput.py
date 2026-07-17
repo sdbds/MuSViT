@@ -43,6 +43,8 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
         self.assertEqual(signature.parameters["checkpoint_every_n_epochs"].default, 100)
         self.assertEqual(signature.parameters["attention_backend"].default, "auto")
         self.assertEqual(signature.parameters["encoder_training_mode"].default, "fine_tune")
+        self.assertEqual(signature.parameters["validation_every_n_batches"].default, 10000)
+        self.assertEqual(signature.parameters["max_steps"].default, 320000)
 
         config_path = REPO_ROOT / "experiments/full_page_omr/config/Polish_Scores/finetuning.json"
         with patch.object(entrypoint, "_launch") as launch:
@@ -52,11 +54,13 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                 checkpoint_every_n_epochs=37,
                 attention_backend="sdpa",
                 encoder_training_mode="linear_probe",
+                validation_every_n_batches=25000,
             )
 
         self.assertEqual(launch.call_args.kwargs["checkpoint_every_n_epochs"], 37)
         self.assertEqual(launch.call_args.kwargs["attention_backend"], "sdpa")
         self.assertEqual(launch.call_args.kwargs["encoder_training_mode"], "linear_probe")
+        self.assertEqual(launch.call_args.kwargs["validation_every_n_batches"], 25000)
 
     def test_launch_forwards_checkpoint_interval_to_main(self):
         config = {
@@ -78,10 +82,13 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                     "test-run",
                     checkpoint_every_n_epochs=37,
                     encoder_training_mode="linear_probe",
+                    validation_every_n_batches=25000,
                 )
 
         self.assertEqual(main.call_args.kwargs["checkpoint_every_n_epochs"], 37)
         self.assertEqual(main.call_args.kwargs["encoder_training_mode"], "linear_probe")
+        self.assertEqual(main.call_args.kwargs["validation_every_n_batches"], 25000)
+        self.assertEqual(main.call_args.kwargs["max_steps"], 320000)
 
     def test_checkpoint_interval_must_be_a_positive_integer(self):
         for value in (0, -1, True, 1.5):
@@ -89,6 +96,18 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                 finetune._validate_checkpoint_every_n_epochs(value)
 
         self.assertEqual(finetune._validate_checkpoint_every_n_epochs(37), 37)
+
+    def test_validation_interval_and_production_max_steps_are_validated(self):
+        for value in (0, -1, True, 1.5):
+            with self.subTest(interval=value), self.assertRaises(ValueError):
+                finetune._validate_validation_every_n_batches(value)
+        self.assertEqual(finetune._validate_validation_every_n_batches(10000), 10000)
+
+        for value in (0, -1, True, 1.5):
+            with self.subTest(max_steps=value), self.assertRaises(ValueError):
+                finetune._validate_max_steps(value, train=True)
+        self.assertEqual(finetune._validate_max_steps(320000, train=True), 320000)
+        self.assertEqual(finetune._validate_max_steps(-1, train=False), -1)
 
     def test_encoder_training_mode_is_validated(self):
         self.assertEqual(finetune._validate_encoder_training_mode("fine_tune"), "fine_tune")
@@ -127,6 +146,53 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
         self.assertEqual(checkpointer._every_n_epochs, 37)
         self.assertEqual(checkpointer.filename, "test-run_CL-epoch")
 
+    def test_metric_checkpointer_uses_v2_ser_and_keeps_two_candidates(self):
+        checkpointer = finetune._build_metric_checkpointer("test-run", "CL")
+
+        self.assertEqual(checkpointer.monitor, "val_SER_v2")
+        self.assertEqual(checkpointer.save_top_k, 2)
+        self.assertIn("{step}", checkpointer.filename)
+        self.assertIn("{val_SER_v2:.4f}", checkpointer.filename)
+
+    def test_trainer_kwargs_use_step_based_validation_without_early_stopping(self):
+        callbacks = [object(), object()]
+        logger = object()
+
+        kwargs = finetune._build_trainer_kwargs(
+            max_steps=320000,
+            validation_every_n_batches=10000,
+            callbacks=callbacks,
+            logger=logger,
+        )
+
+        self.assertEqual(kwargs["max_steps"], 320000)
+        self.assertIsNone(kwargs["check_val_every_n_epoch"])
+        self.assertEqual(kwargs["val_check_interval"], 10000)
+        self.assertEqual(kwargs["callbacks"], callbacks)
+        self.assertEqual(len(kwargs["callbacks"]), 2)
+        self.assertEqual(kwargs["precision"], "16-mixed")
+
+    def test_protocol_metadata_records_metric_and_run_contract(self):
+        metadata = finetune._build_protocol_metadata(
+            max_steps=320000,
+            validation_every_n_batches=10000,
+            from_checkpoint=None,
+            starting_weights=None,
+            encoder_training_mode="fine_tune",
+            encoder_unfreeze_step=120000,
+            resolution=1024,
+            reduce_ratio=0.5,
+            batch_size=1,
+        )
+
+        self.assertEqual(metadata["protocol_version"], "full_page_omr_eval_v2")
+        self.assertEqual(metadata["metric_version"], "canonical_v2")
+        self.assertEqual(metadata["checkpoint_monitor"], "val_SER_v2")
+        self.assertEqual(metadata["checkpoint_source"], "foundation")
+        self.assertEqual(metadata["checkpoint_load_mode"], "fresh")
+        self.assertEqual(metadata["accumulate_grad_batches"], 1)
+        self.assertEqual(metadata["reduce_ratio"], 0.5)
+
     @unittest.skipUnless(sys.platform == "win32", "PowerShell launcher is Windows-specific")
     def test_powershell_dry_run_includes_default_checkpoint_interval(self):
         result = subprocess.run(
@@ -145,6 +211,8 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--checkpoint_every_n_epochs=100", result.stdout)
+        self.assertIn("--validation_every_n_batches=10000", result.stdout)
+        self.assertIn("--max_steps=320000", result.stdout)
         self.assertIn("--encoder_training_mode=fine_tune", result.stdout)
         self.assertIn("(num_workers=24)", result.stdout)
 

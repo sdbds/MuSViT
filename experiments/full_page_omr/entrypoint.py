@@ -29,10 +29,11 @@ def run(config_path: str, experiment_name: str,
         foundation_architecture: str = "ViTMAEBase",
         foundation_weights: str = "carlospm12/LSMT-MAE-Base-1024-16",
         finetuning: str = "CL", from_checkpoint: str | None = None,
-        resolution: int | None = None, max_steps: int = -1, train: bool = True,
+        resolution: int | None = None, max_steps: int = 320000, train: bool = True,
         starting_weights: str | None = None, learning_rate: float | None = None,
         checkpoint_every_n_epochs: int = 100, attention_backend: str = "auto",
-        encoder_training_mode: str = "fine_tune"):
+        encoder_training_mode: str = "fine_tune",
+        validation_every_n_batches: int = 10000):
     """Fine-tune MuSViT for full-page Optical Music Recognition.
 
     Args:
@@ -58,4 +59,5 @@ def run(config_path: str, experiment_name: str,
             checkpoint_every_n_epochs=checkpoint_every_n_epochs,
             attention_backend=attention_backend,
             encoder_training_mode=encoder_training_mode,
+            validation_every_n_batches=validation_every_n_batches,
         )

@@ -13,7 +13,6 @@ from .data_augmentation.data_augmentation import set_up_processor
 from lightning.pytorch import Trainer
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
-from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 
 
 DATASETS_TYPE = {
@@ -23,10 +22,31 @@ DATASETS_TYPE = {
     "R": None
 }
 
+PROTOCOL_VERSION = "full_page_omr_eval_v2"
+METRIC_VERSION = "canonical_v2"
+CHECKPOINT_MONITOR = "val_SER_v2"
+PRECISION = "16-mixed"
+
 
 def _validate_checkpoint_every_n_epochs(value: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError("checkpoint_every_n_epochs must be a positive integer")
+    return value
+
+
+def _validate_validation_every_n_batches(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError("validation_every_n_batches must be a positive integer")
+    return value
+
+
+def _validate_max_steps(value: int, *, train: bool) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("max_steps must be an integer")
+    if train and value < 1:
+        raise ValueError("production training requires max_steps to be a positive integer")
+    if not train and value != -1 and value < 1:
+        raise ValueError("max_steps must be -1 or a positive integer when train=False")
     return value
 
 
@@ -93,6 +113,70 @@ def _build_epoch_checkpointer(experiment_name: str, finetuning_technique: str,
     )
 
 
+def _build_metric_checkpointer(experiment_name: str,
+                               finetuning_technique: str) -> ModelCheckpoint:
+    return ModelCheckpoint(
+        dirpath="weights/",
+        filename=(
+            f"{experiment_name}_{finetuning_technique}"
+            "-step={step}-val_SER_v2={val_SER_v2:.4f}"
+        ),
+        monitor=CHECKPOINT_MONITOR,
+        mode="min",
+        save_top_k=2,
+        save_weights_only=True,
+        auto_insert_metric_name=False,
+        verbose=True,
+    )
+
+
+def _build_trainer_kwargs(*, max_steps: int, validation_every_n_batches: int,
+                          callbacks, logger):
+    return {
+        "max_epochs": 100000,
+        "max_steps": max_steps,
+        "check_val_every_n_epoch": None,
+        "val_check_interval": validation_every_n_batches,
+        "num_sanity_val_steps": 0,
+        "callbacks": callbacks,
+        "logger": logger,
+        "precision": PRECISION,
+    }
+
+
+def _build_protocol_metadata(*, max_steps, validation_every_n_batches,
+                             from_checkpoint, starting_weights,
+                             encoder_training_mode, encoder_unfreeze_step,
+                             resolution, reduce_ratio, batch_size):
+    if from_checkpoint is not None:
+        checkpoint_source = from_checkpoint
+        checkpoint_load_mode = "full"
+    elif starting_weights is not None:
+        checkpoint_source = starting_weights
+        checkpoint_load_mode = "weights_only"
+    else:
+        checkpoint_source = "foundation"
+        checkpoint_load_mode = "fresh"
+    return {
+        "protocol_version": PROTOCOL_VERSION,
+        "metric_version": METRIC_VERSION,
+        "max_steps": max_steps,
+        "validation_every_n_batches": validation_every_n_batches,
+        "checkpoint_monitor": CHECKPOINT_MONITOR,
+        "checkpoint_source": checkpoint_source,
+        "checkpoint_load_mode": checkpoint_load_mode,
+        "encoder_training_mode": encoder_training_mode,
+        "encoder_unfreeze_step": encoder_unfreeze_step,
+        "resolution": resolution,
+        "reduce_ratio": reduce_ratio,
+        "optimizer": "Adam",
+        "learning_rate": _globals.learning_rate,
+        "precision": PRECISION,
+        "batch_size": batch_size,
+        "accumulate_grad_batches": 1,
+    }
+
+
 def _select_test_checkpoint(trainer, checkpointer, experiment_name: str,
                             finetuning_technique: str) -> str:
     if checkpointer.best_model_path:
@@ -119,10 +203,15 @@ def _run_test(trainer, model_wrapper, data, checkpoint_path):
 def main(config: ExperimentConfig, experiment_name,
          foundation_architecture="ViTMAEBase", foundation_weights="carlospm12/LSMT-MAE-Base-1024-16",
          finetuning_technique="CL", from_checkpoint: str | None = None, resolution: int | None = None,
-         max_steps: int = -1, train: bool = True, starting_weights: str | None = None,
+         max_steps: int = 320000, train: bool = True, starting_weights: str | None = None,
          attention_backend: str = "auto", checkpoint_every_n_epochs: int = 100,
-         encoder_training_mode: str = "fine_tune"):
+         encoder_training_mode: str = "fine_tune",
+         validation_every_n_batches: int = 10000):
     checkpoint_every_n_epochs = _validate_checkpoint_every_n_epochs(checkpoint_every_n_epochs)
+    validation_every_n_batches = _validate_validation_every_n_batches(
+        validation_every_n_batches
+    )
+    max_steps = _validate_max_steps(max_steps, train=train)
     encoder_training_mode = _validate_encoder_training_mode(encoder_training_mode)
     from_checkpoint, starting_weights = _validate_checkpoint_sources(
         from_checkpoint,
@@ -201,27 +290,40 @@ def main(config: ExperimentConfig, experiment_name,
         )
         model_wrapper.enforce_checkpoint_protocol = True
 
-    early_stopping = EarlyStopping(monitor="val_SER", min_delta=0.01, patience=3, mode="min", verbose=True)
-
     print(f"Checkpoints will be saved to \"{experiment_name}_{finetuning_technique}\"")
     epoch_checkpointer = _build_epoch_checkpointer(
         experiment_name,
         finetuning_technique,
         checkpoint_every_n_epochs,
     )
-    checkpointer = ModelCheckpoint(dirpath="weights/", filename=f"{experiment_name}_{finetuning_technique}",
-                                   monitor="val_SER", mode='min',
-                                   save_top_k=1, verbose=True)
+    checkpointer = _build_metric_checkpointer(
+        experiment_name,
+        finetuning_technique,
+    )
 
     wandb_logger = WandbLogger(project='Foundation_SMT',
                                name=f"{experiment_name}",
                                log_model=False, save_dir="wandb_logs/")
+    wandb_logger.log_hyperparams(
+        _build_protocol_metadata(
+            max_steps=max_steps,
+            validation_every_n_batches=validation_every_n_batches,
+            from_checkpoint=from_checkpoint,
+            starting_weights=starting_weights,
+            encoder_training_mode=encoder_training_mode,
+            encoder_unfreeze_step=encoder_unfreeze_step,
+            resolution=resolution,
+            reduce_ratio=config.data.reduce_ratio,
+            batch_size=data.batch_size,
+        )
+    )
 
-    trainer = Trainer(max_epochs=100000, max_steps=max_steps,
-                      check_val_every_n_epoch=3500,
-                      num_sanity_val_steps=0,
-                      callbacks=[epoch_checkpointer, checkpointer, early_stopping], logger=wandb_logger,
-                      precision='16-mixed')
+    trainer = Trainer(**_build_trainer_kwargs(
+        max_steps=max_steps,
+        validation_every_n_batches=validation_every_n_batches,
+        callbacks=[epoch_checkpointer, checkpointer],
+        logger=wandb_logger,
+    ))
 
     if train:
         trainer.fit(
@@ -244,11 +346,16 @@ def main(config: ExperimentConfig, experiment_name,
 def launch(config_path: str, experiment_name: str,
            foundation_architecture="ViTMAEBase", foundation_weights="carlospm12/LSMT-MAE-Base-1024-16",
            finetuning: str = "CL", from_checkpoint: str | None = None, resolution: int | None = None,
-           max_steps: int = -1, train: bool = True, starting_weights: str | None = None,
+           max_steps: int = 320000, train: bool = True, starting_weights: str | None = None,
            learning_rate: float | None = None, attention_backend: str = "auto",
            checkpoint_every_n_epochs: int = 100,
-           encoder_training_mode: str = "fine_tune"):
+           encoder_training_mode: str = "fine_tune",
+           validation_every_n_batches: int = 10000):
     checkpoint_every_n_epochs = _validate_checkpoint_every_n_epochs(checkpoint_every_n_epochs)
+    validation_every_n_batches = _validate_validation_every_n_batches(
+        validation_every_n_batches
+    )
+    max_steps = _validate_max_steps(max_steps, train=train)
     encoder_training_mode = _validate_encoder_training_mode(encoder_training_mode)
     from_checkpoint, starting_weights = _validate_checkpoint_sources(
         from_checkpoint,
@@ -266,7 +373,8 @@ def launch(config_path: str, experiment_name: str,
          foundation_weights=foundation_weights, finetuning_technique=finetuning, from_checkpoint=from_checkpoint,
          resolution=resolution, max_steps=max_steps, train=train, starting_weights=starting_weights,
          attention_backend=attention_backend, checkpoint_every_n_epochs=checkpoint_every_n_epochs,
-         encoder_training_mode=encoder_training_mode)
+         encoder_training_mode=encoder_training_mode,
+         validation_every_n_batches=validation_every_n_batches)
 
 
 if __name__ == "__main__":
