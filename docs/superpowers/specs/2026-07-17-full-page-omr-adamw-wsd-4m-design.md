@@ -78,7 +78,7 @@ amsgrad = false
 
 `task` 定义为 `SMTFoundationModelForCausalLM` 中所有不属于 `encoder` 的可训练模块。参数归属使用模块和参数身份，不使用模糊的字符串包含判断。no-decay 集合只包含：
 
-- 名为 `bias` 的参数；
+- 参数局部名称中包含 `bias` 的参数，包括 `bias` 与 `in_proj_bias`，与 Transformers Trainer 的标准排除规则一致；
 - `torch.nn.LayerNorm` 模块直接拥有的参数。
 
 每个模型参数必须恰好出现在一个 optimizer group。重复、遗漏或空的预期 group 都应在 `configure_optimizers()` 时失败。
