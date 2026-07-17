@@ -218,6 +218,15 @@ class CheckpointManifestTests(unittest.TestCase):
 
 
 class EncoderStateTests(unittest.TestCase):
+    def test_snapshot_backed_state_excludes_untrained_vit_pooler(self):
+        encoder = torch.nn.Module()
+        encoder.embeddings = torch.nn.Linear(2, 2, bias=False)
+        encoder.pooler = torch.nn.Linear(2, 2)
+
+        state = diagnostics.snapshot_backed_encoder_state(encoder)
+
+        self.assertEqual(set(state), {"embeddings.weight"})
+
     def test_state_digest_is_sorted_and_covers_name_dtype_shape_and_bytes(self):
         first = {
             "z.weight": torch.tensor([[1.0, 2.0]], dtype=torch.float32),

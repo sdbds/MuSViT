@@ -308,7 +308,7 @@ relative_l2 = ||theta_checkpoint - theta_pretrained||_2
               / ||theta_pretrained||_2
 ```
 
-报告 encoder 全局值和每个 transformer block 的值。参数按完整名称和 shape 对齐；缺失、额外或 shape 不同都使诊断失败。计算使用 float64 CPU 累计，避免大参数求和的混合精度误差。漂移范数只描述权重变化，不单独证明 catastrophic forgetting；结论必须与 val 对照一起解释。
+报告 encoder 全局值和每个 transformer block 的值。漂移域只包含固定 ViTMAE foundation snapshot 实际提供的 encoder 参数；`pooler.*` 不在该 snapshot 中、由 `ViTModel` 动态初始化且不参与 OMR 输出，因此明确排除，并在报告中记录排除前缀。其余参数按完整名称和 shape 对齐；缺失、额外或 shape 不同都使诊断失败。计算使用 float64 CPU 累计，避免大参数求和的混合精度误差。漂移范数只描述权重变化，不单独证明 catastrophic forgetting；结论必须与 val 对照一起解释。
 
 ## 5. 实验分叉
 

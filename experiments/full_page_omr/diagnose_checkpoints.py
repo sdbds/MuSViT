@@ -22,6 +22,7 @@ FOUNDATION_REVISION = "eecd5b327521225e65e1c2fe38ab99eb667c1609"
 DATASET_ID = "antoniorv6/polish-scores"
 DATASET_REVISION = "b3170c8b8f322885b566efe9e264af9328b5603f"
 ENCODER_UNFREEZE_STEP = 120000
+FOUNDATION_EXCLUDED_PARAMETER_PREFIXES = ("pooler.",)
 FIXED_VALIDATION_PROTOCOL = {
     "split": "val",
     "rows": list(range(10)),
@@ -248,6 +249,19 @@ def verify_checkpoint_identity(checkpoint, *, role):
 def _digest_field(digest, value):
     digest.update(len(value).to_bytes(8, byteorder="big", signed=False))
     digest.update(value)
+
+
+def snapshot_backed_encoder_state(encoder):
+    if not isinstance(encoder, torch.nn.Module):
+        raise EncoderStateError("encoder must be a torch module")
+    state = {
+        name: parameter.detach().cpu().clone()
+        for name, parameter in encoder.named_parameters()
+        if not name.startswith(FOUNDATION_EXCLUDED_PARAMETER_PREFIXES)
+    }
+    if not state:
+        raise EncoderStateError("encoder has no snapshot-backed parameters")
+    return state
 
 
 def encoder_state_sha256(state):
@@ -488,6 +502,9 @@ def run_diagnostics(
             "model_id": manifest["foundation"]["model_id"],
             "revision": manifest["foundation"]["revision"],
             "encoder_state_sha256": actual_foundation_digest,
+            "excluded_parameter_prefixes": list(
+                FOUNDATION_EXCLUDED_PARAMETER_PREFIXES
+            ),
         },
         "checkpoints": identities,
         "evaluations": evaluations,
@@ -565,11 +582,9 @@ class _DefaultDiagnosticRuntime:
         encoder = ViTModel.from_pretrained(
             self._snapshot_path(manifest),
             mask_ratio=0.0,
+            add_pooling_layer=False,
         )
-        state = {
-            name: parameter.detach().cpu().clone()
-            for name, parameter in encoder.named_parameters()
-        }
+        state = snapshot_backed_encoder_state(encoder)
         del encoder
         return state
 
@@ -630,10 +645,7 @@ class _DefaultDiagnosticRuntime:
         model = SMTFoundationModelForCausalLM(config)
         model.load_state_dict(self._model_state(payload), strict=True)
         model.eval()
-        state = {
-            name: parameter.detach().cpu().clone()
-            for name, parameter in model.encoder.named_parameters()
-        }
+        state = snapshot_backed_encoder_state(model.encoder)
         if not torch.cuda.is_available():
             raise DiagnosticError("checkpoint validation requires CUDA")
         model.to(torch.device("cuda", 0))
