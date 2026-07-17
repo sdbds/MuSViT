@@ -7,11 +7,9 @@ import hashlib
 import importlib.metadata
 import json
 import math
-import os
 import platform
 import re
 import subprocess
-import sys
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -529,14 +527,34 @@ class _DefaultDiagnosticRuntime:
         self._snapshot = None
         self._rows = None
 
+    @staticmethod
+    def _download_foundation_snapshot(snapshot_download):
+        kwargs = {
+            "repo_id": FOUNDATION_MODEL_ID,
+            "revision": FOUNDATION_REVISION,
+            "allow_patterns": ["config.json", "model.safetensors"],
+        }
+        try:
+            return snapshot_download(**kwargs, local_files_only=True)
+        except Exception:
+            try:
+                return snapshot_download(**kwargs)
+            except Exception as exc:
+                raise DiagnosticError(
+                    "locked foundation revision is unavailable: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+
     def _snapshot_path(self, manifest):
+        if (
+            manifest["foundation"]["model_id"] != FOUNDATION_MODEL_ID
+            or manifest["foundation"]["revision"] != FOUNDATION_REVISION
+        ):
+            raise DiagnosticError("manifest foundation identity is not locked")
         if self._snapshot is None:
             from huggingface_hub import snapshot_download
 
-            self._snapshot = snapshot_download(
-                repo_id=manifest["foundation"]["model_id"],
-                revision=manifest["foundation"]["revision"],
-            )
+            self._snapshot = self._download_foundation_snapshot(snapshot_download)
         return self._snapshot
 
     def load_foundation_encoder(self, manifest):
@@ -652,35 +670,16 @@ class _DefaultDiagnosticRuntime:
 
     @staticmethod
     def _visible_gpu_uuid():
-        visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
-        if visible.startswith("GPU-") and "," not in visible:
-            return visible
         try:
-            output = subprocess.run(
-                [
-                    "nvidia-smi",
-                    "--query-gpu=index,uuid",
-                    "--format=csv,noheader,nounits",
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout
-        except (OSError, subprocess.CalledProcessError) as exc:
-            raise DiagnosticError("could not query the CUDA GPU UUID") from exc
-        identities = {}
-        for line in output.splitlines():
-            index, separator, uuid = line.partition(",")
-            if not separator:
-                continue
-            identities[index.strip()] = uuid.strip()
-        if visible and "," not in visible and visible in identities:
-            return identities[visible]
-        if torch.cuda.device_count() == 1 and len(identities) == 1:
-            return next(iter(identities.values()))
-        raise DiagnosticError(
-            "CUDA device UUID is ambiguous; set CUDA_VISIBLE_DEVICES to one index or UUID"
-        )
+            raw_uuid = torch.cuda.get_device_properties(0).uuid
+        except (AssertionError, RuntimeError) as exc:
+            raise DiagnosticError("could not query CUDA device 0 UUID") from exc
+        if isinstance(raw_uuid, bytes):
+            raw_uuid = raw_uuid.decode("ascii")
+        if not isinstance(raw_uuid, str) or not raw_uuid.strip():
+            raise DiagnosticError("CUDA device 0 returned an invalid UUID")
+        raw_uuid = raw_uuid.strip()
+        return raw_uuid if raw_uuid.startswith("GPU-") else f"GPU-{raw_uuid}"
 
     def _runtime_identity(self, manifest, resolved_backend):
         identity = {

@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
@@ -389,6 +390,37 @@ class DiagnosticReportTests(unittest.TestCase):
                     load_checkpoint_encoder=lambda *_: reference,
                     evaluate_checkpoint=lambda *_: result,
                 )
+
+
+class DefaultDiagnosticRuntimeTests(unittest.TestCase):
+    def test_foundation_snapshot_prefers_the_exact_cached_revision(self):
+        download = Mock(return_value="cached-snapshot")
+
+        snapshot = diagnostics._DefaultDiagnosticRuntime._download_foundation_snapshot(
+            download
+        )
+
+        self.assertEqual(snapshot, "cached-snapshot")
+        download.assert_called_once_with(
+            repo_id=diagnostics.FOUNDATION_MODEL_ID,
+            revision=diagnostics.FOUNDATION_REVISION,
+            allow_patterns=["config.json", "model.safetensors"],
+            local_files_only=True,
+        )
+
+    def test_gpu_uuid_comes_from_the_actual_torch_device(self):
+        properties = SimpleNamespace(uuid="a70be80e-9cef-95c2-7557-52448110b38e")
+        with (
+            patch.object(torch.cuda, "get_device_properties", return_value=properties),
+            patch.object(
+                diagnostics.subprocess,
+                "run",
+                side_effect=AssertionError("driver index must not identify CUDA device"),
+            ),
+        ):
+            uuid = diagnostics._DefaultDiagnosticRuntime._visible_gpu_uuid()
+
+        self.assertEqual(uuid, "GPU-a70be80e-9cef-95c2-7557-52448110b38e")
 
 
 if __name__ == "__main__":
