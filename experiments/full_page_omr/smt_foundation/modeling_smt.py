@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -600,6 +602,14 @@ class Decoder(nn.Module):
 class SMTOutput(CausalLMOutputWithCrossAttentions):
     """This is a nice output wrapper"""
 
+
+@dataclass(frozen=True)
+class GenerationResult:
+    token_ids: tuple[int, ...]
+    output: SMTOutput
+    terminated_by_eos: bool
+    truncated: bool
+
 class SMTFoundationModelForCausalLM(PreTrainedModel):
     config_class = SMTFoundationConfig
 
@@ -698,7 +708,52 @@ class SMTFoundationModelForCausalLM(PreTrainedModel):
         
         return output
     
-    @torch.no_grad()    
+    @torch.no_grad()
+    def generate_token_ids(self, input, use_incremental=False):
+        if not isinstance(use_incremental, bool):
+            raise TypeError("use_incremental must be a boolean")
+        if use_incremental:
+            raise NotImplementedError("incremental generation is not implemented")
+
+        predicted_sequence = torch.tensor(
+            [[self.w2i["<bos>"]]],
+            device=input.device,
+            dtype=torch.long,
+        )
+        encoder_output = self.forward_encoder(input).permute(0, 2, 1).contiguous()
+        token_ids = [int(predicted_sequence[0, 0].item())]
+        output = None
+        terminated_by_eos = False
+
+        for _ in range(self.maxlen - predicted_sequence.shape[-1]):
+            output = self.forward_decoder(
+                encoder_output,
+                predicted_sequence,
+                output_attentions=False,
+                use_cache=False,
+            )
+            next_token = torch.argmax(output.logits[:, :, -1], dim=1, keepdim=True)
+            predicted_token = int(next_token[0, 0].item())
+            predicted_sequence = torch.cat([predicted_sequence, next_token], dim=1)
+            token_ids.append(predicted_token)
+            try:
+                predicted_text = self.i2w[predicted_token]
+            except KeyError:
+                raise KeyError(f"Unknown predicted token id {predicted_token}") from None
+            if predicted_text == "<eos>":
+                terminated_by_eos = True
+                break
+
+        if output is None:
+            raise ValueError("maxlen must allow at least one generated token")
+        return GenerationResult(
+            token_ids=tuple(token_ids),
+            output=output,
+            terminated_by_eos=terminated_by_eos,
+            truncated=not terminated_by_eos,
+        )
+
+    @torch.no_grad()
     def predict(self, input, convert_to_str=False):
         if convert_to_str:
             warnings.warn(
@@ -707,25 +762,19 @@ class SMTFoundationModelForCausalLM(PreTrainedModel):
                 stacklevel=2,
             )
         del convert_to_str
-        predicted_sequence = torch.from_numpy(np.asarray([self.w2i['<bos>']])).to(input.device).unsqueeze(0)
-        encoder_output = self.forward_encoder(input).permute(0,2,1).contiguous()
+        result = SMTFoundationModelForCausalLM.generate_token_ids(
+            self,
+            input,
+            use_incremental=False,
+        )
         text_sequence = []
-        for i in range(self.maxlen - predicted_sequence.shape[-1]):
-            predictions = self.forward_decoder(
-                encoder_output,
-                predicted_sequence.long(),
-                output_attentions=False,
-                use_cache=False,
-            )
-            next_token = torch.argmax(predictions.logits[:, :, -1], dim=1, keepdim=True)
-            predicted_token = int(next_token[0, 0].item())
-            predicted_sequence = torch.cat([predicted_sequence, next_token], dim=1)
+        for predicted_token in result.token_ids[1:]:
             try:
                 predicted_text = self.i2w[predicted_token]
             except KeyError:
                 raise KeyError(f"Unknown predicted token id {predicted_token}") from None
-            if predicted_text == '<eos>':
+            if predicted_text == "<eos>":
                 break
             text_sequence.append(predicted_text)
-        
-        return text_sequence, predictions
+
+        return text_sequence, result.output

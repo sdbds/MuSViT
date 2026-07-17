@@ -4,7 +4,12 @@ import wandb
 import lightning.pytorch as L
 from loguru import logger
 
-from .eval.eval_functions import compute_poliphony_metrics
+from .eval.eval_functions import (
+    canonical_text,
+    canonicalize_prediction_ids,
+    canonicalize_target_ids,
+    compute_canonical_metrics,
+)
 
 from . import _globals
 
@@ -134,33 +139,31 @@ class SMTPP_Trainer(L.LightningModule):
     
     def validation_step(self, val_batch):
         x, dec_in, y = val_batch
-        predicted_sequence, _ = self.model.predict(input=x)
-        
-        dec = "".join(predicted_sequence)
-        dec = dec.replace("<t>", "\t")
-        dec = dec.replace("<b>", "\n")
-        dec = dec.replace("<s>", " ")
-
-        gt = "".join([self.model.i2w[token.item()] for token in y.squeeze(0)[:-1]])
-        gt = gt.replace("<t>", "\t")
-        gt = gt.replace("<b>", "\n")
-        gt = gt.replace("<s>", " ")
-
-        self.preds.append(dec)
-        self.grtrs.append(gt)
+        del dec_in
+        generation = self.model.generate_token_ids(input=x)
+        self.preds.append(
+            canonicalize_prediction_ids(
+                generation.token_ids,
+                self.model.i2w,
+                maxlen=self.model.maxlen,
+            )
+        )
+        self.grtrs.append(
+            canonicalize_target_ids(y.squeeze(0).tolist(), self.model.i2w)
+        )
         
     def on_validation_epoch_end(self, metric_name="val"):
-        cer, ser, ler = compute_poliphony_metrics(self.preds, self.grtrs)
+        cer, ser, ler = compute_canonical_metrics(self.preds, self.grtrs)
         
         random_index = random.randint(0, len(self.preds)-1)
-        predtoshow = self.preds[random_index]
-        gttoshow = self.grtrs[random_index]
+        predtoshow = canonical_text(self.preds[random_index])
+        gttoshow = canonical_text(self.grtrs[random_index])
         print(f"[Prediction] - {predtoshow}")
         print(f"[GT] - {gttoshow}")
         
-        self.log(f'{metric_name}_CER', cer, on_epoch=True, prog_bar=True)
-        self.log(f'{metric_name}_SER', ser, on_epoch=True, prog_bar=True)
-        self.log(f'{metric_name}_LER', ler, on_epoch=True, prog_bar=True)
+        self.log(f'{metric_name}_CER_v2', cer, on_epoch=True, prog_bar=True)
+        self.log(f'{metric_name}_SER_v2', ser, on_epoch=True, prog_bar=True)
+        self.log(f'{metric_name}_LER_v2', ler, on_epoch=True, prog_bar=True)
         
         self.preds = []
         self.grtrs = []
