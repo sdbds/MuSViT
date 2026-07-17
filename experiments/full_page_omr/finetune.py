@@ -125,11 +125,11 @@ def _sha256_file(path: Path) -> str:
 def _read_checkpoint_run_state(checkpoint_path: str,
                                *, expected_sha256: str | None = None) -> CheckpointRunState:
     path = Path(checkpoint_path).expanduser().resolve()
-    actual_sha256 = None
     if expected_sha256 is not None:
         if not isinstance(expected_sha256, str) or _SHA256_RE.fullmatch(expected_sha256) is None:
             raise ValueError("source_checkpoint_sha256 must be a lowercase SHA-256 digest")
-        actual_sha256 = _sha256_file(path)
+    actual_sha256 = _sha256_file(path)
+    if expected_sha256 is not None:
         if actual_sha256 != expected_sha256:
             raise ValueError(
                 "source checkpoint SHA-256 mismatch: "
@@ -338,6 +338,9 @@ def _build_protocol_metadata(*, max_steps, validation_every_n_batches,
         checkpoint_load_mode = "fresh"
     if checkpoint_state is not None:
         checkpoint_source = checkpoint_state.path
+    recorded_source_curriculum_step = source_curriculum_step
+    if recorded_source_curriculum_step is None and checkpoint_state is not None:
+        recorded_source_curriculum_step = checkpoint_state.curriculum_step
     return {
         "protocol_version": protocol_version,
         "metric_version": METRIC_VERSION,
@@ -352,7 +355,7 @@ def _build_protocol_metadata(*, max_steps, validation_every_n_batches,
         "checkpoint_sha256": (
             checkpoint_state.sha256 if checkpoint_state is not None else None
         ),
-        "source_curriculum_step": source_curriculum_step,
+        "source_curriculum_step": recorded_source_curriculum_step,
         "curriculum_step_offset": curriculum_step_offset,
         "source_curriculum_step_evidence": (
             checkpoint_state.curriculum_step_source

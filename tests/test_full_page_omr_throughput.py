@@ -223,6 +223,48 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
 
         self.assertEqual(state.curriculum_step_offset, 10)
 
+    def test_full_resume_records_checkpoint_provenance(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            current = Path(tmpdir) / "current.ckpt"
+            torch.save(
+                {
+                    "global_step": 40,
+                    "full_page_omr_samples_seen": 30,
+                    "hyper_parameters": {"curriculum_step_offset": 10},
+                },
+                current,
+            )
+            current_sha256 = _sha256_file(current)
+            state = finetune._validate_run_contract(
+                config=SimpleNamespace(data=SimpleNamespace(skip_steps=10)),
+                from_checkpoint=str(current),
+                starting_weights=None,
+                max_steps=100,
+                train=True,
+                protocol_version=finetune.PROTOCOL_VERSION,
+                source_curriculum_step=None,
+                source_checkpoint_sha256=None,
+            )
+            metadata = finetune._build_protocol_metadata(
+                max_steps=100,
+                validation_every_n_batches=10,
+                from_checkpoint=str(current),
+                starting_weights=None,
+                encoder_training_mode="fine_tune",
+                encoder_unfreeze_step=120000,
+                resolution=1024,
+                reduce_ratio=0.5,
+                batch_size=1,
+                checkpoint_state=state,
+            )
+
+        self.assertEqual(metadata["checkpoint_sha256"], current_sha256)
+        self.assertEqual(metadata["source_curriculum_step"], 40)
+        self.assertEqual(
+            metadata["source_curriculum_step_evidence"],
+            "checkpoint_samples_seen",
+        )
+
     def test_weights_only_branch_binds_checkpoint_curriculum_and_protocol(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             checkpoint = Path(tmpdir) / "source.ckpt"
