@@ -200,7 +200,7 @@ def _compute_legacy_metric(predictions, targets):
     accumulated_distance = 0
     accumulated_length = 0
     for prediction, target in zip(predictions, targets):
-        accumulated_distance += levenshtein_legacy(prediction, target)
+        accumulated_distance += editdistance.eval(prediction, target)
         accumulated_length += len(target)
     return 100.0 * accumulated_distance / accumulated_length
 
