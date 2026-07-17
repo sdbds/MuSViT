@@ -1,5 +1,6 @@
-import json
 import inspect
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -66,6 +67,29 @@ class LockedBenchmarkContractTests(unittest.TestCase):
                 eos_id=2,
                 pad_id=0,
             )
+
+    def test_gpu_isolation_uses_uuid_not_driver_index_order(self):
+        nvidia_output = (
+            "7, NVIDIA GeForce RTX 4090, "
+            "GPU-a70be80e-9cef-95c2-7557-52448110b38e, 581.57, 63, 0\n"
+        )
+        previous = os.environ.get("CUDA_VISIBLE_DEVICES")
+        try:
+            with (
+                patch.object(benchmark, "_run_nvidia_smi", return_value=nvidia_output),
+                patch.object(torch.cuda, "is_initialized", return_value=False),
+                patch.object(torch.cuda, "is_available", return_value=True),
+                patch.object(torch.cuda, "device_count", return_value=1),
+                patch.object(torch.cuda, "get_device_name", return_value=benchmark.GPU_NAME),
+            ):
+                benchmark._LockedBenchmarkRuntime().ensure_reference_gpu()
+
+            self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], benchmark.GPU_UUID)
+        finally:
+            if previous is None:
+                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            else:
+                os.environ["CUDA_VISIBLE_DEVICES"] = previous
         with self.assertRaisesRegex(ValueError, "length"):
             benchmark.build_cycled_prefix(
                 [1, 7, 2],

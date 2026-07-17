@@ -295,7 +295,7 @@ class _LockedBenchmarkRuntime:
             raise BenchmarkUnavailable(
                 "CUDA was initialized before the benchmark could lock the reference GPU"
             )
-        os.environ["CUDA_VISIBLE_DEVICES"] = reference["index"]
+        os.environ["CUDA_VISIBLE_DEVICES"] = reference["uuid"]
         if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
             raise BenchmarkUnavailable("reference GPU could not be isolated as CUDA device 0")
         if torch.cuda.get_device_name(0) != GPU_NAME:
