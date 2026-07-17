@@ -201,6 +201,20 @@ reference checkpoint、dataset revision 或 GPU 不可用时，本规格的门�
 
 达不到门槛时保留 uncached 默认路径并记录测量结果，不能用渐进复杂度推导替代实测。
 
+### 2.5 2026-07-17 锁定实测结果
+
+锁定 benchmark 已在 source revision `d7bef26302020144f7dfab7435d9851ec8dca40c` 上完整执行，结构化报告写入 `.cache/full_page_omr/generation-benchmark-rtx4090.json`。身份实读结果为 checkpoint `epoch=3399`、`global_step=282200`，GPU UUID 与规格一致；运行环境为 driver 581.57、PyTorch 2.13.0+cu130、CUDA 13.0、FlashAttention 2.8.4，实际 backend 为 `flash_attention_2`。
+
+| Prefix | Uncached median | Incremental median | Speedup | 门槛结果 |
+| --- | ---: | ---: | ---: | --- |
+| 1024 | 10.667 ms | 10.680 ms | 0.999x | 失败，incremental 略慢 |
+| 2048 | 10.018 ms | 9.842 ms | 1.018x | 失败，低于 2.0x |
+| 4096 | 12.031 ms | 13.935 ms | 0.863x | 记录项，incremental 更慢 |
+
+完整 10 页 val 的 uncached median 为 175.232 秒，incremental median 为 165.494 秒，比例为 94.44%，未达到不高于 90% 的门槛。9 页 token 序列相同；row 8 发生真实贪心分叉，uncached 为 2445 tokens、incremental 为 2444 tokens。三个固定前缀的 argmax 均相同，但 fp16 logits 最大绝对差为 0.0625。
+
+self-KV 长度、静态 cross-KV 份数和生产 attention window 的内存契约全部通过。总体 gate 状态为 `failed`，因此 `generate_token_ids(use_incremental=False)` 继续作为生产默认值；本次结果不授权切换默认路径，也不修改任何既定阈值。
+
 ## 3. 验证与 checkpoint 协议
 
 ### 新协议默认值
