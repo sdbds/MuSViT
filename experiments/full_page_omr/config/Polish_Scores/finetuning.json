@@ -3,7 +3,7 @@
       "data_path": "antoniorv6/polish-scores",
       "batch_size": 1,
       "vocab_name": "Polish_Scores_BeKern",
-      "num_workers": 20,
+      "num_workers": 24,
       "tokenization_mode": "bekern",
       "reduce_ratio": 0.5
     }

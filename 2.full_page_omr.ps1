@@ -13,8 +13,10 @@ $Config = @{
     foundation_architecture = "ViTMAEBase"
     foundation_weights     = "carlospm12/LSMT-MAE-Base-1024-16"
     finetuning             = "CL"     # Supported: CL, SR, CL1
+    encoder_training_mode  = "fine_tune" # Supported: fine_tune, linear_probe
     resolution             = $null    # $null uses the experiment default (1024)
     max_steps              = -1       # -1 lets Lightning train without a step limit
+    checkpoint_every_n_epochs = 100   # Periodic full checkpoint interval
     learning_rate          = $null    # $null uses the experiment default (1e-4)
     attention_backend      = "auto"   # auto: FA2 -> SDPA -> eager fallback
     from_checkpoint        = $null    # Start a fresh Trainer run
@@ -28,7 +30,7 @@ $Features = @{
 $Runtime = @{
     cuda_visible_devices = "0"       # Use $null to leave CUDA device selection unchanged
     cairo_dll_directory  = "E:\Roaming\baidu\BaiduNetdisk\module\ImageViewer"
-    windows_num_workers  = 0          # Windows spawn cannot pickle the current OMR datasets
+    windows_num_workers  = 24          # Best measured long-run throughput on this workstation
 }
 
 #endregion
@@ -178,10 +180,24 @@ if ($Env:OS -eq "Windows_NT") {
 if ([string]::IsNullOrWhiteSpace($Config.experiment_name)) {
     throw "experiment_name must not be empty."
 }
+if (-not [string]::IsNullOrWhiteSpace($Config.from_checkpoint) -and
+    -not [string]::IsNullOrWhiteSpace($Config.starting_weights)) {
+    throw "from_checkpoint and starting_weights are mutually exclusive."
+}
+
+$CheckpointEveryNEpochs = 0
+if (-not [int]::TryParse([string]$Config.checkpoint_every_n_epochs, [ref]$CheckpointEveryNEpochs) -or $CheckpointEveryNEpochs -lt 1) {
+    throw "checkpoint_every_n_epochs must be a positive integer."
+}
+$Config.checkpoint_every_n_epochs = $CheckpointEveryNEpochs
 
 $SupportedFinetuningModes = @("CL", "SR", "CL1")
 if ($Config.finetuning -notin $SupportedFinetuningModes) {
     throw "Unsupported finetuning mode '$($Config.finetuning)'. Choose: $($SupportedFinetuningModes -join ', ')."
+}
+$SupportedEncoderTrainingModes = @("fine_tune", "linear_probe")
+if ($Config.encoder_training_mode -notin $SupportedEncoderTrainingModes) {
+    throw "Unsupported encoder training mode '$($Config.encoder_training_mode)'. Choose: $($SupportedEncoderTrainingModes -join ', ')."
 }
 $SupportedAttentionBackends = @("auto", "flash_attention_2", "sdpa", "eager")
 if ($Config.attention_backend -notin $SupportedAttentionBackends) {
@@ -204,7 +220,9 @@ $UvArgs = [System.Collections.ArrayList]::new()
 [void]$UvArgs.Add("--foundation_architecture=$($Config.foundation_architecture)")
 [void]$UvArgs.Add("--foundation_weights=$($Config.foundation_weights)")
 [void]$UvArgs.Add("--finetuning=$($Config.finetuning)")
+[void]$UvArgs.Add("--encoder_training_mode=$($Config.encoder_training_mode)")
 [void]$UvArgs.Add("--max_steps=$($Config.max_steps)")
+[void]$UvArgs.Add("--checkpoint_every_n_epochs=$($Config.checkpoint_every_n_epochs)")
 [void]$UvArgs.Add("--train=$($Features.train.ToString().ToLowerInvariant())")
 [void]$UvArgs.Add("--attention_backend=$($Config.attention_backend)")
 

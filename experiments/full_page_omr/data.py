@@ -2,15 +2,99 @@ import re
 import cv2
 import torch
 import random
+import multiprocessing
 import numpy as np
 from .config.ExperimentConfigWrapper import ExperimentConfig
-from .Generator.SynthGenerator import VerovioGenerator
+from .Generator.SynthGenerator import VerovioGenerator, SyntheticScoreGenerationError
 from .data_augmentation.data_augmentation import augment, convert_img_to_tensor
+from .tokenization import validate_tokenization_mode
 from .utils.vocab_utils import check_and_retrieveVocabulary
 
 from datasets import load_dataset
 from torch.utils.data import Dataset
 from lightning.pytorch import LightningDataModule
+
+
+CL_CURRICULUM_STAGE_STEPS = 40000
+CL_SYNTHETIC_STAGES = 3
+CL_REAL_DATA_START_STEP = CL_CURRICULUM_STAGE_STEPS * CL_SYNTHETIC_STAGES
+SR_REAL_DATA_START_STEP = 200000
+
+
+class _SharedStepCounter:
+    def __init__(self, initial_step: int = 0) -> None:
+        self._value = multiprocessing.Value("q", int(initial_step), lock=True)
+
+    def reset(self, step: int) -> None:
+        with self._value.get_lock():
+            self._value.value = int(step)
+
+    def reserve(self) -> int:
+        with self._value.get_lock():
+            step = self._value.value
+            self._value.value += 1
+        return step
+
+
+class _LazyVerovioGenerator:
+    def __init__(self, sources: str, split: str, tokenization_mode: str) -> None:
+        self.sources = sources
+        self.split = split
+        self.tokenization_mode = validate_tokenization_mode(tokenization_mode)
+        self._generator = None
+
+    def get(self) -> VerovioGenerator:
+        if self._generator is None:
+            self._generator = VerovioGenerator(
+                sources=self.sources,
+                split=self.split,
+                tokenization_mode=self.tokenization_mode,
+            )
+        return self._generator
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_generator"] = None
+        return state
+
+
+def _seed_worker(worker_id: int) -> None:
+    del worker_id
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+
+
+def _build_dataloader(dataset: Dataset, batch_size: int, num_workers: int,
+                      *, shuffle: bool = False, persistent_workers: bool = False):
+    if batch_size != 1:
+        raise ValueError("full-page OMR requires batch_size=1")
+    if num_workers < 0:
+        raise ValueError("num_workers must be non-negative")
+    kwargs = {
+        "dataset": dataset,
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "shuffle": shuffle,
+        "collate_fn": batch_preparation_img2seq,
+        "pin_memory": torch.cuda.is_available(),
+    }
+    if num_workers > 0:
+        kwargs.update(
+            worker_init_fn=_seed_worker,
+            prefetch_factor=1,
+            persistent_workers=persistent_workers,
+        )
+    return torch.utils.data.DataLoader(**kwargs)
+
+
+def _retry_synthetic_sample(generate, max_attempts: int = 5):
+    for attempt in range(max_attempts):
+        try:
+            return generate()
+        except SyntheticScoreGenerationError:
+            if attempt == max_attempts - 1:
+                raise
 
 def clean_kern(krn, avoid_tokens=['*tremolo','*staff2', '*staff1','*Xped', '*tremolo', '*ped', '*Xtuplet', '*tuplet', "*Xtremolo", '*cue', '*Xcue', '*rscale:1/2', '*rscale:1', '*kcancel', '*below']):
     krn = krn.split('\n')
@@ -25,6 +109,7 @@ def clean_kern(krn, avoid_tokens=['*tremolo','*staff2', '*staff1','*Xped', '*tre
     return "\n".join(newkrn)
 
 def parse_kern_file(krn: str, tokenization_mode='bekern') -> str:
+    tokenization_mode = validate_tokenization_mode(tokenization_mode)
     krn = clean_kern(krn)
     krn = krn.replace(" ", " <s> ")
     krn = krn.replace("\t", " <t> ")
@@ -48,20 +133,55 @@ def parse_kern_file(krn: str, tokenization_mode='bekern') -> str:
     
     return krn
 
-def load_from_files_list(file_ref:str, split:str="train", tokenization_mode='bekern', reduce_ratio=0.5) -> list:
-    dataset = load_dataset(file_ref, split=split)
-    x = []
-    y = []
-    for sample in dataset:
-        y.append(['<bos>'] + parse_kern_file(sample["transcription"], tokenization_mode=tokenization_mode) + ['<eos>'])
-        img = img = np.array(sample['image'])
-        width = int(np.ceil(img.shape[1] * reduce_ratio))
-        height = int(np.ceil(img.shape[0] * reduce_ratio))
-        img = cv2.resize(img, (width, height))
-        x.append(img)
-    return x, y
+
+class _ArrowOMRSource:
+    def __init__(self, dataset_ref: str, split: str, tokenization_mode: str,
+                 reduce_ratio: float) -> None:
+        self.tokenization_mode = validate_tokenization_mode(tokenization_mode)
+        if (
+            isinstance(reduce_ratio, bool)
+            or not isinstance(reduce_ratio, (int, float))
+            or reduce_ratio <= 0
+        ):
+            raise ValueError("reduce_ratio must be a positive number")
+        self.reduce_ratio = float(reduce_ratio)
+        self.rows = load_dataset(
+            dataset_ref,
+            split=split,
+            keep_in_memory=False,
+        )
+
+    def __len__(self):
+        return len(self.rows)
+
+    def _tokenize(self, transcription):
+        return [
+            '<bos>',
+            *parse_kern_file(
+                transcription,
+                tokenization_mode=self.tokenization_mode,
+            ),
+            '<eos>',
+        ]
+
+    def __getitem__(self, index):
+        sample = self.rows[index]
+        image = np.asarray(sample['image'])
+        width = int(np.ceil(image.shape[1] * self.reduce_ratio))
+        height = int(np.ceil(image.shape[0] * self.reduce_ratio))
+        image = cv2.resize(image, (width, height))
+        return image, self._tokenize(sample["transcription"])
+
+    def iter_token_sequences(self):
+        for transcription in self.rows["transcription"]:
+            yield self._tokenize(transcription)
+
 
 def batch_preparation_img2seq(data):
+    if len(data) != 1:
+        raise ValueError(
+            f"full-page OMR collate requires batch_size=1; received {len(data)} samples"
+        )
     images = [sample[0] for sample in data]
     dec_in = [sample[1] for sample in data]
     gt = [sample[2] for sample in data]
@@ -129,21 +249,23 @@ class OMRIMG2SEQDataset(Dataset):
 
 class SyntheticOMRDataset(OMRIMG2SEQDataset):
     def __init__(self, data_path, split="train", number_of_systems=1, teacher_forcing_perc=0.2, reduce_ratio=0.5, 
-                 dataset_length=40000, augment=False, tokenization_mode="standard") -> None:
+                 dataset_length=40000, augment=False, tokenization_mode="bekern") -> None:
         super().__init__(teacher_forcing_perc, augment)
-        self.generator = VerovioGenerator(sources="antoniorv6/grandstaff-ekern", split=split, tokenization_mode=tokenization_mode)
+        tokenization_mode = validate_tokenization_mode(tokenization_mode)
+        self.generator = _LazyVerovioGenerator(
+            sources="antoniorv6/grandstaff-ekern",
+            split=split,
+            tokenization_mode=tokenization_mode,
+        )
         
         self.num_sys_gen = number_of_systems
         self.dataset_len = dataset_length
         self.reduce_ratio = reduce_ratio
         self.tokenization_mode = tokenization_mode
 
-    def set_trainer_data(self, trainer):
-        self.trainer = trainer
-    
     def __getitem__(self, index):
-        
-        x, y = self.generator.generate_music_system_image()
+        generator = self.generator.get()
+        x, y = _retry_synthetic_sample(generator.generate_music_system_image)
 
         if self.augment:
             x = augment(x)
@@ -159,16 +281,20 @@ class SyntheticOMRDataset(OMRIMG2SEQDataset):
 
 class RealDataset(OMRIMG2SEQDataset):
     def __init__(self, data_path, split, teacher_forcing_perc=0.2, reduce_ratio=1.0, 
-                augment=False, tokenization_mode="standard") -> None:
+                augment=False, tokenization_mode="bekern") -> None:
        super().__init__(teacher_forcing_perc, augment)
+       tokenization_mode = validate_tokenization_mode(tokenization_mode)
        self.reduce_ratio = reduce_ratio
        self.tokenization_mode = tokenization_mode
-       self.x, self.y = load_from_files_list(data_path, split, tokenization_mode, reduce_ratio=reduce_ratio)
+       self.real_source = _ArrowOMRSource(
+           data_path,
+           split,
+           tokenization_mode,
+           reduce_ratio,
+       )
        
     def __getitem__(self, index):
-       
-       x = self.x[index]
-       y = self.y[index]
+       x, y = self.real_source[index]
 
        if self.augment:
            x = augment(x)
@@ -180,66 +306,78 @@ class RealDataset(OMRIMG2SEQDataset):
        return x, decoder_input, y
 
     def __len__(self):
-       return len(self.x)
+       return len(self.real_source)
+
+    def get_gt(self):
+       return self.real_source.iter_token_sequences()
 
 class CurriculumTrainingDataset(OMRIMG2SEQDataset):
     def __init__(self, data_path, split, 
                 teacher_forcing_perc=0.2, 
                 reduce_ratio=1.0,
                 augment=False, 
-                tokenization_mode="standard",
-                skip_steps: int = 0) -> None:
+                tokenization_mode="bekern",
+                skip_steps: int = 0,
+                step_counter: _SharedStepCounter | None = None) -> None:
        super().__init__(teacher_forcing_perc, augment)
+       tokenization_mode = validate_tokenization_mode(tokenization_mode)
        self.reduce_ratio = reduce_ratio
        self.tokenization_mode = tokenization_mode
-       self.x, self.y = load_from_files_list(data_path, split, tokenization_mode, reduce_ratio=reduce_ratio)
-       self.generator = VerovioGenerator(sources="antoniorv6/grandstaff-ekern", 
-                                         split="train",
-                                         tokenization_mode=tokenization_mode)
+       self.real_source = _ArrowOMRSource(
+           data_path,
+           split,
+           tokenization_mode,
+           reduce_ratio,
+       )
+       self.generator = _LazyVerovioGenerator(
+           sources="antoniorv6/grandstaff-ekern",
+           split="train",
+           tokenization_mode=tokenization_mode,
+       )
        
        self.max_synth_prob = 0.9
        self.min_synth_prob = 0.2
        self.finetune_steps = 200000
-       self.increase_steps = 40000
-       self.num_cl_steps = 3
-       self.max_cl_steps = self.increase_steps * self.num_cl_steps
+       self.increase_steps = CL_CURRICULUM_STAGE_STEPS
+       self.num_cl_steps = CL_SYNTHETIC_STAGES
+       self.max_cl_steps = CL_REAL_DATA_START_STEP
        self.curriculum_stage_beginning = 2
-       self.skip_steps: int = skip_steps
-    
-    def set_trainer_data(self, trainer):
-        self.trainer = trainer
+       self.step_counter = step_counter or _SharedStepCounter(skip_steps)
     
     def linear_scheduler_synthetic(self, step):
         return self.max_synth_prob + round((step - self.max_cl_steps) * (self.min_synth_prob - self.max_synth_prob) / self.finetune_steps, 4)
 
-    def get_trainer_global_step(self) -> int:
-        return self.trainer.global_step + self.skip_steps
-
     def __getitem__(self, index):
-        step = self.get_trainer_global_step()
-        stage = (self.get_trainer_global_step() // self.increase_steps) + self.curriculum_stage_beginning
+        step = self.step_counter.reserve()
+        stage = (step // self.increase_steps) + self.curriculum_stage_beginning
         gen_author_title = np.random.rand() > 0.5
         
         if stage < (self.num_cl_steps + self.curriculum_stage_beginning):
-           num_sys_to_gen = random.randint(1, stage)
-           x, y = self.generator.generate_full_page_score(
-               max_systems = num_sys_to_gen,
-               strict_systems=True,
-               strict_height=False,
-               include_author=gen_author_title,
-               include_title=gen_author_title)
+           generator = self.generator.get()
+           x, y = _retry_synthetic_sample(
+               lambda: generator.generate_full_page_score(
+                   max_systems=random.randint(1, stage),
+                   strict_systems=True,
+                   strict_height=False,
+                   include_author=gen_author_title,
+                   include_title=gen_author_title,
+               )
+           )
         else:
             probability = max(self.linear_scheduler_synthetic(step), self.min_synth_prob)
             if random.random() > probability:
-                x = self.x[index]
-                y = self.y[index]
+                x, y = self.real_source[index]
             else:
-                x, y = self.generator.generate_full_page_score(
-                    max_systems = random.randint(2, 4),
-                    strict_systems=False,
-                    strict_height=False,
-                    include_author=gen_author_title,
-                    include_title=gen_author_title)
+                generator = self.generator.get()
+                x, y = _retry_synthetic_sample(
+                    lambda: generator.generate_full_page_score(
+                        max_systems=random.randint(2, 4),
+                        strict_systems=False,
+                        strict_height=False,
+                        include_author=gen_author_title,
+                        include_title=gen_author_title,
+                    )
+                )
 
         if self.augment:
            x = augment(x)
@@ -251,7 +389,10 @@ class CurriculumTrainingDataset(OMRIMG2SEQDataset):
         return x, decoder_input, y
 
     def __len__(self):
-       return len(self.x)
+       return len(self.real_source)
+
+    def get_gt(self):
+       return self.real_source.iter_token_sequences()
 
 
 class SynthToRealDataset(OMRIMG2SEQDataset):
@@ -259,33 +400,43 @@ class SynthToRealDataset(OMRIMG2SEQDataset):
                 teacher_forcing_perc=0.2, 
                 reduce_ratio=1.0,
                 augment=False, 
-                tokenization_mode="standard") -> None:
+                tokenization_mode="bekern",
+                step_counter: _SharedStepCounter | None = None) -> None:
        super().__init__(teacher_forcing_perc, augment)
+       tokenization_mode = validate_tokenization_mode(tokenization_mode)
        self.reduce_ratio = reduce_ratio
        self.tokenization_mode = tokenization_mode
-       self.x, self.y = load_from_files_list(data_path, split, tokenization_mode, reduce_ratio=reduce_ratio)
-       self.generator = VerovioGenerator(sources="antoniorv6/grandstaff-ekern", 
-                                         split="train",
-                                         tokenization_mode=tokenization_mode)
+       self.real_source = _ArrowOMRSource(
+           data_path,
+           split,
+           tokenization_mode,
+           reduce_ratio,
+       )
+       self.generator = _LazyVerovioGenerator(
+           sources="antoniorv6/grandstaff-ekern",
+           split="train",
+           tokenization_mode=tokenization_mode,
+       )
        
-       self.synth_pretraining_steps = 200000
-    
-    def set_trainer_data(self, trainer):
-        self.trainer = trainer
+       self.synth_pretraining_steps = SR_REAL_DATA_START_STEP
+       self.step_counter = step_counter or _SharedStepCounter()
 
     def __getitem__(self, index):
-        step = self.trainer.global_step
+        step = self.step_counter.reserve()
         gen_author_title = np.random.rand() > 0.5
         if step < self.synth_pretraining_steps:
-            x, y = self.generator.generate_full_page_score(
-                    max_systems = random.randint(2, 4),
+            generator = self.generator.get()
+            x, y = _retry_synthetic_sample(
+                lambda: generator.generate_full_page_score(
+                    max_systems=random.randint(2, 4),
                     strict_systems=False,
                     strict_height=False,
                     include_author=gen_author_title,
-                    include_title=gen_author_title)
+                    include_title=gen_author_title,
+                )
+            )
         else:
-            x = self.x[index]
-            y = self.y[index]
+            x, y = self.real_source[index]
 
         if self.augment:
            x = augment(x)
@@ -297,10 +448,16 @@ class SynthToRealDataset(OMRIMG2SEQDataset):
         return x, decoder_input, y
 
     def __len__(self):
-       return len(self.x)
+       return len(self.real_source)
+
+    def get_gt(self):
+       return self.real_source.iter_token_sequences()
 
 # CL1 for SMT
 class SyntheticGrandStaffDataset(LightningDataModule):
+    encoder_unfreeze_step = None
+    curriculum_step_offset = 0
+
     def __init__(self, config:ExperimentConfig) -> None:
         super().__init__()
         self.data_path = config.data.data_path
@@ -328,16 +485,24 @@ class SyntheticGrandStaffDataset(LightningDataModule):
         return 4360
 
     def train_dataloader(self):
-        return torch.utils.data.DataLoader(self.train_dataset, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=True, collate_fn=batch_preparation_img2seq)
+        return _build_dataloader(
+            self.train_dataset,
+            self.batch_size,
+            self.num_workers,
+            shuffle=True,
+            persistent_workers=True,
+        )
 
     def val_dataloader(self):
-        return torch.utils.data.DataLoader(self.val_dataset, batch_size=self.batch_size, num_workers=self.num_workers, collate_fn=batch_preparation_img2seq)
+        return _build_dataloader(self.val_dataset, self.batch_size, self.num_workers)
 
     def test_dataloader(self):
-        return torch.utils.data.DataLoader(self.test_dataset, batch_size=self.batch_size, num_workers=self.num_workers, collate_fn=batch_preparation_img2seq)
+        return _build_dataloader(self.test_dataset, self.batch_size, self.num_workers)
 
 # CL2 and CL3
 class CLFinetuningDataset(LightningDataModule):
+    encoder_unfreeze_step = CL_REAL_DATA_START_STEP
+
     def __init__(self, config:ExperimentConfig) -> None:
         super().__init__()
         self.data_path = config.data.data_path
@@ -345,10 +510,14 @@ class CLFinetuningDataset(LightningDataModule):
         self.batch_size = config.data.batch_size
         self.num_workers = config.data.num_workers
         self.tokenization_mode = config.data.tokenization_mode
-        skip_steps: int = config.data.skip_steps
+        self.skip_steps: int = config.data.skip_steps
+        self.step_counter = _SharedStepCounter(self.skip_steps)
         self.train_dataset = CurriculumTrainingDataset(data_path=self.data_path, split="train", 
                                                        augment=True, 
-                                                       tokenization_mode=self.tokenization_mode, reduce_ratio=config.data.reduce_ratio, skip_steps=skip_steps)
+                                                       tokenization_mode=self.tokenization_mode,
+                                                       reduce_ratio=config.data.reduce_ratio,
+                                                       skip_steps=self.skip_steps,
+                                                       step_counter=self.step_counter)
         self.val_dataset = RealDataset(data_path=self.data_path, split="val", augment=False, 
                                        tokenization_mode=self.tokenization_mode, reduce_ratio=config.data.reduce_ratio)
         self.test_dataset = RealDataset(data_path=self.data_path, split="test", augment=False, 
@@ -359,17 +528,32 @@ class CLFinetuningDataset(LightningDataModule):
         self.train_dataset.set_dictionaries(w2i, i2w)
         self.val_dataset.set_dictionaries(w2i, i2w)
         self.test_dataset.set_dictionaries(w2i, i2w)
+
+    @property
+    def curriculum_step_offset(self) -> int:
+        return self.skip_steps
         
     def train_dataloader(self):
-        return torch.utils.data.DataLoader(self.train_dataset, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=True, collate_fn=batch_preparation_img2seq)
+        trainer_step = int(self.trainer.global_step) if self.trainer is not None else 0
+        self.step_counter.reset(trainer_step + self.skip_steps)
+        return _build_dataloader(
+            self.train_dataset,
+            self.batch_size,
+            self.num_workers,
+            shuffle=True,
+            persistent_workers=True,
+        )
     
     def val_dataloader(self):
-        return torch.utils.data.DataLoader(self.val_dataset, batch_size=self.batch_size, num_workers=self.num_workers, collate_fn=batch_preparation_img2seq)
+        return _build_dataloader(self.val_dataset, self.batch_size, self.num_workers)
     
     def test_dataloader(self):
-        return torch.utils.data.DataLoader(self.test_dataset, batch_size=self.batch_size, num_workers=self.num_workers, collate_fn=batch_preparation_img2seq)
+        return _build_dataloader(self.test_dataset, self.batch_size, self.num_workers)
 
 class SynthRealFinetuningDataset(LightningDataModule):
+    encoder_unfreeze_step = SR_REAL_DATA_START_STEP
+    curriculum_step_offset = 0
+
     def __init__(self, config:ExperimentConfig) -> None:
         super().__init__()
         self.data_path = config.data.data_path
@@ -377,9 +561,12 @@ class SynthRealFinetuningDataset(LightningDataModule):
         self.batch_size = config.data.batch_size
         self.num_workers = config.data.num_workers
         self.tokenization_mode = config.data.tokenization_mode
+        self.step_counter = _SharedStepCounter()
         self.train_dataset = SynthToRealDataset(data_path=self.data_path, split="train", 
                                                        augment=True, 
-                                                       tokenization_mode=self.tokenization_mode, reduce_ratio=config.data.reduce_ratio)
+                                                       tokenization_mode=self.tokenization_mode,
+                                                       reduce_ratio=config.data.reduce_ratio,
+                                                       step_counter=self.step_counter)
         self.val_dataset = RealDataset(data_path=self.data_path, split="val", augment=False, 
                                        tokenization_mode=self.tokenization_mode, reduce_ratio=config.data.reduce_ratio)
         self.test_dataset = RealDataset(data_path=self.data_path, split="test", augment=False, 
@@ -392,10 +579,18 @@ class SynthRealFinetuningDataset(LightningDataModule):
         self.test_dataset.set_dictionaries(w2i, i2w)
         
     def train_dataloader(self):
-        return torch.utils.data.DataLoader(self.train_dataset, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=True, collate_fn=batch_preparation_img2seq)
+        trainer_step = int(self.trainer.global_step) if self.trainer is not None else 0
+        self.step_counter.reset(trainer_step)
+        return _build_dataloader(
+            self.train_dataset,
+            self.batch_size,
+            self.num_workers,
+            shuffle=True,
+            persistent_workers=True,
+        )
     
     def val_dataloader(self):
-        return torch.utils.data.DataLoader(self.val_dataset, batch_size=self.batch_size, num_workers=self.num_workers, collate_fn=batch_preparation_img2seq)
+        return _build_dataloader(self.val_dataset, self.batch_size, self.num_workers)
     
     def test_dataloader(self):
-        return torch.utils.data.DataLoader(self.test_dataset, batch_size=self.batch_size, num_workers=self.num_workers, collate_fn=batch_preparation_img2seq)
+        return _build_dataloader(self.test_dataset, self.batch_size, self.num_workers)

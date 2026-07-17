@@ -1,28 +1,55 @@
 import torch
 import random
-import numpy as np
 import wandb
 import lightning.pytorch as L
+from loguru import logger
 
 from .eval.eval_functions import compute_poliphony_metrics
 
 from . import _globals
 
+
+ENCODER_TRAINING_MODES = frozenset({"fine_tune", "linear_probe"})
+
+
 class SMTPP_Trainer(L.LightningModule):
-    def __init__(self, smt_config, smt_model):
+    def __init__(self, smt_config, smt_model, encoder_training_mode="fine_tune",
+                 encoder_unfreeze_step=None, curriculum_step_offset=0,
+                 enforce_checkpoint_protocol=True):
         super().__init__()
+        if (
+            not isinstance(encoder_training_mode, str)
+            or encoder_training_mode not in ENCODER_TRAINING_MODES
+        ):
+            raise ValueError(
+                f"encoder_training_mode must be one of {sorted(ENCODER_TRAINING_MODES)}, "
+                f"got {encoder_training_mode!r}"
+            )
+        if encoder_unfreeze_step is not None and (
+            isinstance(encoder_unfreeze_step, bool)
+            or not isinstance(encoder_unfreeze_step, int)
+            or encoder_unfreeze_step < 0
+        ):
+            raise ValueError("encoder_unfreeze_step must be a non-negative integer or None")
+        if (
+            isinstance(curriculum_step_offset, bool)
+            or not isinstance(curriculum_step_offset, int)
+            or curriculum_step_offset < 0
+        ):
+            raise ValueError("curriculum_step_offset must be a non-negative integer")
+
         self.model = smt_model
         self.padding_token = smt_config.padding_token
+        self.encoder_training_mode = encoder_training_mode
+        self.encoder_unfreeze_step = encoder_unfreeze_step
+        self.curriculum_step_offset = curriculum_step_offset
+        self.enforce_checkpoint_protocol = enforce_checkpoint_protocol
 
         self.preds = []
         self.grtrs = []
 
-        self.worst_loss = -1
-        self.worst_image = None
-        self.best_loss = np.inf
-        self.best_image = None
-
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=["smt_model", "enforce_checkpoint_protocol"])
+        self.model.freeze_encoder()
         self.unfrozen_vision = False
     
     def configure_optimizers(self):
@@ -30,25 +57,77 @@ class SMTPP_Trainer(L.LightningModule):
     
     def forward(self, input, last_preds):
         return self.model(input, last_preds)
-    
-    def training_step(self, batch):
-        
-        if not self.unfrozen_vision and self.global_step > 200000:
+
+    def _sync_encoder_trainability(self, step):
+        curriculum_step = step + self.curriculum_step_offset
+        should_unfreeze = (
+            self.encoder_training_mode == "fine_tune"
+            and self.encoder_unfreeze_step is not None
+            and curriculum_step >= self.encoder_unfreeze_step
+        )
+        if should_unfreeze and not self.unfrozen_vision:
             self.model.unfreeze_encoder()
             self.unfrozen_vision = True
-            
+            logger.info(
+                "Unfroze vision encoder at global step {} "
+                "(curriculum step: {}, boundary: {})",
+                step,
+                curriculum_step,
+                self.encoder_unfreeze_step,
+            )
+        elif not should_unfreeze and self.unfrozen_vision:
+            self.model.freeze_encoder()
+            self.unfrozen_vision = False
+
+    def on_load_checkpoint(self, checkpoint):
+        if not self.enforce_checkpoint_protocol:
+            return
+
+        hyper_parameters = checkpoint.get("hyper_parameters", {})
+        checkpoint_mode = hyper_parameters.get("encoder_training_mode")
+        if checkpoint_mode is None:
+            if self.encoder_training_mode != "fine_tune":
+                raise ValueError(
+                    "legacy checkpoints may only be resumed with "
+                    "encoder_training_mode='fine_tune'"
+                )
+            logger.warning(
+                "Legacy checkpoint has no encoder_training_mode; using explicit mode {!r} "
+                "with boundary {!r}",
+                self.encoder_training_mode,
+                self.encoder_unfreeze_step,
+            )
+            return
+        if checkpoint_mode != self.encoder_training_mode:
+            raise ValueError(
+                "Checkpoint encoder_training_mode mismatch: "
+                f"checkpoint={checkpoint_mode!r}, requested={self.encoder_training_mode!r}"
+            )
+
+        if "encoder_unfreeze_step" not in hyper_parameters:
+            raise ValueError("Checkpoint is missing encoder_unfreeze_step metadata")
+
+        checkpoint_boundary = hyper_parameters["encoder_unfreeze_step"]
+        if checkpoint_boundary != self.encoder_unfreeze_step:
+            raise ValueError(
+                "Checkpoint encoder_unfreeze_step mismatch: "
+                f"checkpoint={checkpoint_boundary!r}, requested={self.encoder_unfreeze_step!r}"
+            )
+
+        checkpoint_offset = hyper_parameters.get("curriculum_step_offset", 0)
+        if checkpoint_offset != self.curriculum_step_offset:
+            raise ValueError(
+                "Checkpoint curriculum_step_offset mismatch: "
+                f"checkpoint={checkpoint_offset!r}, requested={self.curriculum_step_offset!r}"
+            )
+
+    def training_step(self, batch):
+        self._sync_encoder_trainability(int(self.global_step))
+
         x, di, y, = batch
         outputs = self.model(x, di[:, :-1], labels=y)
         loss = outputs.loss
-        self.log('loss', loss, on_epoch=True, batch_size=1, prog_bar=True)
-        
-        if loss.item() > self.worst_loss:
-            self.worst_image = x
-            self.worst_loss = loss.item()
-        
-        if loss.item() < self.best_loss:
-            self.best_image = x
-            self.best_loss = loss.item()
+        self.log('loss', loss, on_step=False, on_epoch=True, batch_size=x.shape[0], prog_bar=True)
         
         return loss
         

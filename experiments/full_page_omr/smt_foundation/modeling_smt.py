@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import warnings
 from loguru import logger
 from torch.nn.init import xavier_uniform_
 from transformers import PreTrainedModel, ViTModel
@@ -42,32 +43,85 @@ IMPL_DICT = {
     "ViTMAEBase": [ViTModel, 768],    # MuSViT-Base
 }
 
+
+def _normalize_i2w(i2w):
+    if not isinstance(i2w, dict):
+        raise TypeError(f"i2w must be a dictionary, got {type(i2w).__name__}")
+
+    normalized = {}
+    for raw_key, token in i2w.items():
+        if isinstance(raw_key, bool):
+            raise TypeError("i2w token ids must be integers or numeric strings, got bool")
+        if isinstance(raw_key, (int, np.integer)):
+            token_id = int(raw_key)
+        elif isinstance(raw_key, str) and raw_key.isdecimal():
+            token_id = int(raw_key)
+        else:
+            raise TypeError(
+                f"i2w token ids must be integers or numeric strings, got {raw_key!r}"
+            )
+        if token_id < 0:
+            raise ValueError(f"i2w token ids must be non-negative, got {token_id}")
+        if not isinstance(token, str):
+            raise TypeError(f"i2w[{raw_key!r}] must be a string, got {type(token).__name__}")
+        if token_id in normalized and normalized[token_id] != token:
+            raise ValueError(
+                f"Conflicting i2w entries for token id {token_id}: "
+                f"{normalized[token_id]!r} != {token!r}"
+            )
+        normalized[token_id] = token
+    return normalized
+
+
 class PositionalEncoding2D(nn.Module):
 
-    def __init__(self, dim, h_max, w_max):
+    def __init__(self, dim, h_max=None, w_max=None):
         super(PositionalEncoding2D, self).__init__()
-        self.h_max = h_max
-        self.max_w = w_max
+        del h_max, w_max
+        if isinstance(dim, bool) or not isinstance(dim, int) or dim <= 0 or dim % 4 != 0:
+            raise ValueError("2D positional encoding dimension must be a positive multiple of 4")
         self.dim = dim
-        self.pe = torch.zeros((1, dim, h_max, w_max), device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'), requires_grad=False)
+        self.register_buffer("pe", None, persistent=False)
 
-        div = torch.exp(-torch.arange(0., dim // 2, 2) / dim * torch.log(torch.tensor(10000.0))).unsqueeze(1)
-        w_pos = torch.arange(0., w_max)
-        h_pos = torch.arange(0., h_max)
-        self.pe[:, :dim // 2:2, :, :] = torch.sin(h_pos * div).unsqueeze(0).unsqueeze(3).repeat(1, 1, 1, w_max)
-        self.pe[:, 1:dim // 2:2, :, :] = torch.cos(h_pos * div).unsqueeze(0).unsqueeze(3).repeat(1, 1, 1, w_max)
-        self.pe[:, dim // 2::2, :, :] = torch.sin(w_pos * div).unsqueeze(0).unsqueeze(2).repeat(1, 1, h_max, 1)
-        self.pe[:, dim // 2 + 1::2, :, :] = torch.cos(w_pos * div).unsqueeze(0).unsqueeze(2).repeat(1, 1, h_max, 1)
+    def _build(self, h, w, device, dtype):
+        calculation_dtype = (
+            torch.float32 if dtype in (torch.float16, torch.bfloat16) else dtype
+        )
+        div = torch.exp(
+            -torch.arange(0, self.dim // 2, 2, device=device, dtype=calculation_dtype)
+            / self.dim
+            * torch.log(torch.tensor(10000.0, device=device, dtype=calculation_dtype))
+        ).unsqueeze(1)
+        h_pos = torch.arange(h, device=device, dtype=calculation_dtype).unsqueeze(0)
+        w_pos = torch.arange(w, device=device, dtype=calculation_dtype).unsqueeze(0)
+        pe = torch.zeros((1, self.dim, h, w), device=device, dtype=calculation_dtype)
+        pe[:, :self.dim // 2:2] = torch.sin(div * h_pos).unsqueeze(0).unsqueeze(3).expand(-1, -1, -1, w)
+        pe[:, 1:self.dim // 2:2] = torch.cos(div * h_pos).unsqueeze(0).unsqueeze(3).expand(-1, -1, -1, w)
+        pe[:, self.dim // 2::2] = torch.sin(div * w_pos).unsqueeze(0).unsqueeze(2).expand(-1, -1, h, -1)
+        pe[:, self.dim // 2 + 1::2] = torch.cos(div * w_pos).unsqueeze(0).unsqueeze(2).expand(-1, -1, h, -1)
+        return pe.to(dtype=dtype)
+
+    def _ensure_cache(self, h, w, device, dtype):
+        expected_shape = (1, self.dim, h, w)
+        if (
+            self.pe is None
+            or tuple(self.pe.shape) != expected_shape
+            or self.pe.device != device
+            or self.pe.dtype != dtype
+        ):
+            self.pe = self._build(h, w, device, dtype)
 
     def forward(self, x):
         """
         Add 2D positional encoding to x
         x: (B, C, H, W)
         """
-        return x + self.pe[:, :, :x.size(2), :x.size(3)]
+        self._ensure_cache(x.size(2), x.size(3), x.device, x.dtype)
+        return x + self.pe
 
-    def get_pe_by_size(self, h, w, device):
-        return self.pe[:, :, :h, :w].to(device)
+    def get_pe_by_size(self, h, w, device, dtype=torch.float32):
+        self._ensure_cache(h, w, torch.device(device), dtype)
+        return self.pe
 
 
 class PositionalEncoding1D(nn.Module):
@@ -575,13 +629,13 @@ class SMTFoundationModelForCausalLM(PreTrainedModel):
         #    nn.Conv2d(256, 256, 2, 2)])
         
         self.freeze_encoder()
-        self.positional_2D = PositionalEncoding2D(config.d_model, config.maxh, config.maxw)
+        self.positional_2D = PositionalEncoding2D(config.d_model)
 
         self.padding_token = config.padding_token
         self.loss = nn.CrossEntropyLoss(ignore_index=self.padding_token)
 
         self.w2i = config.w2i
-        self.i2w = config.i2w
+        self.i2w = _normalize_i2w(config.i2w)
         self.maxlen = config.maxlen
         self.out_dir= config.out_dir
     
@@ -590,9 +644,8 @@ class SMTFoundationModelForCausalLM(PreTrainedModel):
             param.requires_grad = False
 
     def unfreeze_encoder(self):
-        pass
-        #for param in self.encoder.parameters():
-        #    param.requires_grad = True
+        for param in self.encoder.parameters():
+            param.requires_grad = True
 
     def forward_encoder(self, x):
         output = self.encoder(pixel_values=x, interpolate_pos_encoding=True).last_hidden_state
@@ -647,6 +700,13 @@ class SMTFoundationModelForCausalLM(PreTrainedModel):
     
     @torch.no_grad()    
     def predict(self, input, convert_to_str=False):
+        if convert_to_str:
+            warnings.warn(
+                "convert_to_str is deprecated; vocabulary keys are normalized automatically",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        del convert_to_str
         predicted_sequence = torch.from_numpy(np.asarray([self.w2i['<bos>']])).to(input.device).unsqueeze(0)
         encoder_output = self.forward_encoder(input).permute(0,2,1).contiguous()
         text_sequence = []
@@ -657,12 +717,15 @@ class SMTFoundationModelForCausalLM(PreTrainedModel):
                 output_attentions=False,
                 use_cache=False,
             )
-            predicted_token = torch.argmax(predictions.logits[:, :, -1]).item()
-            predicted_sequence = torch.cat([predicted_sequence, torch.argmax(predictions.logits[:, :, -1], dim=1, keepdim=True)], dim=1)
-            if convert_to_str:
-                predicted_token = f"{predicted_token}"
-            if self.i2w[predicted_token] == '<eos>':
+            next_token = torch.argmax(predictions.logits[:, :, -1], dim=1, keepdim=True)
+            predicted_token = int(next_token[0, 0].item())
+            predicted_sequence = torch.cat([predicted_sequence, next_token], dim=1)
+            try:
+                predicted_text = self.i2w[predicted_token]
+            except KeyError:
+                raise KeyError(f"Unknown predicted token id {predicted_token}") from None
+            if predicted_text == '<eos>':
                 break
-            text_sequence.append(self.i2w[predicted_token])
+            text_sequence.append(predicted_text)
         
         return text_sequence, predictions

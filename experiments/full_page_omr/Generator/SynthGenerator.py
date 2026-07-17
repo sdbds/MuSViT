@@ -1,5 +1,9 @@
 import re
 import os
+import sys
+import tempfile
+from contextlib import contextmanager
+
 import cv2
 
 import verovio
@@ -16,7 +20,54 @@ from rich import progress
 from cairosvg import svg2png
 
 import names
+from loguru import logger
 from wonderwords import RandomSentence
+
+from ..tokenization import validate_tokenization_mode
+
+
+class SyntheticScoreRenderError(RuntimeError):
+    """Raised when a generated score cannot be rendered safely."""
+
+
+class SyntheticScoreGenerationError(RuntimeError):
+    """Raised when a complete sample exhausts its render attempts."""
+
+
+@contextmanager
+def _capture_native_stderr():
+    """Capture native-library stderr so recoverable parser errors can be rejected."""
+    captured = [""]
+    stderr_fd = 2
+    try:
+        sys.stderr.flush()
+        saved_stderr_fd = os.dup(stderr_fd)
+    except (AttributeError, OSError, ValueError):
+        yield captured
+        return
+
+    with tempfile.TemporaryFile(mode="w+b") as buffer:
+        try:
+            os.dup2(buffer.fileno(), stderr_fd)
+            yield captured
+        finally:
+            sys.stderr.flush()
+            os.dup2(saved_stderr_fd, stderr_fd)
+            os.close(saved_stderr_fd)
+            buffer.seek(0)
+            captured[0] = buffer.read().decode(errors="replace")
+
+
+def _native_stderr_has_error(output):
+    return any(line.lstrip().startswith(("Error:", "[Error]")) for line in output.splitlines())
+
+
+def _native_error_summary(output):
+    return next(
+        (line.strip() for line in output.splitlines() if line.strip()),
+        "native parser error",
+    )
+
 
 def clean_kern(krn, avoid_tokens=['*Xped', '*staff1', '*staff2', '*tremolo', 
                                   '*ped', '*Xtuplet', '*tuplet', "*Xtremolo", 
@@ -57,12 +108,19 @@ def rint(start, end):
     return random.randint(start, end)        
 
 class VerovioGenerator():
-    def __init__(self, sources: list, split="train", tokenization_mode='bekern'):
+    def __init__(self, sources: list, split="train", tokenization_mode='bekern', max_render_attempts=20):
+        if max_render_attempts < 1:
+            raise ValueError("max_render_attempts must be at least 1")
+
+        tokenization_mode = validate_tokenization_mode(tokenization_mode)
         self.beat_db = self.load_beats(sources, split=split)
         verovio.enableLog(verovio.LOG_OFF)
         self.tk = verovio.toolkit()
-        
+
         self.tokenization_mode = tokenization_mode
+        self.max_render_attempts = max_render_attempts
+        self.render_attempts = 0
+        self.render_failures = 0
         self.title_generator = RandomSentence()
         self.textures = [os.path.join("Generator/paper_textures", f) for f in os.listdir("Generator/paper_textures") if os.path.isfile(os.path.join("Generator/paper_textures", f))]
 
@@ -113,21 +171,63 @@ class VerovioGenerator():
         return None
     
     def render(self, music_sequence):
-        self.tk.loadData(music_sequence)
-        self.tk.setOptions({"pageWidth": 2100, "footer": 'none', 
-                                'barLineWidth': rfloat(0.3, 0.8), 'beamMaxSlope': rfloat(10,20), 
-                                'staffLineWidth': rfloat(0.1, 0.3), 'spacingStaff': rfloat(1, 12)})
-        self.tk.getPageCount()
+        self.render_attempts += 1
+        with _capture_native_stderr() as native_stderr:
+            loaded = self.tk.loadData(music_sequence)
+
+        if not loaded or _native_stderr_has_error(native_stderr[0]):
+            reason = (
+                _native_error_summary(native_stderr[0])
+                if native_stderr[0]
+                else "Verovio rejected the generated Humdrum score"
+            )
+            self._raise_render_error(reason)
+        elif native_stderr[0]:
+            sys.stderr.write(native_stderr[0])
+            sys.stderr.flush()
+
+        options_set = self.tk.setOptions({"pageWidth": 2100, "footer": 'none',
+                                          'barLineWidth': rfloat(0.3, 0.8), 'beamMaxSlope': rfloat(10,20),
+                                          'staffLineWidth': rfloat(0.1, 0.3), 'spacingStaff': rfloat(1, 12)})
+        if not options_set:
+            self._raise_render_error("Verovio rejected the rendering options")
+        if self.tk.getPageCount() < 1:
+            self._raise_render_error("Verovio produced no pages for the generated score")
+
         svg = self.tk.renderToSVG()
+        if not svg:
+            self._raise_render_error("Verovio returned an empty SVG")
+        try:
+            ET.fromstring(svg)
+        except ET.ParseError as exc:
+            self._raise_render_error("Verovio returned malformed SVG", cause=exc)
+
         svg = svg.replace("overflow=\"inherit\"", "overflow=\"visible\"")
         return svg
+
+    def _raise_render_error(self, reason, cause=None):
+        self.render_failures += 1
+        if self.render_failures == 1 or self.render_failures % 25 == 0:
+            logger.warning(
+                "Rejected invalid synthetic score: {} (render failures: {}/{})",
+                reason,
+                self.render_failures,
+                self.render_attempts,
+            )
+        error = SyntheticScoreRenderError(reason)
+        if cause is None:
+            raise error
+        raise error from cause
     
     def convert_to_png(self, svg_file, cut=False):
         pngfile = svg2png(bytestring=svg_file, background_color='white')
         pngfile = cv2.imdecode(np.frombuffer(pngfile, np.uint8), -1)
+        if pngfile is None or pngfile.size == 0:
+            self._raise_render_error("The generated SVG could not be decoded as an image")
         if cut:
             cut_height = self.find_image_cut(pngfile)
-            pngfile = pngfile[:cut_height + 10, :]
+            if cut_height is not None:
+                pngfile = pngfile[:cut_height + 10, :]
         
         return pngfile
     
@@ -155,16 +255,29 @@ class VerovioGenerator():
         return [token for token in system if token != '']
     
     def generate_music_system_image(self, reduce_ratio=0.5):
-        num_systems = 0
-        
-        while num_systems != 1:
+        for _ in range(self.max_render_attempts):
             beat = random.choice(list(self.beat_db.keys()))
             music_seq = random.choice(self.beat_db[beat])
             render_sequence = "**kern\t**kern\n" + music_seq.replace(' <b> ', '\n').replace(' <s> ', ' ').replace(' <t> ', '\t').replace('@', '').replace('·', '')
-            image = self.render(render_sequence)
+            try:
+                image = self.render(render_sequence)
+            except SyntheticScoreRenderError:
+                continue
+
             num_systems = self.count_class_occurrences(svg_file=image, class_name='grpSym')
-        
-        x = self.convert_to_png(image, cut=True)
+            if num_systems != 1:
+                continue
+
+            try:
+                x = self.convert_to_png(image, cut=True)
+            except SyntheticScoreRenderError:
+                continue
+            break
+        else:
+            raise SyntheticScoreGenerationError(
+                f"Unable to generate a valid single-system score after {self.max_render_attempts} attempts"
+            )
+
         x = cv2.cvtColor(np.array(x), cv2.COLOR_BGR2RGB)
         width = int(np.ceil(x.shape[1] * reduce_ratio))
         height = int(np.ceil(x.shape[0] * reduce_ratio))
@@ -185,16 +298,13 @@ class VerovioGenerator():
 
     def generate_full_page_score(self, max_systems=2, strict_systems=False, strict_height=False, 
                                  include_title=False, include_author=False, texturize_image=True, reduce_ratio=0.5):
-        
         num_systems = max_systems
-        generated_systems = 0
-        x = None
-        
-        while generated_systems != num_systems and x is None:
-            beats = []
-            while len(beats) < num_systems:
-                beat = random.choice(list(self.beat_db.keys()))
-                beats = self.beat_db[beat]
+        eligible_beats = [beats for beats in self.beat_db.values() if len(beats) >= num_systems]
+        if not eligible_beats:
+            raise ValueError(f"No beat group contains {num_systems} source systems")
+
+        for _ in range(self.max_render_attempts):
+            beats = random.choice(eligible_beats)
             
             systems_to_compose = [system.split(" ") for system in random.sample(beats, num_systems)]
             complete_score = []
@@ -213,13 +323,25 @@ class VerovioGenerator():
             #preseq += f"!!!COM:{names.get_full_name()}\n" if include_author else ""
             render_sequence = preseq + "**kern\t**kern\n" + "".join(complete_score).replace('<b>', '\n').replace('<s>', ' ').replace('<t>', '\t').replace('@', '').replace('·', '')
             
-            image = self.render(render_sequence)
+            try:
+                image = self.render(render_sequence)
+            except SyntheticScoreRenderError:
+                continue
+
             generated_systems = self.count_class_occurrences(svg_file=image, class_name='grpSym')
-            
-            x = self.convert_to_png(image, cut=strict_height)
-            
-            if not strict_systems:
-                break
+            if generated_systems < 1 or (strict_systems and generated_systems != num_systems):
+                continue
+
+            try:
+                x = self.convert_to_png(image, cut=strict_height)
+            except SyntheticScoreRenderError:
+                continue
+            break
+        else:
+            raise SyntheticScoreGenerationError(
+                f"Unable to generate a valid {num_systems}-system score after "
+                f"{self.max_render_attempts} attempts"
+            )
 
         texture = Image.open(random.choice(self.textures))
         img_width, img_height = x.shape[1], x.shape[0]
