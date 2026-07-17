@@ -242,7 +242,7 @@ early_stopping = disabled
 
 新基线从 trainer step 0 开始：`from_checkpoint=None`、`starting_weights=None`、`skip_steps=0`，使用指定 foundation encoder 和新初始化的 adaptor/decoder。`max_steps=320000` 是该 run 的绝对 Trainer 终点，不是在某个旧 checkpoint 后追加 320000 steps。
 
-完整恢复使用 `from_checkpoint`，保留 checkpoint 的 `global_step`；此时 `max_steps` 仍表示恢复后 run 的绝对终点，必须大于 checkpoint step。实验分叉使用 `starting_weights` 建立新 Trainer，optimizer step 从 0 开始；它必须设置 `skip_steps=来源 curriculum_step`，而新 run 的 `samples_seen` 从 0 开始，并在独立实验规格中定义本 run 的更新预算，不继承基线的 320000 作为“追加步数”。
+完整恢复使用 `from_checkpoint`，保留 checkpoint 的 `global_step`；此时 `max_steps` 仍表示恢复后 run 的绝对终点，必须大于 checkpoint step。完整恢复还必须校验当前 `skip_steps` 等于 checkpoint 记录的 curriculum offset；缺少 offset 证据的 legacy checkpoint 只允许 `skip_steps=0`。实验分叉使用 `starting_weights` 建立新 Trainer，optimizer step 从 0 开始；它必须同时设置 `skip_steps=来源 curriculum_step` 和来源 checkpoint SHA-256，启动时重算文件 hash 并校验，而新 run 的 `samples_seen` 从 0 开始，并在独立实验规格中定义本 run 的更新预算，不继承基线的 320000 作为“追加步数”。
 
 EarlyStopping 从新基线中删除。若后续要在 curriculum 稳定后继续训练并使用 EarlyStopping，应建立单独 continuation 协议，明确起点、验证周期、patience 和最大终点，不能复用本基线的隐式状态。
 
@@ -253,7 +253,7 @@ checkpoint 文件名至少包含 `step` 和 `val_SER_v2`，W&B config 与本地�
 - run protocol version；
 - `max_steps` 和 `validation_every_n_batches`；
 - metric version；
-- checkpoint 来源和加载方式；
+- checkpoint 来源、加载方式、SHA-256、来源 curriculum step 及其证据；
 - encoder mode 与解冻边界；
 - resolution、reduce ratio、optimizer、precision、batch size 和 accumulation factor。
 
@@ -283,6 +283,8 @@ live run 的结果可以作为 legacy 诊断样本，但不能与新协议 run �
 - post-unfreeze：待分析的后续 checkpoint，记录其准确 step。
 
 当前工作区没有 pre-unfreeze checkpoint，因此本项在 archived checkpoint 被恢复前只能完成 post-unfreeze 漂移测量，不能声称完成 pre/post val 对照。不得用 step 282200 的 `epoch3500` 代替 pre-unfreeze。
+
+允许的 post-only 诊断已在 source revision `441771f94a0400156c146853b01dadf586d28e30` 上完成。step 282200 checkpoint 的 `SER_v2=13.400844`，10 页全部命中 EOS、无截断；相对固定 foundation snapshot 的 encoder 全局 `relative_l2=0.252046`，逐 block 为 `0.861474` 至 `1.040596`。报告状态保持 `partial`，不据此声称解冻导致退化；完整身份、逐页指标和漂移表归档于 `docs/superpowers/reports/2026-07-17-full-page-omr-post-only-diagnostic.md`。
 
 归档来源无法从当前仓库事实推导，规格不编造路径。负责该 run 的操作者必须恢复真实文件并提供来源记录；在此之前，完整诊断门禁保持 `blocked`，不是由实现者自行挑选替代 checkpoint 的待办项。
 
@@ -325,7 +327,7 @@ relative_l2 = ||theta_checkpoint - theta_pretrained||_2
 - `reduce_ratio=1.0` 时跳过同尺寸 OpenCV resize，避免无意义插值；
 - Mozarteum 行为不变。
 
-这是新数据分布，不能在 live run 中途切换。实验记录首批输入的原始尺寸、中间尺寸和最终尺寸，并保存固定样本的变换前后校验图供人工检查。
+这是新数据分布，不能在 live run 中途切换。实验记录首批实际训练输入的来源、原始尺寸、中间尺寸和最终尺寸，并保存固定 real row 0 的变换前后校验图供人工检查。尺寸 metadata 随 batch 经 collate 回到主进程，由首批 callback 归档；它不改变 curriculum 选择或模型输入。每次启动使用独立本地 run-record id，避免同名实验覆盖旧审计记录。
 
 ### 5.2 Optimizer 诊断分叉
 
