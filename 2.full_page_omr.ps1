@@ -20,6 +20,8 @@ $Config = @{
     checkpoint_every_n_epochs = 100   # Periodic full checkpoint interval
     learning_rate          = $null    # $null uses the experiment default (1e-4)
     attention_backend      = "auto"   # auto: FA2 -> SDPA -> eager fallback
+    protocol_version       = "full_page_omr_eval_v2"
+    source_curriculum_step = $null    # Required with starting_weights
     from_checkpoint        = $null    # Start a fresh Trainer run
     starting_weights       = $null    # Initialize model weights from a .ckpt file
 }
@@ -181,9 +183,24 @@ if ($Env:OS -eq "Windows_NT") {
 if ([string]::IsNullOrWhiteSpace($Config.experiment_name)) {
     throw "experiment_name must not be empty."
 }
+if ([string]::IsNullOrWhiteSpace($Config.protocol_version)) {
+    throw "protocol_version must not be empty."
+}
 if (-not [string]::IsNullOrWhiteSpace($Config.from_checkpoint) -and
     -not [string]::IsNullOrWhiteSpace($Config.starting_weights)) {
     throw "from_checkpoint and starting_weights are mutually exclusive."
+}
+if (-not [string]::IsNullOrWhiteSpace($Config.starting_weights)) {
+    $SourceCurriculumStep = 0
+    if ($null -eq $Config.source_curriculum_step -or
+        -not [int]::TryParse([string]$Config.source_curriculum_step, [ref]$SourceCurriculumStep) -or
+        $SourceCurriculumStep -lt 0) {
+        throw "source_curriculum_step must be a non-negative integer with starting_weights."
+    }
+    $Config.source_curriculum_step = $SourceCurriculumStep
+}
+elseif ($null -ne $Config.source_curriculum_step) {
+    throw "source_curriculum_step requires starting_weights."
 }
 
 $CheckpointEveryNEpochs = 0
@@ -239,6 +256,7 @@ $UvArgs = [System.Collections.ArrayList]::new()
 [void]$UvArgs.Add("--checkpoint_every_n_epochs=$($Config.checkpoint_every_n_epochs)")
 [void]$UvArgs.Add("--train=$($Features.train.ToString().ToLowerInvariant())")
 [void]$UvArgs.Add("--attention_backend=$($Config.attention_backend)")
+[void]$UvArgs.Add("--protocol_version=$($Config.protocol_version)")
 
 if ($null -ne $Config.resolution) {
     [void]$UvArgs.Add("--resolution=$($Config.resolution)")
@@ -253,6 +271,7 @@ if (-not [string]::IsNullOrWhiteSpace($Config.from_checkpoint)) {
 if (-not [string]::IsNullOrWhiteSpace($Config.starting_weights)) {
     $StartingWeightsPath = Resolve-InputFile -Path $Config.starting_weights -SettingName "starting_weights"
     [void]$UvArgs.Add("--starting_weights=$StartingWeightsPath")
+    [void]$UvArgs.Add("--source_curriculum_step=$($Config.source_curriculum_step)")
 }
 
 $DisplayArgs = $UvArgs | ForEach-Object {

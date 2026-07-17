@@ -355,6 +355,28 @@ class DataLoaderPipelineTests(unittest.TestCase):
         resize.assert_not_called()
         self.assertIs(image, rows.samples[0]["image"])
 
+    def test_resize_audit_uses_the_same_intermediate_and_final_pipeline(self):
+        rows = _FakeArrowRows()
+        final = torch.zeros((1, 3, 8, 8))
+        with (
+            patch.object(data, "load_dataset", return_value=rows),
+            patch.object(data, "parse_kern_file", return_value=["note"]),
+            patch.object(data.cv2, "resize", return_value=np.zeros((2, 3, 3), dtype=np.uint8)),
+            patch.object(data, "convert_img_to_tensor", return_value=final) as convert,
+        ):
+            source = data._ArrowOMRSource(
+                "example/dataset",
+                "train",
+                "bekern",
+                reduce_ratio=0.5,
+            )
+            stages = source.resize_audit(0)
+
+        self.assertEqual(stages.raw.shape, (4, 6, 3))
+        self.assertEqual(stages.intermediate.shape, (2, 3, 3))
+        self.assertIs(stages.final, final)
+        convert.assert_called_once_with(stages.intermediate)
+
     def test_single_resize_config_is_isolated_from_baselines(self):
         config_root = (
             Path(__file__).resolve().parents[1]

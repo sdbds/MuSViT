@@ -4,6 +4,7 @@ import torch
 import random
 import multiprocessing
 import numpy as np
+from dataclasses import dataclass
 from .config.ExperimentConfigWrapper import ExperimentConfig
 from .Generator.SynthGenerator import VerovioGenerator, SyntheticScoreGenerationError
 from .data_augmentation.data_augmentation import augment, convert_img_to_tensor
@@ -19,6 +20,13 @@ CL_CURRICULUM_STAGE_STEPS = 40000
 CL_SYNTHETIC_STAGES = 3
 CL_REAL_DATA_START_STEP = CL_CURRICULUM_STAGE_STEPS * CL_SYNTHETIC_STAGES
 SR_REAL_DATA_START_STEP = 200000
+
+
+@dataclass(frozen=True)
+class ResizeAuditStages:
+    raw: np.ndarray
+    intermediate: np.ndarray
+    final: torch.Tensor
 
 
 class _SharedStepCounter:
@@ -164,14 +172,27 @@ class _ArrowOMRSource:
             '<eos>',
         ]
 
-    def __getitem__(self, index):
+    def _image_stages(self, index):
         sample = self.rows[index]
-        image = np.asarray(sample['image'])
+        raw = np.asarray(sample['image'])
+        intermediate = raw
         if self.reduce_ratio != 1.0:
-            width = int(np.ceil(image.shape[1] * self.reduce_ratio))
-            height = int(np.ceil(image.shape[0] * self.reduce_ratio))
-            image = cv2.resize(image, (width, height))
-        return image, self._tokenize(sample["transcription"])
+            width = int(np.ceil(raw.shape[1] * self.reduce_ratio))
+            height = int(np.ceil(raw.shape[0] * self.reduce_ratio))
+            intermediate = cv2.resize(raw, (width, height))
+        return sample, raw, intermediate
+
+    def __getitem__(self, index):
+        sample, _, intermediate = self._image_stages(index)
+        return intermediate, self._tokenize(sample["transcription"])
+
+    def resize_audit(self, index) -> ResizeAuditStages:
+        _, raw, intermediate = self._image_stages(index)
+        return ResizeAuditStages(
+            raw=raw,
+            intermediate=intermediate,
+            final=convert_img_to_tensor(intermediate),
+        )
 
     def iter_token_sequences(self):
         for transcription in self.rows["transcription"]:

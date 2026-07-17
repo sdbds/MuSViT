@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from experiments.full_page_omr import entrypoint, finetune
+from experiments.full_page_omr import data, entrypoint, finetune
 from experiments.full_page_omr import smt_trainer
 from experiments.full_page_omr.smt_trainer import SMTPP_Trainer
 
@@ -45,6 +45,10 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
         self.assertEqual(signature.parameters["encoder_training_mode"].default, "fine_tune")
         self.assertEqual(signature.parameters["validation_every_n_batches"].default, 10000)
         self.assertEqual(signature.parameters["max_steps"].default, 320000)
+        self.assertEqual(
+            signature.parameters["protocol_version"].default,
+            "full_page_omr_eval_v2",
+        )
 
         config_path = REPO_ROOT / "experiments/full_page_omr/config/Polish_Scores/finetuning.json"
         with patch.object(entrypoint, "_launch") as launch:
@@ -55,12 +59,19 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                 attention_backend="sdpa",
                 encoder_training_mode="linear_probe",
                 validation_every_n_batches=25000,
+                protocol_version="full_page_omr_resize_v1",
+                source_curriculum_step=282200,
             )
 
         self.assertEqual(launch.call_args.kwargs["checkpoint_every_n_epochs"], 37)
         self.assertEqual(launch.call_args.kwargs["attention_backend"], "sdpa")
         self.assertEqual(launch.call_args.kwargs["encoder_training_mode"], "linear_probe")
         self.assertEqual(launch.call_args.kwargs["validation_every_n_batches"], 25000)
+        self.assertEqual(
+            launch.call_args.kwargs["protocol_version"],
+            "full_page_omr_resize_v1",
+        )
+        self.assertEqual(launch.call_args.kwargs["source_curriculum_step"], 282200)
 
     def test_launch_forwards_checkpoint_interval_to_main(self):
         config = {
@@ -83,12 +94,19 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                     checkpoint_every_n_epochs=37,
                     encoder_training_mode="linear_probe",
                     validation_every_n_batches=25000,
+                    protocol_version="full_page_omr_resize_v1",
+                    source_curriculum_step=282200,
                 )
 
         self.assertEqual(main.call_args.kwargs["checkpoint_every_n_epochs"], 37)
         self.assertEqual(main.call_args.kwargs["encoder_training_mode"], "linear_probe")
         self.assertEqual(main.call_args.kwargs["validation_every_n_batches"], 25000)
         self.assertEqual(main.call_args.kwargs["max_steps"], 320000)
+        self.assertEqual(
+            main.call_args.kwargs["protocol_version"],
+            "full_page_omr_resize_v1",
+        )
+        self.assertEqual(main.call_args.kwargs["source_curriculum_step"], 282200)
 
     def test_checkpoint_interval_must_be_a_positive_integer(self):
         for value in (0, -1, True, 1.5):
@@ -271,6 +289,48 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
         self.assertEqual(metadata["accumulate_grad_batches"], 1)
         self.assertEqual(metadata["reduce_ratio"], 0.5)
 
+    def test_protocol_metadata_is_archived_locally(self):
+        metadata = {"protocol_version": "full_page_omr_resize_v1", "max_steps": 20000}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = finetune._write_protocol_metadata(
+                "polish-resize",
+                metadata,
+                output_root=Path(tmpdir),
+            )
+
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), metadata)
+            self.assertEqual(path.name, "protocol.json")
+
+    def test_resize_audit_archives_shapes_and_check_images(self):
+        stages = data.ResizeAuditStages(
+            raw=torch.zeros(4, 6, 3, dtype=torch.uint8).numpy(),
+            intermediate=torch.zeros(2, 3, 3, dtype=torch.uint8).numpy(),
+            final=torch.zeros(1, 3, 8, 8),
+        )
+        source = Mock()
+        source.resize_audit.return_value = stages
+        module = SimpleNamespace(
+            train_dataset=SimpleNamespace(real_source=source),
+            batch_size=1,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = finetune._write_resize_audit(
+                module,
+                experiment_name="polish-resize",
+                protocol_version="full_page_omr_resize_v1",
+                reduce_ratio=0.5,
+                resolution=8,
+                output_root=Path(tmpdir),
+            )
+            report = json.loads(path.read_text(encoding="utf-8"))
+
+            self.assertEqual(report["raw_shape_hwc"], [4, 6, 3])
+            self.assertEqual(report["intermediate_shape_hwc"], [2, 3, 3])
+            self.assertEqual(report["final_shape_nchw"], [1, 3, 8, 8])
+            for filename in ("raw.png", "intermediate.png", "final.png"):
+                self.assertTrue((path.parent / filename).is_file())
+
     @unittest.skipUnless(sys.platform == "win32", "PowerShell launcher is Windows-specific")
     def test_powershell_dry_run_includes_default_checkpoint_interval(self):
         result = subprocess.run(
@@ -292,6 +352,7 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
         self.assertIn("--validation_every_n_batches=10000", result.stdout)
         self.assertIn("--max_steps=320000", result.stdout)
         self.assertIn("--encoder_training_mode=fine_tune", result.stdout)
+        self.assertIn("--protocol_version=full_page_omr_eval_v2", result.stdout)
         self.assertIn("(num_workers=24)", result.stdout)
 
     def test_missing_best_checkpoint_saves_an_end_checkpoint(self):

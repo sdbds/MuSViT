@@ -4,6 +4,8 @@ from pathlib import Path
 
 from fire import Fire
 from loguru import logger
+import numpy as np
+from PIL import Image
 import torch
 
 from . import _globals
@@ -266,7 +268,13 @@ def _build_protocol_metadata(*, max_steps, validation_every_n_batches,
                              resolution, reduce_ratio, batch_size,
                              protocol_version=PROTOCOL_VERSION,
                              source_curriculum_step=None,
-                             checkpoint_state=None):
+                             checkpoint_state=None,
+                             curriculum_step_offset=0,
+                             finetuning_technique=None,
+                             attention_backend=None,
+                             tokenization_mode=None,
+                             num_workers=None,
+                             checkpoint_every_n_epochs=None):
     if from_checkpoint is not None:
         checkpoint_source = from_checkpoint
         checkpoint_load_mode = "full"
@@ -276,6 +284,8 @@ def _build_protocol_metadata(*, max_steps, validation_every_n_batches,
     else:
         checkpoint_source = "foundation"
         checkpoint_load_mode = "fresh"
+    if checkpoint_state is not None:
+        checkpoint_source = checkpoint_state.path
     return {
         "protocol_version": protocol_version,
         "metric_version": METRIC_VERSION,
@@ -288,12 +298,18 @@ def _build_protocol_metadata(*, max_steps, validation_every_n_batches,
             checkpoint_state.global_step if checkpoint_state is not None else None
         ),
         "source_curriculum_step": source_curriculum_step,
+        "curriculum_step_offset": curriculum_step_offset,
         "source_curriculum_step_evidence": (
             checkpoint_state.curriculum_step_source
             if checkpoint_state is not None else None
         ),
         "encoder_training_mode": encoder_training_mode,
         "encoder_unfreeze_step": encoder_unfreeze_step,
+        "finetuning_technique": finetuning_technique,
+        "attention_backend": attention_backend,
+        "tokenization_mode": tokenization_mode,
+        "num_workers": num_workers,
+        "checkpoint_every_n_epochs": checkpoint_every_n_epochs,
         "resolution": resolution,
         "reduce_ratio": reduce_ratio,
         "optimizer": "Adam",
@@ -302,6 +318,116 @@ def _build_protocol_metadata(*, max_steps, validation_every_n_batches,
         "batch_size": batch_size,
         "accumulate_grad_batches": ACCUMULATE_GRAD_BATCHES,
     }
+
+
+def _run_record_directory(experiment_name: str, protocol_version: str,
+                          output_root: Path) -> Path:
+    for field_name, value in (
+        ("experiment_name", experiment_name),
+        ("protocol_version", protocol_version),
+    ):
+        if not isinstance(value, str) or not value.strip() or Path(value).name != value:
+            raise ValueError(f"{field_name} must be a single non-empty path component")
+    directory = Path(output_root) / experiment_name / protocol_version
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def _write_json(path: Path, payload) -> Path:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+    return path.resolve()
+
+
+def _write_protocol_metadata(experiment_name: str, metadata,
+                             *, output_root=Path("logs")) -> Path:
+    protocol_version = _validate_protocol_version(metadata.get("protocol_version"))
+    directory = _run_record_directory(
+        experiment_name,
+        protocol_version,
+        Path(output_root),
+    )
+    return _write_json(directory / "protocol.json", metadata)
+
+
+def _save_hwc_image(path: Path, image) -> None:
+    array = np.asarray(image)
+    if array.ndim != 3 or array.shape[2] not in (1, 3, 4):
+        raise ValueError(f"audit image must be HWC, got shape {array.shape}")
+    if array.dtype != np.uint8:
+        array = np.clip(array, 0, 255).astype(np.uint8)
+    if array.shape[2] == 1:
+        array = array[:, :, 0]
+    Image.fromarray(array).save(path)
+
+
+def _final_tensor_as_hwc(final: torch.Tensor) -> np.ndarray:
+    if not isinstance(final, torch.Tensor) or final.ndim != 4 or final.shape[0] != 1:
+        raise ValueError("final audit image must be a rank-4 tensor with batch size 1")
+    if final.shape[1] not in (1, 3, 4):
+        raise ValueError(f"final audit tensor has unsupported channels: {final.shape[1]}")
+    return (
+        final.detach()
+        .cpu()
+        .squeeze(0)
+        .permute(1, 2, 0)
+        .clamp(0, 1)
+        .mul(255)
+        .round()
+        .to(torch.uint8)
+        .numpy()
+    )
+
+
+def _write_resize_audit(data, *, experiment_name: str, protocol_version: str,
+                        reduce_ratio: float, resolution: int,
+                        output_root=Path("logs")) -> Path:
+    source = getattr(getattr(data, "train_dataset", None), "real_source", None)
+    source_split = "train"
+    if source is None:
+        source = getattr(getattr(data, "val_dataset", None), "real_source", None)
+        source_split = "val"
+    if source is None or not hasattr(source, "resize_audit"):
+        raise ValueError("data module does not expose a real source for resize audit")
+
+    stages = source.resize_audit(0)
+    final_shape = list(stages.final.shape)
+    expected_shape = [1, 3, resolution, resolution]
+    if final_shape != expected_shape:
+        raise ValueError(
+            f"final resize audit shape must be {expected_shape}, got {final_shape}"
+        )
+
+    directory = _run_record_directory(
+        experiment_name,
+        protocol_version,
+        Path(output_root),
+    ) / "input_audit"
+    directory.mkdir(parents=True, exist_ok=True)
+    _save_hwc_image(directory / "raw.png", stages.raw)
+    _save_hwc_image(directory / "intermediate.png", stages.intermediate)
+    _save_hwc_image(directory / "final.png", _final_tensor_as_hwc(stages.final))
+    return _write_json(
+        directory / "resize.json",
+        {
+            "audit_scope": f"fixed_real_{source_split}_row_0",
+            "row_index": 0,
+            "batch_size": data.batch_size,
+            "reduce_ratio": reduce_ratio,
+            "raw_shape_hwc": list(stages.raw.shape),
+            "intermediate_shape_hwc": list(stages.intermediate.shape),
+            "final_shape_nchw": final_shape,
+            "images": {
+                "raw": "raw.png",
+                "intermediate": "intermediate.png",
+                "final": "final.png",
+            },
+        },
+    )
 
 
 def _select_test_checkpoint(trainer, checkpointer, experiment_name: str,
@@ -443,25 +569,42 @@ def main(config: ExperimentConfig, experiment_name,
         finetuning_technique,
     )
 
+    protocol_metadata = _build_protocol_metadata(
+        max_steps=max_steps,
+        validation_every_n_batches=validation_every_n_batches,
+        from_checkpoint=from_checkpoint,
+        starting_weights=starting_weights,
+        encoder_training_mode=encoder_training_mode,
+        encoder_unfreeze_step=encoder_unfreeze_step,
+        resolution=resolution,
+        reduce_ratio=config.data.reduce_ratio,
+        batch_size=data.batch_size,
+        protocol_version=protocol_version,
+        source_curriculum_step=source_curriculum_step,
+        checkpoint_state=checkpoint_state,
+        curriculum_step_offset=curriculum_step_offset,
+        finetuning_technique=finetuning_technique,
+        attention_backend=attention_backend,
+        tokenization_mode=data.tokenization_mode,
+        num_workers=data.num_workers,
+        checkpoint_every_n_epochs=checkpoint_every_n_epochs,
+    )
+    resize_audit_path = _write_resize_audit(
+        data,
+        experiment_name=experiment_name,
+        protocol_version=protocol_version,
+        reduce_ratio=config.data.reduce_ratio,
+        resolution=resolution,
+    )
+    protocol_metadata["resize_audit_path"] = str(resize_audit_path)
+    protocol_path = _write_protocol_metadata(experiment_name, protocol_metadata)
+    logger.info("Local run protocol: {}", protocol_path)
+    logger.info("{}", json.dumps(protocol_metadata, sort_keys=True))
+
     wandb_logger = WandbLogger(project='Foundation_SMT',
                                name=f"{experiment_name}",
                                log_model=False, save_dir="wandb_logs/")
-    wandb_logger.log_hyperparams(
-        _build_protocol_metadata(
-            max_steps=max_steps,
-            validation_every_n_batches=validation_every_n_batches,
-            from_checkpoint=from_checkpoint,
-            starting_weights=starting_weights,
-            encoder_training_mode=encoder_training_mode,
-            encoder_unfreeze_step=encoder_unfreeze_step,
-            resolution=resolution,
-            reduce_ratio=config.data.reduce_ratio,
-            batch_size=data.batch_size,
-            protocol_version=protocol_version,
-            source_curriculum_step=source_curriculum_step,
-            checkpoint_state=checkpoint_state,
-        )
-    )
+    wandb_logger.log_hyperparams(protocol_metadata)
 
     trainer = Trainer(**_build_trainer_kwargs(
         max_steps=max_steps,
