@@ -155,7 +155,10 @@ class DataLoaderPipelineTests(unittest.TestCase):
     def _make_cl_data_module(self, num_workers):
         module = data.CLFinetuningDataset.__new__(data.CLFinetuningDataset)
         LightningDataModule.__init__(module)
-        module.trainer = SimpleNamespace(global_step=123)
+        module.trainer = SimpleNamespace(
+            global_step=999,
+            lightning_module=SimpleNamespace(samples_seen=23),
+        )
         module.batch_size = 1
         module.num_workers = num_workers
         module.skip_steps = 120000
@@ -163,12 +166,28 @@ class DataLoaderPipelineTests(unittest.TestCase):
         module.train_dataset = _TinySequenceDataset()
         return module
 
-    def test_train_loader_resets_counter_from_restored_global_step(self):
+    def test_train_loader_resets_counter_from_restored_samples_seen(self):
         module = self._make_cl_data_module(num_workers=0)
 
         module.train_dataloader()
 
-        self.assertEqual(module.step_counter.reserve(), 120123)
+        self.assertEqual(module.step_counter.reserve(), 120023)
+
+    def test_synth_real_loader_resets_counter_from_restored_samples_seen(self):
+        module = data.SynthRealFinetuningDataset.__new__(data.SynthRealFinetuningDataset)
+        LightningDataModule.__init__(module)
+        module.trainer = SimpleNamespace(
+            global_step=999,
+            lightning_module=SimpleNamespace(samples_seen=23),
+        )
+        module.batch_size = 1
+        module.num_workers = 0
+        module.step_counter = data._SharedStepCounter(0)
+        module.train_dataset = _TinySequenceDataset()
+
+        module.train_dataloader()
+
+        self.assertEqual(module.step_counter.reserve(), 23)
 
     def test_cl_course_exposes_skip_steps_as_curriculum_offset(self):
         module = self._make_cl_data_module(num_workers=0)

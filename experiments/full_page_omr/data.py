@@ -500,6 +500,18 @@ class SyntheticGrandStaffDataset(LightningDataModule):
         return _build_dataloader(self.test_dataset, self.batch_size, self.num_workers)
 
 # CL2 and CL3
+def _restored_samples_seen(trainer) -> int:
+    if trainer is None:
+        return 0
+    lightning_module = getattr(trainer, "lightning_module", None)
+    if lightning_module is None or not hasattr(lightning_module, "samples_seen"):
+        raise RuntimeError("Trainer module is missing the restored samples_seen counter")
+    samples_seen = lightning_module.samples_seen
+    if isinstance(samples_seen, bool) or not isinstance(samples_seen, int) or samples_seen < 0:
+        raise ValueError(f"samples_seen must be a non-negative integer, got {samples_seen!r}")
+    return samples_seen
+
+
 class CLFinetuningDataset(LightningDataModule):
     encoder_unfreeze_step = CL_REAL_DATA_START_STEP
 
@@ -534,8 +546,8 @@ class CLFinetuningDataset(LightningDataModule):
         return self.skip_steps
         
     def train_dataloader(self):
-        trainer_step = int(self.trainer.global_step) if self.trainer is not None else 0
-        self.step_counter.reset(trainer_step + self.skip_steps)
+        samples_seen = _restored_samples_seen(self.trainer)
+        self.step_counter.reset(samples_seen + self.skip_steps)
         return _build_dataloader(
             self.train_dataset,
             self.batch_size,
@@ -579,8 +591,8 @@ class SynthRealFinetuningDataset(LightningDataModule):
         self.test_dataset.set_dictionaries(w2i, i2w)
         
     def train_dataloader(self):
-        trainer_step = int(self.trainer.global_step) if self.trainer is not None else 0
-        self.step_counter.reset(trainer_step)
+        samples_seen = _restored_samples_seen(self.trainer)
+        self.step_counter.reset(samples_seen)
         return _build_dataloader(
             self.train_dataset,
             self.batch_size,

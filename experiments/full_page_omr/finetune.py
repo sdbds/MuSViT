@@ -26,6 +26,7 @@ PROTOCOL_VERSION = "full_page_omr_eval_v2"
 METRIC_VERSION = "canonical_v2"
 CHECKPOINT_MONITOR = "val_SER_v2"
 PRECISION = "16-mixed"
+ACCUMULATE_GRAD_BATCHES = 1
 
 
 def _validate_checkpoint_every_n_epochs(value: int) -> int:
@@ -141,6 +142,7 @@ def _build_trainer_kwargs(*, max_steps: int, validation_every_n_batches: int,
         "callbacks": callbacks,
         "logger": logger,
         "precision": PRECISION,
+        "accumulate_grad_batches": ACCUMULATE_GRAD_BATCHES,
     }
 
 
@@ -173,7 +175,7 @@ def _build_protocol_metadata(*, max_steps, validation_every_n_batches,
         "learning_rate": _globals.learning_rate,
         "precision": PRECISION,
         "batch_size": batch_size,
-        "accumulate_grad_batches": 1,
+        "accumulate_grad_batches": ACCUMULATE_GRAD_BATCHES,
     }
 
 
@@ -276,6 +278,8 @@ def main(config: ExperimentConfig, experiment_name,
             encoder_training_mode=encoder_training_mode,
             encoder_unfreeze_step=encoder_unfreeze_step,
             curriculum_step_offset=curriculum_step_offset,
+            batch_size=data.batch_size,
+            accumulate_grad_batches=ACCUMULATE_GRAD_BATCHES,
         )
     else:
         model_wrapper = SMTPP_Trainer.load_from_checkpoint(
@@ -285,6 +289,8 @@ def main(config: ExperimentConfig, experiment_name,
             encoder_training_mode=encoder_training_mode,
             encoder_unfreeze_step=encoder_unfreeze_step,
             curriculum_step_offset=curriculum_step_offset,
+            batch_size=data.batch_size,
+            accumulate_grad_batches=ACCUMULATE_GRAD_BATCHES,
             enforce_checkpoint_protocol=False,
             weights_only=False,
         )

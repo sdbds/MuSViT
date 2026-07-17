@@ -15,11 +15,25 @@ from . import _globals
 
 
 ENCODER_TRAINING_MODES = frozenset({"fine_tune", "linear_probe"})
+SAMPLES_SEEN_CHECKPOINT_KEY = "full_page_omr_samples_seen"
+
+
+def _validate_non_negative_integer(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+    return value
+
+
+def _validate_positive_integer(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    return value
 
 
 class SMTPP_Trainer(L.LightningModule):
     def __init__(self, smt_config, smt_model, encoder_training_mode="fine_tune",
                  encoder_unfreeze_step=None, curriculum_step_offset=0,
+                 batch_size=1, accumulate_grad_batches=1,
                  enforce_checkpoint_protocol=True):
         super().__init__()
         if (
@@ -42,13 +56,21 @@ class SMTPP_Trainer(L.LightningModule):
             or curriculum_step_offset < 0
         ):
             raise ValueError("curriculum_step_offset must be a non-negative integer")
+        batch_size = _validate_positive_integer(batch_size, "batch_size")
+        accumulate_grad_batches = _validate_positive_integer(
+            accumulate_grad_batches,
+            "accumulate_grad_batches",
+        )
 
         self.model = smt_model
         self.padding_token = smt_config.padding_token
         self.encoder_training_mode = encoder_training_mode
         self.encoder_unfreeze_step = encoder_unfreeze_step
         self.curriculum_step_offset = curriculum_step_offset
+        self.batch_size = batch_size
+        self.accumulate_grad_batches = accumulate_grad_batches
         self.enforce_checkpoint_protocol = enforce_checkpoint_protocol
+        self.samples_seen = 0
 
         self.preds = []
         self.grtrs = []
@@ -63,8 +85,12 @@ class SMTPP_Trainer(L.LightningModule):
     def forward(self, input, last_preds):
         return self.model(input, last_preds)
 
-    def _sync_encoder_trainability(self, step):
-        curriculum_step = step + self.curriculum_step_offset
+    @property
+    def curriculum_step(self):
+        return self.curriculum_step_offset + self.samples_seen
+
+    def _sync_encoder_trainability(self):
+        curriculum_step = self.curriculum_step
         should_unfreeze = (
             self.encoder_training_mode == "fine_tune"
             and self.encoder_unfreeze_step is not None
@@ -74,9 +100,9 @@ class SMTPP_Trainer(L.LightningModule):
             self.model.unfreeze_encoder()
             self.unfrozen_vision = True
             logger.info(
-                "Unfroze vision encoder at global step {} "
+                "Unfroze vision encoder after {} consumed samples "
                 "(curriculum step: {}, boundary: {})",
-                step,
+                self.samples_seen,
                 curriculum_step,
                 self.encoder_unfreeze_step,
             )
@@ -102,37 +128,66 @@ class SMTPP_Trainer(L.LightningModule):
                 self.encoder_training_mode,
                 self.encoder_unfreeze_step,
             )
+        else:
+            if checkpoint_mode != self.encoder_training_mode:
+                raise ValueError(
+                    "Checkpoint encoder_training_mode mismatch: "
+                    f"checkpoint={checkpoint_mode!r}, requested={self.encoder_training_mode!r}"
+                )
+
+            if "encoder_unfreeze_step" not in hyper_parameters:
+                raise ValueError("Checkpoint is missing encoder_unfreeze_step metadata")
+
+            checkpoint_boundary = hyper_parameters["encoder_unfreeze_step"]
+            if checkpoint_boundary != self.encoder_unfreeze_step:
+                raise ValueError(
+                    "Checkpoint encoder_unfreeze_step mismatch: "
+                    f"checkpoint={checkpoint_boundary!r}, requested={self.encoder_unfreeze_step!r}"
+                )
+
+            checkpoint_offset = hyper_parameters.get("curriculum_step_offset", 0)
+            if checkpoint_offset != self.curriculum_step_offset:
+                raise ValueError(
+                    "Checkpoint curriculum_step_offset mismatch: "
+                    f"checkpoint={checkpoint_offset!r}, requested={self.curriculum_step_offset!r}"
+                )
+
+        if SAMPLES_SEEN_CHECKPOINT_KEY in checkpoint:
+            self.samples_seen = _validate_non_negative_integer(
+                checkpoint[SAMPLES_SEEN_CHECKPOINT_KEY],
+                SAMPLES_SEEN_CHECKPOINT_KEY,
+            )
             return
-        if checkpoint_mode != self.encoder_training_mode:
-            raise ValueError(
-                "Checkpoint encoder_training_mode mismatch: "
-                f"checkpoint={checkpoint_mode!r}, requested={self.encoder_training_mode!r}"
-            )
 
-        if "encoder_unfreeze_step" not in hyper_parameters:
-            raise ValueError("Checkpoint is missing encoder_unfreeze_step metadata")
-
-        checkpoint_boundary = hyper_parameters["encoder_unfreeze_step"]
-        if checkpoint_boundary != self.encoder_unfreeze_step:
+        if self.batch_size != 1 or self.accumulate_grad_batches != 1:
             raise ValueError(
-                "Checkpoint encoder_unfreeze_step mismatch: "
-                f"checkpoint={checkpoint_boundary!r}, requested={self.encoder_unfreeze_step!r}"
+                "Legacy checkpoint has no samples_seen counter; migration is only exact "
+                "with batch_size=1 and accumulate_grad_batches=1"
             )
+        self.samples_seen = _validate_non_negative_integer(
+            checkpoint.get("global_step"),
+            "legacy checkpoint global_step used for samples_seen",
+        )
+        logger.warning(
+            "Legacy checkpoint has no samples_seen counter; inferred {} from global_step "
+            "under the batch_size=1, accumulate_grad_batches=1 contract",
+            self.samples_seen,
+        )
 
-        checkpoint_offset = hyper_parameters.get("curriculum_step_offset", 0)
-        if checkpoint_offset != self.curriculum_step_offset:
-            raise ValueError(
-                "Checkpoint curriculum_step_offset mismatch: "
-                f"checkpoint={checkpoint_offset!r}, requested={self.curriculum_step_offset!r}"
-            )
+    def on_save_checkpoint(self, checkpoint):
+        checkpoint[SAMPLES_SEEN_CHECKPOINT_KEY] = _validate_non_negative_integer(
+            self.samples_seen,
+            SAMPLES_SEEN_CHECKPOINT_KEY,
+        )
 
     def training_step(self, batch):
-        self._sync_encoder_trainability(int(self.global_step))
+        self._sync_encoder_trainability()
 
         x, di, y, = batch
         outputs = self.model(x, di[:, :-1], labels=y)
         loss = outputs.loss
         self.log('loss', loss, on_step=False, on_epoch=True, batch_size=x.shape[0], prog_bar=True)
+        self.samples_seen += int(x.shape[0])
         
         return loss
         

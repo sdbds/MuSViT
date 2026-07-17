@@ -171,6 +171,7 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
         self.assertEqual(kwargs["callbacks"], callbacks)
         self.assertEqual(len(kwargs["callbacks"]), 2)
         self.assertEqual(kwargs["precision"], "16-mixed")
+        self.assertEqual(kwargs["accumulate_grad_batches"], 1)
 
     def test_protocol_metadata_records_metric_and_run_contract(self):
         metadata = finetune._build_protocol_metadata(
@@ -259,6 +260,8 @@ class SMTPPTrainerThroughputTests(unittest.TestCase):
             _TinyModel(),
             encoder_training_mode="fine_tune",
             encoder_unfreeze_step=120000,
+            batch_size=1,
+            accumulate_grad_batches=1,
         )
 
         self.assertIn("smt_config", module.hparams)
@@ -266,6 +269,8 @@ class SMTPPTrainerThroughputTests(unittest.TestCase):
         self.assertEqual(module.hparams.encoder_training_mode, "fine_tune")
         self.assertEqual(module.hparams.encoder_unfreeze_step, 120000)
         self.assertEqual(module.hparams.curriculum_step_offset, 0)
+        self.assertEqual(module.hparams.batch_size, 1)
+        self.assertEqual(module.hparams.accumulate_grad_batches, 1)
 
     def test_fine_tune_unfreezes_encoder_at_real_data_boundary(self):
         model = _TinyModel()
@@ -276,9 +281,11 @@ class SMTPPTrainerThroughputTests(unittest.TestCase):
             encoder_unfreeze_step=120000,
         )
 
-        module._sync_encoder_trainability(119999)
+        module.samples_seen = 119999
+        module._sync_encoder_trainability()
         self.assertTrue(all(not parameter.requires_grad for parameter in model.encoder.parameters()))
-        module._sync_encoder_trainability(120000)
+        module.samples_seen = 120000
+        module._sync_encoder_trainability()
         self.assertTrue(all(parameter.requires_grad for parameter in model.encoder.parameters()))
 
     def test_fine_tune_applies_curriculum_step_offset_before_unfreezing(self):
@@ -291,7 +298,7 @@ class SMTPPTrainerThroughputTests(unittest.TestCase):
             curriculum_step_offset=120000,
         )
 
-        module._sync_encoder_trainability(0)
+        module._sync_encoder_trainability()
 
         self.assertTrue(all(parameter.requires_grad for parameter in model.encoder.parameters()))
 
@@ -304,7 +311,8 @@ class SMTPPTrainerThroughputTests(unittest.TestCase):
             encoder_unfreeze_step=120000,
         )
 
-        module._sync_encoder_trainability(999999)
+        module.samples_seen = 999999
+        module._sync_encoder_trainability()
 
         self.assertTrue(all(not parameter.requires_grad for parameter in model.encoder.parameters()))
 
@@ -334,9 +342,10 @@ class SMTPPTrainerThroughputTests(unittest.TestCase):
         )
 
         with patch.object(smt_trainer.logger, "warning") as warning:
-            module.on_load_checkpoint({"hyper_parameters": {}})
+            module.on_load_checkpoint({"hyper_parameters": {}, "global_step": 73})
 
-        warning.assert_called_once()
+        self.assertEqual(module.samples_seen, 73)
+        self.assertEqual(warning.call_count, 2)
 
     def test_legacy_checkpoint_cannot_be_resumed_as_linear_probe(self):
         module = SMTPP_Trainer(
@@ -408,6 +417,112 @@ class SMTPPTrainerThroughputTests(unittest.TestCase):
         )
         for name in ("best_loss", "best_image", "worst_loss", "worst_image"):
             self.assertFalse(hasattr(module, name), name)
+
+    def test_training_step_counts_consumed_samples_not_optimizer_steps(self):
+        module = SMTPP_Trainer(
+            SimpleNamespace(padding_token=0),
+            _TinyModel(),
+            encoder_training_mode="linear_probe",
+            encoder_unfreeze_step=None,
+            batch_size=2,
+            accumulate_grad_batches=4,
+        )
+        module.log = Mock()
+        batch = (
+            torch.zeros((2, 3, 2, 2)),
+            torch.zeros((2, 3), dtype=torch.long),
+            torch.zeros((2, 3), dtype=torch.long),
+        )
+
+        self.assertEqual(module.samples_seen, 0)
+        module.training_step(batch)
+
+        self.assertEqual(module.samples_seen, 2)
+        self.assertEqual(module.curriculum_step, 2)
+
+    def test_failed_training_step_does_not_count_unconsumed_samples(self):
+        model = _TinyModel()
+        module = SMTPP_Trainer(
+            SimpleNamespace(padding_token=0),
+            model,
+            encoder_training_mode="linear_probe",
+            encoder_unfreeze_step=None,
+        )
+        module.log = Mock()
+        batch = (
+            torch.zeros((1, 3, 2, 2)),
+            torch.zeros((1, 3), dtype=torch.long),
+            torch.zeros((1, 3), dtype=torch.long),
+        )
+
+        with patch.object(model, "forward", side_effect=RuntimeError("forward failed")):
+            with self.assertRaisesRegex(RuntimeError, "forward failed"):
+                module.training_step(batch)
+
+        self.assertEqual(module.samples_seen, 0)
+
+    def test_samples_seen_is_saved_and_restored(self):
+        module = SMTPP_Trainer(
+            SimpleNamespace(padding_token=0),
+            _TinyModel(),
+            encoder_training_mode="fine_tune",
+            encoder_unfreeze_step=120000,
+        )
+        module.samples_seen = 41
+        checkpoint = {}
+
+        module.on_save_checkpoint(checkpoint)
+        self.assertEqual(checkpoint["full_page_omr_samples_seen"], 41)
+
+        restored = SMTPP_Trainer(
+            SimpleNamespace(padding_token=0),
+            _TinyModel(),
+            encoder_training_mode="fine_tune",
+            encoder_unfreeze_step=120000,
+        )
+        checkpoint["hyper_parameters"] = {
+            "encoder_training_mode": "fine_tune",
+            "encoder_unfreeze_step": 120000,
+            "curriculum_step_offset": 0,
+        }
+        restored.on_load_checkpoint(checkpoint)
+
+        self.assertEqual(restored.samples_seen, 41)
+
+    def test_legacy_samples_seen_migration_requires_unit_batch_and_accumulation(self):
+        checkpoint = {
+            "global_step": 73,
+            "hyper_parameters": {
+                "encoder_training_mode": "fine_tune",
+                "encoder_unfreeze_step": 120000,
+                "curriculum_step_offset": 0,
+            },
+        }
+        for kwargs in ({"batch_size": 2}, {"accumulate_grad_batches": 4}):
+            with self.subTest(kwargs=kwargs):
+                module = SMTPP_Trainer(
+                    SimpleNamespace(padding_token=0),
+                    _TinyModel(),
+                    encoder_training_mode="fine_tune",
+                    encoder_unfreeze_step=120000,
+                    **kwargs,
+                )
+
+                with self.assertRaisesRegex(ValueError, "samples_seen"):
+                    module.on_load_checkpoint(checkpoint)
+
+    def test_starting_weights_do_not_import_source_samples_seen(self):
+        module = SMTPP_Trainer(
+            SimpleNamespace(padding_token=0),
+            _TinyModel(),
+            encoder_training_mode="fine_tune",
+            encoder_unfreeze_step=120000,
+            enforce_checkpoint_protocol=False,
+        )
+
+        module.on_load_checkpoint({"full_page_omr_samples_seen": 999})
+
+        self.assertEqual(module.samples_seen, 0)
 
 
 if __name__ == "__main__":
