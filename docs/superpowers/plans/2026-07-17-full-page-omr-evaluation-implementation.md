@@ -4,14 +4,14 @@
 
 **Goal:** Implement canonical v2 metrics, true incremental generation, step-based validation, reproducible checkpoint diagnostics, and the `samples_seen` curriculum contract without changing the running legacy training process.
 
-**Architecture:** Scoring is separated into immutable canonical token streams and metric views. Generation gets a dedicated state made of prepared visual memory, static per-layer cross K/V, and window-bounded self K/V, while training keeps the existing full-sequence forward path. Training protocol, diagnostics, and data experiments remain explicit callers of those two foundations.
+**Architecture:** Scoring is separated into immutable canonical token streams and metric views. Generation gets a dedicated state made of prepared visual memory, static per-layer cross K/V, and self K/V that preserves the configured context, while training keeps the existing full-sequence forward path. Training protocol, diagnostics, and data experiments remain explicit callers of those two foundations.
 
 **Tech Stack:** Python 3.11, PyTorch 2.13, Lightning 2.5+, Hugging Face Transformers/Datasets, `editdistance`, `unittest`/pytest, PowerShell.
 
 ## Global Constraints
 
 - Work only in `D:\UGit\MuSViT\.worktrees\full-page-omr-eval-v2`; do not modify executable or configuration files in the live run worktree.
-- Preserve `softmax_scale=1.0`, greedy decoding, batch size 1, attention window 100, and old checkpoint weight compatibility.
+- Preserve `softmax_scale=1.0`, greedy decoding, batch size 1, production `attention_window=maxlen+1`, and old checkpoint weight compatibility.
 - New metrics are only `val/test_{CER,SER,LER}_v2`; checkpoint monitor is `val_SER_v2`.
 - New Polish Scores baseline uses `validation_every_n_batches=10000`, `max_steps=320000`, `save_top_k=2`, and no EarlyStopping.
 - Incremental generation cannot become the default until numerical tests pass and the locked RTX 4090 performance gate is measured.
@@ -180,12 +180,12 @@ for position in range(tokens.size(1)):
     step_logits, state = decoder.decode_step(memory, tokens[:, position:position + 1], state)
     full_logits = full_decoder_logits(tokens[:, :position + 1])
     torch.testing.assert_close(step_logits, full_logits, rtol=1e-5, atol=1e-5)
-    self.assertLessEqual(state.layers[0].self_kv.key.size(2), 99)
+    self.assertEqual(state.layers[0].self_kv.key.size(2), position + 1)
 ```
 
-Patch each layer's cross `lk/lv` and assert they are each called once in `prepare_generation_memory()` and never in `decode_step()`.
+Patch each layer's cross `lk/lv` and assert they are each called once in `prepare_generation_memory()` and never in `decode_step()`. Add a separate decoder with `attention_window=4` and assert its write-back cache never exceeds 3 historical positions.
 
-- [ ] **Step 4: Implement window-bounded per-layer generation state**
+- [ ] **Step 4: Implement context-preserving per-layer generation state**
 
 ```python
 @dataclass(frozen=True)
@@ -195,7 +195,8 @@ class DecoderGenerationState:
 
 def decode_step(self, memory, token, state):
     # embed only token, apply absolute PE at state.position, append current self K/V,
-    # keep at most attention_window - 1 entries for the next step, and project one logit position.
+    # preserve all history when attention_window exceeds maxlen; only a smaller explicit
+    # window keeps at most attention_window - 1 entries for the next step.
 ```
 
 - [ ] **Step 5: Prepare visual memory once and add incremental raw generation**
@@ -206,7 +207,7 @@ Extract adaptor/2D PE/flatten into `prepare_generation_memory()`. `generate_toke
 
 Run: `.\.venv\Scripts\python.exe -m pytest tests/test_smt_attention.py tests/test_full_page_omr_generation.py tests/test_full_page_omr_model_contracts.py -q`
 
-Commit: `feat: add windowed incremental OMR decoding`
+Commit: `feat: add incremental OMR decoding`
 
 ### Task 4: Step-Based Validation And Versioned Checkpoints
 

@@ -37,6 +37,7 @@
 
 - 当前 `predict()` 每个 token 都调用 `forward_decoder()`，重复执行 adaptor、2D positional encoding、flatten 和所有 decoder layers。
 - 现有 `DecoderStack` cache 保存逐层 hidden state，不保存投影后的 self-attention K/V；cross-attention 的 memory K/V 也会每步重新投影。
+- `Decoder` 类的默认 `attention_window=100` 不代表生产配置；`SMTFoundationModelForCausalLM` 显式传入 `maxlen + 1`，当前为 7513。对最多 7512 token 的生成，这等价于全上下文 self-attention。
 - 小模型 float32 探针中，hidden-state cache 与全前缀路径的最大 logits 差约 `3e-7`，贪心 token 一致。
 - 按 8 层、`d_model=256`、4096 个 visual tokens 的 decoder 探针，旧 cache 在 1024 token 时为基线的 `0.87x`，即更慢；2048 token 时仅为 `1.03x`。旧 cache 不能作为性能方案验收。
 
@@ -156,7 +157,7 @@ input image
 4. 2D positional encoding 与 flatten；
 5. 为每个 decoder layer 计算一次 cross-attention memory K/V。
 
-`decode_step()` 每步只接收当前 token 和绝对位置，返回当前 token 的 logits 与新 state。每个 decoder layer 的 state 只保存下一步仍在 self-attention window 内的历史 K/V；新 K/V 只计算和追加一次。当前 `attention_window=100` 时，本步 query 看到至多 99 个历史位置和当前位置，state 在本步结束后只保留最新 99 个 K/V。若窗口显式配置为无限，state 才保留全部历史 K/V。out layer 只处理最后一个 hidden position。
+`decode_step()` 每步只接收当前 token 和绝对位置，返回当前 token 的 logits 与新 state。每个 decoder layer 的 state 只保存下一步仍在 self-attention window 内的历史 K/V；新 K/V 只计算和追加一次。生产配置 `attention_window=maxlen+1`，因此在合法生成范围内保留全部历史 K/V，不得裁剪。只有调用者显式配置更小的有限窗口 `N` 时，本步 query 才看到至多 `N-1` 个历史位置和当前位置，state 在本步结束后保留最新 `N-1` 个 K/V。out layer 只处理最后一个 hidden position。
 
 generation state 由模型拥有，至少记录：
 
@@ -196,7 +197,7 @@ reference checkpoint、dataset revision 或 GPU 不可用时，本规格的门�
 - 2048 token decoder benchmark 至少为 uncached 基线的 `2.0x`；
 - 1024 token 不慢于基线；
 - Polish Scores 全部 10 页 val 至少重复三次，增量路径的端到端中位耗时不高于 uncached 基线的 `90%`，且逐页输出 token 序列一致；
-- 当前固定 attention window 下 self-KV memory 有界，静态 cross K/V 每层只有一份；无限窗口配置下 cache memory 才随输出长度线性增长。任何配置都不得保留完整历史 logits 或重复 cross K/V。
+- 生产全上下文配置下 self-KV memory 随输出长度线性增长，静态 cross K/V 每层只有一份；显式有限窗口下 self-KV memory 才有界。任何配置都不得保留完整历史 logits 或重复 cross K/V。
 
 达不到门槛时保留 uncached 默认路径并记录测量结果，不能用渐进复杂度推导替代实测。
 
@@ -388,7 +389,7 @@ encoder 解冻边界和 curriculum 数据选择都改用 `curriculum_step`。opt
 ### 解码正确性与性能
 
 7. adaptor、2D PE、flatten 和每层 cross K/V 在一张图的完整生成中各只计算一次。
-8. 每层 self K/V 每步只计算当前 token；窗口为 100 时，本步 attention 的 K/V 长度不超过 100，写回 state 的历史 K/V 不超过 99。无限窗口测试中，写回长度才与已生成 token 数一致。
+8. 每层 self K/V 每步只计算当前 token；生产 `attention_window=maxlen+1` 测试中，写回长度与已处理 token 数一致。另用显式窗口 4 验证本步 attention 的 K/V 长度不超过 4，写回 state 的历史 K/V 不超过 3。
 9. CPU float32 eager 的逐步 logits 最大差不超过 `1e-5`，cached 与 uncached 每步 argmax 一致。
 10. CUDA 支持的 backend 在固定 checkpoint 和样本上生成完全相同的 token 序列；fallback 被日志明确记录。
 11. 1024、2048、4096 token benchmark 和完整 10 页 val benchmark 按本规格报告；达到性能门槛后才能切换默认路径。
