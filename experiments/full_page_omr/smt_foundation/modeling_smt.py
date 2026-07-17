@@ -152,6 +152,39 @@ class PositionalEncoding1D(nn.Module):
                 x[i] = x[i] + self.pe[0, :, start[i]:start[i]+x.size(2)]
             return x
 
+
+@dataclass(frozen=True)
+class AttentionKV:
+    key: torch.Tensor
+    value: torch.Tensor
+
+
+@dataclass(frozen=True)
+class GenerationMemory:
+    raw_features: torch.Tensor
+    enhanced_features: torch.Tensor
+    cross_kv: tuple[AttentionKV, ...]
+
+
+@dataclass(frozen=True)
+class DecoderLayerGenerationState:
+    self_kv: AttentionKV | None
+
+
+@dataclass(frozen=True)
+class DecoderGenerationState:
+    position: int
+    layers: tuple[DecoderLayerGenerationState, ...]
+
+
+@dataclass(frozen=True)
+class PreparedDecoderFeatures:
+    raw_features: torch.Tensor
+    enhanced_features: torch.Tensor
+    reduced_size: tuple[tuple[int, int], ...]
+    feature_size: torch.Size
+
+
 class MHA(nn.Module):
     def __init__(self, embedding_dim, num_heads=None, dropout=0, proj_value=True, attention_backend="auto") -> None:
         super().__init__()
@@ -224,20 +257,51 @@ class MHA(nn.Module):
         raw_weights = self.softmax(weights)
         return torch.matmul(self.dropout(raw_weights), v), raw_weights
             
-    def forward(self, query, key, value, key_pad_mask=None, attn_mask=None, get_weights=True,
-                is_causal=False, window_size=(-1, -1)):
-        
-        target_len, b, c = query.size()
-        source_len = key.size(0)
+    def project_query(self, query):
+        target_len, batch_size, channels = query.size()
+        if channels != self.num_heads * self.head_dim:
+            raise ValueError(
+                f"query embedding size must be {self.num_heads * self.head_dim}, got {channels}"
+            )
+        return self.lq(query).view(
+            target_len,
+            batch_size,
+            self.num_heads,
+            self.head_dim,
+        ).permute(1, 2, 0, 3)
 
-        q = self.lq(query)
-        k = self.lk(key)
-        v = self.lv(value) if self.proj_value else value
+    def project_key_value(self, key, value=None):
+        if value is None:
+            value = key
+        if key.size(0) != value.size(0) or key.size(1) != value.size(1):
+            raise ValueError("key and value must have matching sequence and batch dimensions")
+        source_len, batch_size, channels = key.size()
+        if channels != self.num_heads * self.head_dim or value.size(2) != channels:
+            raise ValueError(
+                f"key/value embedding size must be {self.num_heads * self.head_dim}"
+            )
+        projected_key = self.lk(key).view(
+            source_len,
+            batch_size,
+            self.num_heads,
+            self.head_dim,
+        ).permute(1, 2, 0, 3)
+        projected_value = self.lv(value) if self.proj_value else value
+        projected_value = projected_value.view(
+            source_len,
+            batch_size,
+            self.num_heads,
+            self.head_dim,
+        ).permute(1, 2, 0, 3)
+        return AttentionKV(projected_key, projected_value)
 
-        q = q.view(target_len, b, self.num_heads, self.head_dim).permute(1, 2, 0, 3)
-        k = k.view(source_len, b, self.num_heads, self.head_dim).permute(1, 2, 0, 3)
-        v = v.view(source_len, b, self.num_heads, self.head_dim).permute(1, 2, 0, 3)
-
+    def _attend(self, q, projected_kv, attn_mask, key_pad_mask, get_weights,
+                is_causal, window_size):
+        k = projected_kv.key
+        v = projected_kv.value
+        batch_size = q.size(0)
+        target_len = q.size(-2)
+        source_len = k.size(-2)
         flash_attn_func = None
         if self._can_use_flash_attention_2(q, k, v, attn_mask, key_pad_mask, get_weights):
             flash_attn_func = _load_flash_attn_func()
@@ -280,7 +344,7 @@ class MHA(nn.Module):
             if not sdpa_is_causal and (attn_mask is not None or key_pad_mask is not None or has_structured_mask):
                 if attn_mask is not None and attn_mask.dtype != torch.bool:
                     sdpa_mask = attn_mask.to(device=q.device, dtype=q.dtype).unsqueeze(0).unsqueeze(0)
-                    sdpa_mask = sdpa_mask.expand(b, 1, target_len, source_len).clone()
+                    sdpa_mask = sdpa_mask.expand(batch_size, 1, target_len, source_len).clone()
                     if has_structured_mask:
                         allowed = self._structured_allowed_mask(
                             target_len, source_len, is_causal, window_size, q.device
@@ -289,7 +353,11 @@ class MHA(nn.Module):
                     if key_pad_mask is not None:
                         sdpa_mask.masked_fill_(key_pad_mask.unsqueeze(1).unsqueeze(2), float("-inf"))
                 else:
-                    sdpa_mask = torch.ones((b, 1, target_len, source_len), dtype=torch.bool, device=q.device)
+                    sdpa_mask = torch.ones(
+                        (batch_size, 1, target_len, source_len),
+                        dtype=torch.bool,
+                        device=q.device,
+                    )
                     if has_structured_mask:
                         sdpa_mask &= self._structured_allowed_mask(
                             target_len, source_len, is_causal, window_size, q.device
@@ -326,14 +394,55 @@ class MHA(nn.Module):
             )
             self.last_backend = "eager"
 
+        return attn_output, attn_output_weigths_raw
+
+    def forward_projected(self, query, projected_kv, key_pad_mask=None, attn_mask=None,
+                          get_weights=True, is_causal=False, window_size=(-1, -1)):
+        if not isinstance(projected_kv, AttentionKV):
+            raise TypeError("projected_kv must be an AttentionKV")
+        target_len, batch_size, channels = query.size()
+        expected_prefix = (batch_size, self.num_heads)
+        if projected_kv.key.shape[:2] != expected_prefix:
+            raise ValueError("projected key batch/head dimensions do not match query")
+        if projected_kv.key.shape != projected_kv.value.shape:
+            raise ValueError("projected key and value shapes must match")
+        if projected_kv.key.size(-1) != self.head_dim:
+            raise ValueError("projected key/value head dimension does not match attention")
+
+        q = self.project_query(query)
+        attn_output, raw_weights = self._attend(
+            q,
+            projected_kv,
+            attn_mask,
+            key_pad_mask,
+            get_weights,
+            is_causal,
+            window_size,
+        )
         _log_attention_backend(self.last_backend)
-        attn_output = attn_output.permute(2, 0, 1, 3).contiguous().view(target_len, b, c)
+        attn_output = attn_output.permute(2, 0, 1, 3).contiguous().view(
+            target_len,
+            batch_size,
+            channels,
+        )
         attn_output = self.out_proj(attn_output)
-        
+
         if get_weights:
-            return attn_output, attn_output_weigths_raw.mean(dim=1)
-        
+            return attn_output, raw_weights.mean(dim=1)
         return attn_output
+
+    def forward(self, query, key, value, key_pad_mask=None, attn_mask=None, get_weights=True,
+                is_causal=False, window_size=(-1, -1)):
+        projected_kv = self.project_key_value(key, value)
+        return self.forward_projected(
+            query,
+            projected_kv,
+            key_pad_mask=key_pad_mask,
+            attn_mask=attn_mask,
+            get_weights=get_weights,
+            is_causal=is_causal,
+            window_size=window_size,
+        )
 
     def init_weights(self):
         xavier_uniform_(self.in_proj_q.weight)
@@ -387,6 +496,45 @@ class DecoderLayer(nn.Module):
         
         for parameter in self.norm2.parameters():
             parameter.requires_grad = True
+
+    def forward_generation_step(self, tgt, state, cross_kv, *,
+                                self_attention_window, history_limit):
+        current_kv = self.input_attention.project_key_value(tgt, tgt)
+        if state.self_kv is None:
+            attention_kv = current_kv
+        else:
+            attention_kv = AttentionKV(
+                key=torch.cat([state.self_kv.key, current_kv.key], dim=2),
+                value=torch.cat([state.self_kv.value, current_kv.value], dim=2),
+            )
+
+        tgt2 = self.input_attention.forward_projected(
+            tgt,
+            attention_kv,
+            get_weights=False,
+            is_causal=True,
+            window_size=self_attention_window,
+        )
+        tgt = self.norm1(tgt + self.dropout(tgt2))
+        att_query = tgt
+        tgt2 = self.cross_attention.forward_projected(
+            att_query,
+            cross_kv,
+            get_weights=False,
+        )
+        tgt = self.norm2(att_query + self.dropout(tgt2))
+        tgt = self.norm3(tgt + self.dropout(self.ffNet(tgt)))
+
+        if history_limit is None or attention_kv.key.size(2) <= history_limit:
+            next_kv = attention_kv
+        elif history_limit == 0:
+            next_kv = None
+        else:
+            next_kv = AttentionKV(
+                key=attention_kv.key[:, :, -history_limit:],
+                value=attention_kv.value[:, :, -history_limit:],
+            )
+        return tgt, DecoderLayerGenerationState(self_kv=next_kv)
 
     def forward(self, tgt, memory_key, memory_value=None, tgt_mask=None, memory_mask=None, tgt_key_padding_mask=None, memory_key_padding_mask=None,
                 predict_n_last_only=None, need_weights=False, self_attention_is_causal=False,
@@ -526,6 +674,92 @@ class Decoder(nn.Module):
     def set_transcription_mode(self):
         self.decoder.set_transcription_mode()
 
+    def prepare_generation_memory(self, raw_features_1D, enhanced_features_1D):
+        if raw_features_1D.shape != enhanced_features_1D.shape:
+            raise ValueError("raw and enhanced generation memory shapes must match")
+        if raw_features_1D.ndim != 3:
+            raise ValueError("generation memory must have shape [sequence, batch, channels]")
+        cross_kv = tuple(
+            layer.cross_attention.project_key_value(
+                enhanced_features_1D,
+                raw_features_1D,
+            )
+            for layer in self.decoder.layers
+        )
+        return GenerationMemory(
+            raw_features=raw_features_1D,
+            enhanced_features=enhanced_features_1D,
+            cross_kv=cross_kv,
+        )
+
+    def init_generation_state(self, memory):
+        if not isinstance(memory, GenerationMemory):
+            raise TypeError("memory must be a GenerationMemory")
+        if len(memory.cross_kv) != len(self.decoder.layers):
+            raise ValueError("generation memory does not match decoder layer count")
+        return DecoderGenerationState(
+            position=0,
+            layers=tuple(
+                DecoderLayerGenerationState(self_kv=None)
+                for _ in self.decoder.layers
+            ),
+        )
+
+    def _generation_window(self, total_length):
+        if self.dec_attn_win in {None, 1} or self.dec_attn_win >= total_length:
+            return (-1, -1)
+        return (self.dec_attn_win - 1, 0)
+
+    def _generation_history_limit(self):
+        if self.dec_attn_win in {None, 1}:
+            return None
+        return max(0, self.dec_attn_win - 1)
+
+    def decode_step(self, memory, token, state):
+        if not isinstance(memory, GenerationMemory):
+            raise TypeError("memory must be a GenerationMemory")
+        if not isinstance(state, DecoderGenerationState):
+            raise TypeError("state must be a DecoderGenerationState")
+        if token.ndim != 2 or token.size(1) != 1:
+            raise ValueError("decode_step token must have shape [batch, 1]")
+        if token.size(0) != memory.raw_features.size(1):
+            raise ValueError("decode_step token batch does not match generation memory")
+        if len(state.layers) != len(self.decoder.layers):
+            raise ValueError("generation state does not match decoder layer count")
+        if state.position >= self.positional_1D.len_max:
+            raise ValueError("generation position exceeds decoder maxlen")
+
+        pos_tokens = self.embedding(token).permute(0, 2, 1)
+        pos_tokens = self.positional_1D(pos_tokens, start=state.position)
+        output = pos_tokens.permute(2, 0, 1).contiguous()
+        total_length = state.position + 1
+        window = self._generation_window(total_length)
+        history_limit = self._generation_history_limit()
+        next_layer_states = []
+        for layer, layer_state, cross_kv in zip(
+            self.decoder.layers,
+            state.layers,
+            memory.cross_kv,
+            strict=True,
+        ):
+            output, next_layer_state = layer.forward_generation_step(
+                output,
+                layer_state,
+                cross_kv,
+                self_attention_window=window,
+                history_limit=history_limit,
+            )
+            next_layer_states.append(next_layer_state)
+
+        projected_output = self.dropout(self.end_relu(output))
+        predictions = self.out_layer(
+            projected_output.permute(1, 2, 0).contiguous()
+        )
+        return output, predictions, DecoderGenerationState(
+            position=total_length,
+            layers=tuple(next_layer_states),
+        )
+
     def forward(self, raw_features_1D, enhanced_features_1D, tokens, 
                 reduced_size, token_len, features_size, hidden_predict=None, num_pred=None, cache=None,
                 keep_all_weights=False, use_cache=False):
@@ -660,15 +894,11 @@ class SMTFoundationModelForCausalLM(PreTrainedModel):
     def forward_encoder(self, x):
         output = self.encoder(pixel_values=x, interpolate_pos_encoding=True).last_hidden_state
         return output
-    
-    def forward_decoder(self, encoder_output, y_pred, output_attentions=False, use_cache=False, cache=None):
+
+    def _prepare_decoder_features(self, encoder_output):
         b, channels, ln = encoder_output.size()
-
-        reduced_size = [s.shape[:2] for s in encoder_output]
-        ylens = [len(sample) for sample in y_pred]
-
+        reduced_size = tuple(tuple(s.shape[:2]) for s in encoder_output)
         offset = 1  # discard the encoder [CLS] token
-
         ln = ln - offset
         encoder_output = encoder_output[:, :, offset:]
         spatial_size = int(ln ** 0.5)
@@ -678,11 +908,33 @@ class SMTFoundationModelForCausalLM(PreTrainedModel):
         encoder_output = self.adaptor(encoder_output)
         pos_features = self.positional_2D(encoder_output)
         features = torch.flatten(encoder_output, start_dim=2, end_dim=3).permute(2,0,1)
-        enhanced_features = features
         enhanced_features = torch.flatten(pos_features, start_dim=2, end_dim=3).permute(2,0,1)
-        
-        output, predictions, _, _, weights = self.decoder(features, enhanced_features, y_pred[:, :], reduced_size, 
-                                                           [max(ylens) for _ in range(b)], encoder_output.size(), 
+
+        return PreparedDecoderFeatures(
+            raw_features=features,
+            enhanced_features=enhanced_features,
+            reduced_size=reduced_size,
+            feature_size=encoder_output.size(),
+        )
+
+    def prepare_generation_memory(self, encoder_output):
+        features = self._prepare_decoder_features(encoder_output)
+        return self.decoder.prepare_generation_memory(
+            features.raw_features,
+            features.enhanced_features,
+        )
+
+    def forward_decoder(self, encoder_output, y_pred, output_attentions=False, use_cache=False, cache=None):
+        b = encoder_output.size(0)
+        ylens = [len(sample) for sample in y_pred]
+        features = self._prepare_decoder_features(encoder_output)
+        output, predictions, _, _, weights = self.decoder(
+                                                           features.raw_features,
+                                                           features.enhanced_features,
+                                                           y_pred[:, :],
+                                                           features.reduced_size,
+                                                           [max(ylens) for _ in range(b)],
+                                                           features.feature_size,
                                                            cache=cache, keep_all_weights=output_attentions,
                                                            use_cache=use_cache)
         return SMTOutput(
@@ -712,8 +964,6 @@ class SMTFoundationModelForCausalLM(PreTrainedModel):
     def generate_token_ids(self, input, use_incremental=False):
         if not isinstance(use_incremental, bool):
             raise TypeError("use_incremental must be a boolean")
-        if use_incremental:
-            raise NotImplementedError("incremental generation is not implemented")
 
         predicted_sequence = torch.tensor(
             [[self.w2i["<bos>"]]],
@@ -721,17 +971,30 @@ class SMTFoundationModelForCausalLM(PreTrainedModel):
             dtype=torch.long,
         )
         encoder_output = self.forward_encoder(input).permute(0, 2, 1).contiguous()
+        generation_memory = None
+        generation_state = None
+        if use_incremental:
+            generation_memory = self.prepare_generation_memory(encoder_output)
+            generation_state = self.decoder.init_generation_state(generation_memory)
         token_ids = [int(predicted_sequence[0, 0].item())]
         output = None
         terminated_by_eos = False
 
         for _ in range(self.maxlen - predicted_sequence.shape[-1]):
-            output = self.forward_decoder(
-                encoder_output,
-                predicted_sequence,
-                output_attentions=False,
-                use_cache=False,
-            )
+            if use_incremental:
+                hidden_states, logits, generation_state = self.decoder.decode_step(
+                    generation_memory,
+                    predicted_sequence[:, -1:],
+                    generation_state,
+                )
+                output = SMTOutput(logits=logits, hidden_states=hidden_states)
+            else:
+                output = self.forward_decoder(
+                    encoder_output,
+                    predicted_sequence,
+                    output_attentions=False,
+                    use_cache=False,
+                )
             next_token = torch.argmax(output.logits[:, :, -1], dim=1, keepdim=True)
             predicted_token = int(next_token[0, 0].item())
             predicted_sequence = torch.cat([predicted_sequence, next_token], dim=1)

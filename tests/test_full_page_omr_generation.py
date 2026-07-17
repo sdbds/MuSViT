@@ -1,12 +1,14 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 
 from experiments.full_page_omr.eval.eval_functions import CanonicalTokenStream
 from experiments.full_page_omr.smt_foundation.modeling_smt import (
+    Decoder,
     GenerationResult,
+    PositionalEncoding2D,
     SMTFoundationModelForCausalLM,
 )
 from experiments.full_page_omr.smt_trainer import SMTPP_Trainer
@@ -72,6 +74,54 @@ class RawGenerationTests(unittest.TestCase):
 
         self.assertEqual(sequence, ["note"])
         self.assertEqual(output.logits.shape, (1, 3, 1))
+
+    def test_incremental_generation_matches_uncached_and_prepares_visual_memory_once(self):
+        torch.manual_seed(31)
+        model = SMTFoundationModelForCausalLM.__new__(SMTFoundationModelForCausalLM)
+        torch.nn.Module.__init__(model)
+        model.w2i = {"<pad>": 0, "<bos>": 1, "<eos>": 2, "note": 3}
+        model.i2w = {token_id: token for token, token_id in model.w2i.items()}
+        model.maxlen = 6
+        model.adaptor = torch.nn.Conv2d(4, 8, kernel_size=1)
+        model.positional_2D = PositionalEncoding2D(8)
+        model.decoder = Decoder(
+            d_model=8,
+            dim_ff=8,
+            n_layers=2,
+            maxlen=model.maxlen,
+            out_categories=4,
+            attention_window=model.maxlen + 1,
+            attention_backend="eager",
+        )
+        with torch.no_grad():
+            model.decoder.out_layer.bias.zero_()
+            model.decoder.out_layer.bias[2] = -5.0
+            model.decoder.out_layer.bias[3] = 5.0
+        model.eval()
+        encoder_hidden = torch.randn(1, 5, 4)
+        model.forward_encoder = lambda _input: encoder_hidden
+        image = torch.zeros((1, 3, 2, 2))
+
+        uncached = SMTFoundationModelForCausalLM.generate_token_ids(
+            model,
+            image,
+            use_incremental=False,
+        )
+        with patch.object(model.adaptor, "forward", wraps=model.adaptor.forward) as adaptor, \
+                patch.object(
+                    model.positional_2D,
+                    "forward",
+                    wraps=model.positional_2D.forward,
+                ) as positional:
+            incremental = SMTFoundationModelForCausalLM.generate_token_ids(
+                model,
+                image,
+                use_incremental=True,
+            )
+
+        self.assertEqual(incremental.token_ids, uncached.token_ids)
+        self.assertEqual(adaptor.call_count, 1)
+        self.assertEqual(positional.call_count, 1)
 
 
 class _MetricModel(torch.nn.Module):

@@ -37,6 +37,31 @@ class MHABackendTests(unittest.TestCase):
         sdpa_output = sdpa(hidden, hidden, hidden, get_weights=False, is_causal=True)
 
         torch.testing.assert_close(sdpa_output, eager_output, rtol=1e-5, atol=1e-6)
+
+    def test_projected_key_value_path_matches_regular_attention(self):
+        torch.manual_seed(19)
+        attention = MHA(
+            embedding_dim=8,
+            num_heads=2,
+            dropout=0.0,
+            attention_backend="eager",
+        )
+        attention.eval()
+        query = torch.randn(2, 1, 8)
+        key = torch.randn(5, 1, 8)
+        value = torch.randn(5, 1, 8)
+
+        projected = attention.project_key_value(key, value)
+        actual = attention.forward_projected(
+            query,
+            projected,
+            get_weights=False,
+        )
+        expected = attention(query, key, value, get_weights=False)
+
+        self.assertEqual(projected.key.shape, torch.Size([1, 2, 5, 4]))
+        self.assertEqual(projected.value.shape, torch.Size([1, 2, 5, 4]))
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
     def test_sdpa_uses_bottom_right_causal_sliding_window(self):
         attention = self._make_identity_attention("sdpa")
         query = torch.tensor([[[1.0, 0.0]], [[0.0, 1.0]]])
@@ -344,6 +369,114 @@ class DecoderAttentionIntegrationTests(unittest.TestCase):
 
         expected = torch.tensor([[False, False, True, True], [False, False, False, False]])
         torch.testing.assert_close(mask, expected)
+
+    def test_incremental_decoder_matches_full_prefix_logits(self):
+        torch.manual_seed(23)
+        decoder = Decoder(
+            d_model=8,
+            dim_ff=8,
+            n_layers=2,
+            maxlen=16,
+            out_categories=12,
+            attention_window=17,
+            attention_backend="eager",
+        )
+        decoder.eval()
+        raw_memory = torch.randn(6, 1, 8)
+        enhanced_memory = torch.randn(6, 1, 8)
+        tokens = torch.tensor([[1, 2, 3, 4, 5, 6]])
+
+        memory = decoder.prepare_generation_memory(raw_memory, enhanced_memory)
+        state = decoder.init_generation_state(memory)
+        for position in range(tokens.size(1)):
+            _, step_logits, state = decoder.decode_step(
+                memory,
+                tokens[:, position:position + 1],
+                state,
+            )
+            _, full_logits, _, _, _ = decoder(
+                raw_memory,
+                enhanced_memory,
+                tokens[:, :position + 1],
+                reduced_size=[(2, 3)],
+                token_len=[position + 1],
+                features_size=torch.Size([1, 8, 2, 3]),
+            )
+
+            torch.testing.assert_close(
+                step_logits,
+                full_logits[:, :, -1:],
+                rtol=1e-5,
+                atol=1e-5,
+            )
+            self.assertEqual(state.position, position + 1)
+            for layer_state in state.layers:
+                self.assertEqual(layer_state.self_kv.key.size(2), position + 1)
+
+    def test_incremental_decoder_reuses_cross_projection_and_honors_finite_window(self):
+        torch.manual_seed(29)
+        decoder = Decoder(
+            d_model=8,
+            dim_ff=8,
+            n_layers=2,
+            maxlen=16,
+            out_categories=12,
+            attention_window=4,
+            attention_backend="eager",
+        )
+        decoder.eval()
+        raw_memory = torch.randn(6, 1, 8)
+        enhanced_memory = torch.randn(6, 1, 8)
+        key_projections = [
+            patch.object(layer.cross_attention.lk, "forward", wraps=layer.cross_attention.lk.forward)
+            for layer in decoder.decoder.layers
+        ]
+        value_projections = [
+            patch.object(layer.cross_attention.lv, "forward", wraps=layer.cross_attention.lv.forward)
+            for layer in decoder.decoder.layers
+        ]
+
+        with key_projections[0] as key_0, key_projections[1] as key_1, \
+                value_projections[0] as value_0, value_projections[1] as value_1:
+            memory = decoder.prepare_generation_memory(raw_memory, enhanced_memory)
+            state = decoder.init_generation_state(memory)
+            prefix = []
+            expected_projection_calls = 1
+            for token_id in range(1, 8):
+                prefix.append(token_id)
+                _, step_logits, state = decoder.decode_step(
+                    memory,
+                    torch.tensor([[token_id]]),
+                    state,
+                )
+                self.assertEqual(
+                    [key_0.call_count, key_1.call_count],
+                    [expected_projection_calls, expected_projection_calls],
+                )
+                self.assertEqual(
+                    [value_0.call_count, value_1.call_count],
+                    [expected_projection_calls, expected_projection_calls],
+                )
+                _, full_logits, _, _, _ = decoder(
+                    raw_memory,
+                    enhanced_memory,
+                    torch.tensor([prefix]),
+                    reduced_size=[(2, 3)],
+                    token_len=[len(prefix)],
+                    features_size=torch.Size([1, 8, 2, 3]),
+                )
+                torch.testing.assert_close(
+                    step_logits,
+                    full_logits[:, :, -1:],
+                    rtol=1e-5,
+                    atol=1e-5,
+                )
+                expected_projection_calls += 1
+                for layer_state in state.layers:
+                    self.assertLessEqual(layer_state.self_kv.key.size(2), 3)
+
+        self.assertEqual([key_0.call_count, key_1.call_count], [8, 8])
+        self.assertEqual([value_0.call_count, value_1.call_count], [8, 8])
 
 
 if __name__ == "__main__":
