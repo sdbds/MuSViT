@@ -186,6 +186,18 @@ class _ArrowOMRSource:
         sample, _, intermediate = self._image_stages(index)
         return intermediate, self._tokenize(sample["transcription"])
 
+    def get_with_resize_metadata(self, index):
+        sample, raw, intermediate = self._image_stages(index)
+        return (
+            intermediate,
+            self._tokenize(sample["transcription"]),
+            {
+                "source": "real",
+                "raw_shape_hwc": list(raw.shape),
+                "intermediate_shape_hwc": list(intermediate.shape),
+            },
+        )
+
     def resize_audit(self, index) -> ResizeAuditStages:
         _, raw, intermediate = self._image_stages(index)
         return ResizeAuditStages(
@@ -207,6 +219,7 @@ def batch_preparation_img2seq(data):
     images = [sample[0] for sample in data]
     dec_in = [sample[1] for sample in data]
     gt = [sample[2] for sample in data]
+    input_metadata = data[0][3] if len(data[0]) == 4 else None
 
     X_train = images[0]
     
@@ -221,7 +234,8 @@ def batch_preparation_img2seq(data):
     for i, seq in enumerate(gt):
         y[i, 0:len(seq)-1] = torch.from_numpy(np.asarray([char for char in seq[1:]]))
     
-    return X_train, decoder_input.long(), y.long()
+    batch = (X_train, decoder_input.long(), y.long())
+    return (*batch, input_metadata) if input_metadata is not None else batch
 
 class OMRIMG2SEQDataset(Dataset):
     def __init__(self, teacher_forcing_perc=0.2, augment=False) -> None:
@@ -340,7 +354,8 @@ class CurriculumTrainingDataset(OMRIMG2SEQDataset):
                 augment=False, 
                 tokenization_mode="bekern",
                 skip_steps: int = 0,
-                step_counter: _SharedStepCounter | None = None) -> None:
+                step_counter: _SharedStepCounter | None = None,
+                capture_input_metadata: bool = False) -> None:
        super().__init__(teacher_forcing_perc, augment)
        tokenization_mode = validate_tokenization_mode(tokenization_mode)
        self.reduce_ratio = reduce_ratio
@@ -365,6 +380,7 @@ class CurriculumTrainingDataset(OMRIMG2SEQDataset):
        self.max_cl_steps = CL_REAL_DATA_START_STEP
        self.curriculum_stage_beginning = 2
        self.step_counter = step_counter or _SharedStepCounter(skip_steps)
+       self.capture_input_metadata = bool(capture_input_metadata)
     
     def linear_scheduler_synthetic(self, step):
         return self.max_synth_prob + round((step - self.max_cl_steps) * (self.min_synth_prob - self.max_synth_prob) / self.finetune_steps, 4)
@@ -373,6 +389,7 @@ class CurriculumTrainingDataset(OMRIMG2SEQDataset):
         step = self.step_counter.reserve()
         stage = (step // self.increase_steps) + self.curriculum_stage_beginning
         gen_author_title = np.random.rand() > 0.5
+        input_metadata = None
         
         if stage < (self.num_cl_steps + self.curriculum_stage_beginning):
            generator = self.generator.get()
@@ -388,7 +405,10 @@ class CurriculumTrainingDataset(OMRIMG2SEQDataset):
         else:
             probability = max(self.linear_scheduler_synthetic(step), self.min_synth_prob)
             if random.random() > probability:
-                x, y = self.real_source[index]
+                if getattr(self, "capture_input_metadata", False):
+                    x, y, input_metadata = self.real_source.get_with_resize_metadata(index)
+                else:
+                    x, y = self.real_source[index]
             else:
                 generator = self.generator.get()
                 x, y = _retry_synthetic_sample(
@@ -401,6 +421,14 @@ class CurriculumTrainingDataset(OMRIMG2SEQDataset):
                     )
                 )
 
+        if getattr(self, "capture_input_metadata", False) and input_metadata is None:
+            raw_shape = list(np.asarray(x).shape)
+            input_metadata = {
+                "source": "synthetic",
+                "raw_shape_hwc": raw_shape,
+                "intermediate_shape_hwc": raw_shape,
+            }
+
         if self.augment:
            x = augment(x)
         else:
@@ -408,7 +436,11 @@ class CurriculumTrainingDataset(OMRIMG2SEQDataset):
 
         y = torch.from_numpy(np.asarray([self.w2i[token] for token in y if token != '']))
         decoder_input = self.apply_teacher_forcing(y)
-        return x, decoder_input, y
+        sample = (x, decoder_input, y)
+        if input_metadata is not None:
+            input_metadata["final_shape_nchw"] = list(x.shape)
+            return (*sample, input_metadata)
+        return sample
 
     def __len__(self):
        return len(self.real_source)
@@ -551,7 +583,8 @@ class CLFinetuningDataset(LightningDataModule):
                                                        tokenization_mode=self.tokenization_mode,
                                                        reduce_ratio=config.data.reduce_ratio,
                                                        skip_steps=self.skip_steps,
-                                                       step_counter=self.step_counter)
+                                                       step_counter=self.step_counter,
+                                                       capture_input_metadata=True)
         self.val_dataset = RealDataset(data_path=self.data_path, split="val", augment=False, 
                                        tokenization_mode=self.tokenization_mode, reduce_ratio=config.data.reduce_ratio)
         self.test_dataset = RealDataset(data_path=self.data_path, split="test", augment=False, 

@@ -243,6 +243,37 @@ class DataLoaderPipelineTests(unittest.TestCase):
         self.assertEqual(dataset.generator.instance.calls, 2)
         self.assertFalse(hasattr(dataset, "trainer"))
 
+    def test_first_curriculum_batch_carries_actual_input_shapes_to_collate(self):
+        dataset = data.CurriculumTrainingDataset.__new__(data.CurriculumTrainingDataset)
+        data.OMRIMG2SEQDataset.__init__(dataset, teacher_forcing_perc=0.0, augment=False)
+        dataset.generator = _StaticLazyGenerator()
+        dataset.step_counter = _CountingStepCounter(80000)
+        dataset.max_synth_prob = 0.9
+        dataset.min_synth_prob = 0.2
+        dataset.finetune_steps = 200000
+        dataset.increase_steps = 40000
+        dataset.num_cl_steps = 3
+        dataset.max_cl_steps = 120000
+        dataset.curriculum_stage_beginning = 2
+        dataset.capture_input_metadata = True
+        dataset.set_dictionaries(
+            {"<pad>": 0, "<bos>": 1, "note": 2, "<eos>": 3},
+            {0: "<pad>", 1: "<bos>", 2: "note", 3: "<eos>"},
+        )
+        final = torch.zeros((1, 3, 8, 8))
+
+        with patch.object(data, "convert_img_to_tensor", return_value=final):
+            sample = dataset[0]
+            batch = data.batch_preparation_img2seq([sample])
+
+        self.assertEqual(len(sample), 4)
+        self.assertEqual(len(batch), 4)
+        metadata = batch[3]
+        self.assertEqual(metadata["source"], "synthetic")
+        self.assertEqual(metadata["raw_shape_hwc"], [4, 4, 3])
+        self.assertEqual(metadata["intermediate_shape_hwc"], [4, 4, 3])
+        self.assertEqual(metadata["final_shape_nchw"], [1, 3, 8, 8])
+
     def test_worker_seed_initializes_python_and_numpy_rngs(self):
         with patch.object(torch, "initial_seed", return_value=123456):
             data._seed_worker(0)
@@ -376,6 +407,27 @@ class DataLoaderPipelineTests(unittest.TestCase):
         self.assertEqual(stages.intermediate.shape, (2, 3, 3))
         self.assertIs(stages.final, final)
         convert.assert_called_once_with(stages.intermediate)
+
+    def test_arrow_source_exposes_actual_raw_and_intermediate_shapes(self):
+        rows = _FakeArrowRows()
+        resized = np.zeros((2, 3, 3), dtype=np.uint8)
+        with (
+            patch.object(data, "load_dataset", return_value=rows),
+            patch.object(data, "parse_kern_file", return_value=["note"]),
+            patch.object(data.cv2, "resize", return_value=resized),
+        ):
+            source = data._ArrowOMRSource(
+                "example/dataset",
+                "train",
+                "bekern",
+                reduce_ratio=0.5,
+            )
+            image, _, metadata = source.get_with_resize_metadata(0)
+
+        self.assertIs(image, resized)
+        self.assertEqual(metadata["source"], "real")
+        self.assertEqual(metadata["raw_shape_hwc"], [4, 6, 3])
+        self.assertEqual(metadata["intermediate_shape_hwc"], [2, 3, 3])
 
     def test_single_resize_config_is_isolated_from_baselines(self):
         config_root = (

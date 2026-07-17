@@ -1,4 +1,7 @@
 import json
+import hashlib
+import re
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,7 +23,7 @@ from .smt_trainer import (
 from .data_augmentation.data_augmentation import set_up_processor
 
 from lightning.pytorch import Trainer
-from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.callbacks import Callback, ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 
 
@@ -45,6 +48,10 @@ class CheckpointRunState:
     curriculum_step: int
     curriculum_step_offset: int
     curriculum_step_source: str
+    sha256: str | None
+
+
+_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 
 
 def _validate_checkpoint_every_n_epochs(value: int) -> int:
@@ -107,8 +114,27 @@ def _validate_protocol_version(value: str) -> str:
     return value.strip()
 
 
-def _read_checkpoint_run_state(checkpoint_path: str) -> CheckpointRunState:
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _read_checkpoint_run_state(checkpoint_path: str,
+                               *, expected_sha256: str | None = None) -> CheckpointRunState:
     path = Path(checkpoint_path).expanduser().resolve()
+    actual_sha256 = None
+    if expected_sha256 is not None:
+        if not isinstance(expected_sha256, str) or _SHA256_RE.fullmatch(expected_sha256) is None:
+            raise ValueError("source_checkpoint_sha256 must be a lowercase SHA-256 digest")
+        actual_sha256 = _sha256_file(path)
+        if actual_sha256 != expected_sha256:
+            raise ValueError(
+                "source checkpoint SHA-256 mismatch: "
+                f"declared={expected_sha256}, actual={actual_sha256}"
+            )
     payload = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
     if not isinstance(payload, dict):
         raise ValueError(f"checkpoint must contain a dictionary payload: {path}")
@@ -143,17 +169,20 @@ def _read_checkpoint_run_state(checkpoint_path: str) -> CheckpointRunState:
         curriculum_step=curriculum_step,
         curriculum_step_offset=offset,
         curriculum_step_source=curriculum_step_source,
+        sha256=actual_sha256,
     )
 
 
 def _validate_run_contract(*, config, from_checkpoint, starting_weights,
                            max_steps: int, train: bool, protocol_version: str,
-                           source_curriculum_step: int | None):
+                           source_curriculum_step: int | None,
+                           source_checkpoint_sha256: str | None = None):
     protocol_version = _validate_protocol_version(protocol_version)
     if from_checkpoint is not None:
-        if source_curriculum_step is not None:
+        if source_curriculum_step is not None or source_checkpoint_sha256 is not None:
             raise ValueError(
-                "source_curriculum_step is only valid with starting_weights"
+                "source_curriculum_step and source_checkpoint_sha256 are only valid "
+                "with starting_weights"
             )
         state = _read_checkpoint_run_state(from_checkpoint)
         requested_offset = config.data.skip_steps
@@ -192,7 +221,14 @@ def _validate_run_contract(*, config, from_checkpoint, starting_weights,
                 "config data.skip_steps must equal source_curriculum_step: "
                 f"{config.data.skip_steps} != {source_curriculum_step}"
             )
-        state = _read_checkpoint_run_state(starting_weights)
+        if source_checkpoint_sha256 is None:
+            raise ValueError(
+                "source_checkpoint_sha256 is required with starting_weights"
+            )
+        state = _read_checkpoint_run_state(
+            starting_weights,
+            expected_sha256=source_checkpoint_sha256,
+        )
         if state.curriculum_step != source_curriculum_step:
             raise ValueError(
                 "source_curriculum_step does not match checkpoint curriculum_step: "
@@ -200,8 +236,10 @@ def _validate_run_contract(*, config, from_checkpoint, starting_weights,
             )
         return state
 
-    if source_curriculum_step is not None:
-        raise ValueError("source_curriculum_step requires starting_weights")
+    if source_curriculum_step is not None or source_checkpoint_sha256 is not None:
+        raise ValueError(
+            "source_curriculum_step and source_checkpoint_sha256 require starting_weights"
+        )
     if config.data.skip_steps != 0:
         raise ValueError("fresh training requires data.skip_steps=0")
     return None
@@ -310,6 +348,9 @@ def _build_protocol_metadata(*, max_steps, validation_every_n_batches,
         "checkpoint_load_mode": checkpoint_load_mode,
         "checkpoint_global_step": (
             checkpoint_state.global_step if checkpoint_state is not None else None
+        ),
+        "checkpoint_sha256": (
+            checkpoint_state.sha256 if checkpoint_state is not None else None
         ),
         "source_curriculum_step": source_curriculum_step,
         "curriculum_step_offset": curriculum_step_offset,
@@ -444,6 +485,37 @@ def _write_resize_audit(data, *, experiment_name: str, protocol_version: str,
     )
 
 
+class _FirstTrainBatchInputAudit(Callback):
+    def __init__(self, output_path) -> None:
+        super().__init__()
+        self.output_path = Path(output_path)
+        self._written = False
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx) -> None:
+        del trainer, pl_module
+        if self._written:
+            return
+        if not isinstance(batch, (tuple, list)) or len(batch) != 4:
+            raise ValueError("first CL training batch is missing input audit metadata")
+        metadata = batch[3]
+        if not isinstance(metadata, dict):
+            raise ValueError("first CL training batch audit metadata must be a dictionary")
+        actual_shape = list(batch[0].shape)
+        if metadata.get("final_shape_nchw") != actual_shape:
+            raise ValueError(
+                "first CL training batch final shape does not match its audit metadata"
+            )
+        _write_json(
+            self.output_path,
+            {
+                **metadata,
+                "batch_index": int(batch_idx),
+                "actual_batch_shape_nchw": actual_shape,
+            },
+        )
+        self._written = True
+
+
 def _select_test_checkpoint(trainer, checkpointer, experiment_name: str,
                             finetuning_technique: str) -> str:
     if checkpointer.best_model_path:
@@ -475,7 +547,8 @@ def main(config: ExperimentConfig, experiment_name,
          encoder_training_mode: str = "fine_tune",
          validation_every_n_batches: int = 10000,
          protocol_version: str = PROTOCOL_VERSION,
-         source_curriculum_step: int | None = None):
+         source_curriculum_step: int | None = None,
+         source_checkpoint_sha256: str | None = None):
     checkpoint_every_n_epochs = _validate_checkpoint_every_n_epochs(checkpoint_every_n_epochs)
     validation_every_n_batches = _validate_validation_every_n_batches(
         validation_every_n_batches
@@ -494,6 +567,7 @@ def main(config: ExperimentConfig, experiment_name,
         train=train,
         protocol_version=protocol_version,
         source_curriculum_step=source_curriculum_step,
+        source_checkpoint_sha256=source_checkpoint_sha256,
     )
     if resolution is None:
         _globals.resolution = 1024
@@ -603,12 +677,16 @@ def main(config: ExperimentConfig, experiment_name,
         num_workers=data.num_workers,
         checkpoint_every_n_epochs=checkpoint_every_n_epochs,
     )
+    run_record_id = uuid.uuid4().hex
+    run_record_root = Path("logs") / "run_instances" / run_record_id
+    protocol_metadata["run_record_id"] = run_record_id
     resize_audit_path = _write_resize_audit(
         data,
         experiment_name=experiment_name,
         protocol_version=protocol_version,
         reduce_ratio=config.data.reduce_ratio,
         resolution=resolution,
+        output_root=run_record_root,
     )
     protocol_metadata["resize_audit_path"] = (
         str(resize_audit_path) if resize_audit_path is not None else None
@@ -616,7 +694,22 @@ def main(config: ExperimentConfig, experiment_name,
     protocol_metadata["resize_audit_status"] = (
         "archived" if resize_audit_path is not None else "not-applicable-synthetic-only"
     )
-    protocol_path = _write_protocol_metadata(experiment_name, protocol_metadata)
+    trainer_callbacks = [epoch_checkpointer, checkpointer]
+    if train and finetuning_technique == "CL" and resize_audit_path is not None:
+        first_batch_audit_path = resize_audit_path.parent / "first_train_batch.json"
+        trainer_callbacks.append(_FirstTrainBatchInputAudit(first_batch_audit_path))
+        protocol_metadata["first_train_batch_audit_path"] = str(
+            first_batch_audit_path.resolve()
+        )
+        protocol_metadata["first_train_batch_audit_status"] = "pending"
+    else:
+        protocol_metadata["first_train_batch_audit_path"] = None
+        protocol_metadata["first_train_batch_audit_status"] = "not-applicable"
+    protocol_path = _write_protocol_metadata(
+        experiment_name,
+        protocol_metadata,
+        output_root=run_record_root,
+    )
     logger.info("Local run protocol: {}", protocol_path)
     logger.info("{}", json.dumps(protocol_metadata, sort_keys=True))
 
@@ -628,7 +721,7 @@ def main(config: ExperimentConfig, experiment_name,
     trainer = Trainer(**_build_trainer_kwargs(
         max_steps=max_steps,
         validation_every_n_batches=validation_every_n_batches,
-        callbacks=[epoch_checkpointer, checkpointer],
+        callbacks=trainer_callbacks,
         logger=wandb_logger,
     ))
 
@@ -659,7 +752,8 @@ def launch(config_path: str, experiment_name: str,
            encoder_training_mode: str = "fine_tune",
            validation_every_n_batches: int = 10000,
            protocol_version: str = PROTOCOL_VERSION,
-           source_curriculum_step: int | None = None):
+           source_curriculum_step: int | None = None,
+           source_checkpoint_sha256: str | None = None):
     checkpoint_every_n_epochs = _validate_checkpoint_every_n_epochs(checkpoint_every_n_epochs)
     validation_every_n_batches = _validate_validation_every_n_batches(
         validation_every_n_batches
@@ -685,7 +779,8 @@ def launch(config_path: str, experiment_name: str,
          encoder_training_mode=encoder_training_mode,
          validation_every_n_batches=validation_every_n_batches,
          protocol_version=protocol_version,
-         source_curriculum_step=source_curriculum_step)
+         source_curriculum_step=source_curriculum_step,
+         source_checkpoint_sha256=source_checkpoint_sha256)
 
 
 if __name__ == "__main__":

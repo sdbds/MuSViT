@@ -183,7 +183,7 @@ class SMTPP_Trainer(L.LightningModule):
     def training_step(self, batch):
         self._sync_encoder_trainability()
 
-        x, di, y, = batch
+        x, di, y = batch[:3]
         outputs = self.model(x, di[:, :-1], labels=y)
         loss = outputs.loss
         self.log('loss', loss, on_step=False, on_epoch=True, batch_size=x.shape[0], prog_bar=True)

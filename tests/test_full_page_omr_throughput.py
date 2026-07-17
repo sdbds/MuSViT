@@ -1,4 +1,5 @@
 import ast
+import hashlib
 import inspect
 import json
 import subprocess
@@ -17,6 +18,14 @@ from experiments.full_page_omr.smt_trainer import SMTPP_Trainer
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 class _TinyModel(torch.nn.Module):
@@ -61,6 +70,7 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                 validation_every_n_batches=25000,
                 protocol_version="full_page_omr_resize_v1",
                 source_curriculum_step=282200,
+                source_checkpoint_sha256="a" * 64,
             )
 
         self.assertEqual(launch.call_args.kwargs["checkpoint_every_n_epochs"], 37)
@@ -72,6 +82,7 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
             "full_page_omr_resize_v1",
         )
         self.assertEqual(launch.call_args.kwargs["source_curriculum_step"], 282200)
+        self.assertEqual(launch.call_args.kwargs["source_checkpoint_sha256"], "a" * 64)
 
     def test_launch_forwards_checkpoint_interval_to_main(self):
         config = {
@@ -96,6 +107,7 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                     validation_every_n_batches=25000,
                     protocol_version="full_page_omr_resize_v1",
                     source_curriculum_step=282200,
+                    source_checkpoint_sha256="a" * 64,
                 )
 
         self.assertEqual(main.call_args.kwargs["checkpoint_every_n_epochs"], 37)
@@ -107,6 +119,7 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
             "full_page_omr_resize_v1",
         )
         self.assertEqual(main.call_args.kwargs["source_curriculum_step"], 282200)
+        self.assertEqual(main.call_args.kwargs["source_checkpoint_sha256"], "a" * 64)
 
     def test_checkpoint_interval_must_be_a_positive_integer(self):
         for value in (0, -1, True, 1.5):
@@ -157,6 +170,7 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                     train=True,
                     protocol_version=finetune.PROTOCOL_VERSION,
                     source_curriculum_step=None,
+                    source_checkpoint_sha256=None,
                 )
 
     def test_full_resume_rejects_curriculum_offset_mismatch(self):
@@ -172,6 +186,7 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                     train=True,
                     protocol_version=finetune.PROTOCOL_VERSION,
                     source_curriculum_step=None,
+                    source_checkpoint_sha256=None,
                 )
 
             current = Path(tmpdir) / "current.ckpt"
@@ -192,6 +207,7 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                     train=True,
                     protocol_version=finetune.PROTOCOL_VERSION,
                     source_curriculum_step=None,
+                    source_checkpoint_sha256=None,
                 )
 
             state = finetune._validate_run_contract(
@@ -202,6 +218,7 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                 train=True,
                 protocol_version=finetune.PROTOCOL_VERSION,
                 source_curriculum_step=None,
+                source_checkpoint_sha256=None,
             )
 
         self.assertEqual(state.curriculum_step_offset, 10)
@@ -210,6 +227,7 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             checkpoint = Path(tmpdir) / "source.ckpt"
             torch.save({"global_step": 282200}, checkpoint)
+            checkpoint_sha256 = _sha256_file(checkpoint)
             config = SimpleNamespace(data=SimpleNamespace(skip_steps=282200))
 
             state = finetune._validate_run_contract(
@@ -220,11 +238,13 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                 train=True,
                 protocol_version="full_page_omr_single_resize_v1",
                 source_curriculum_step=282200,
+                source_checkpoint_sha256=checkpoint_sha256,
             )
 
         self.assertEqual(state.global_step, 282200)
         self.assertEqual(state.curriculum_step, 282200)
         self.assertEqual(state.curriculum_step_source, "legacy_global_step")
+        self.assertEqual(state.sha256, checkpoint_sha256)
 
     def test_weights_only_branch_rejects_implicit_or_mismatched_contract(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -244,6 +264,7 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                 max_steps=100,
                 train=True,
                 protocol_version="full_page_omr_resize_v1",
+                source_checkpoint_sha256=_sha256_file(checkpoint),
             )
 
             with self.assertRaisesRegex(ValueError, "source_curriculum_step.*required"):
@@ -265,6 +286,17 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                 finetune._validate_run_contract(
                     **{**base, "config": SimpleNamespace(data=SimpleNamespace(skip_steps=41))},
                     source_curriculum_step=41,
+                )
+
+            with self.assertRaisesRegex(ValueError, "source_checkpoint_sha256.*required"):
+                finetune._validate_run_contract(
+                    **{**base, "source_checkpoint_sha256": None},
+                    source_curriculum_step=40,
+                )
+            with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+                finetune._validate_run_contract(
+                    **{**base, "source_checkpoint_sha256": "0" * 64},
+                    source_curriculum_step=40,
                 )
 
         with self.assertRaisesRegex(ValueError, "mutually exclusive"):
@@ -396,6 +428,30 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
             )
 
         self.assertIsNone(path)
+
+    def test_first_train_batch_callback_archives_actual_batch_shapes_once(self):
+        metadata = {
+            "source": "real",
+            "raw_shape_hwc": [2100, 1484, 3],
+            "intermediate_shape_hwc": [2100, 1484, 3],
+            "final_shape_nchw": [1, 3, 1024, 1024],
+        }
+        batch = (
+            torch.zeros((1, 3, 1024, 1024)),
+            torch.zeros((1, 2), dtype=torch.long),
+            torch.zeros((1, 2), dtype=torch.long),
+            metadata,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "first_train_batch.json"
+            callback = finetune._FirstTrainBatchInputAudit(path)
+            callback.on_train_batch_start(None, None, batch, 0)
+            callback.on_train_batch_start(None, None, (*batch[:3], {**metadata, "source": "other"}), 1)
+            report = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(report["batch_index"], 0)
+        self.assertEqual(report["source"], "real")
+        self.assertEqual(report["actual_batch_shape_nchw"], [1, 3, 1024, 1024])
 
     @unittest.skipUnless(sys.platform == "win32", "PowerShell launcher is Windows-specific")
     def test_powershell_dry_run_includes_default_checkpoint_interval(self):
@@ -643,6 +699,26 @@ class SMTPPTrainerThroughputTests(unittest.TestCase):
 
         self.assertEqual(module.samples_seen, 2)
         self.assertEqual(module.curriculum_step, 2)
+
+    def test_training_step_ignores_input_audit_metadata(self):
+        module = SMTPP_Trainer(
+            SimpleNamespace(padding_token=0),
+            _TinyModel(),
+            encoder_training_mode="linear_probe",
+            encoder_unfreeze_step=None,
+        )
+        module.log = Mock()
+        batch = (
+            torch.zeros((1, 3, 2, 2)),
+            torch.zeros((1, 3), dtype=torch.long),
+            torch.zeros((1, 3), dtype=torch.long),
+            {"source": "real"},
+        )
+
+        loss = module.training_step(batch)
+
+        self.assertIsInstance(loss, torch.Tensor)
+        self.assertEqual(module.samples_seen, 1)
 
     def test_failed_training_step_does_not_count_unconsumed_samples(self):
         model = _TinyModel()

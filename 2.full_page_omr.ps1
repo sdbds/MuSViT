@@ -22,6 +22,7 @@ $Config = @{
     attention_backend      = "auto"   # auto: FA2 -> SDPA -> eager fallback
     protocol_version       = "full_page_omr_eval_v2"
     source_curriculum_step = $null    # Required with starting_weights
+    source_checkpoint_sha256 = $null  # Required with starting_weights
     from_checkpoint        = $null    # Start a fresh Trainer run
     starting_weights       = $null    # Initialize model weights from a .ckpt file
 }
@@ -198,9 +199,14 @@ if (-not [string]::IsNullOrWhiteSpace($Config.starting_weights)) {
         throw "source_curriculum_step must be a non-negative integer with starting_weights."
     }
     $Config.source_curriculum_step = $SourceCurriculumStep
+    if ([string]::IsNullOrWhiteSpace($Config.source_checkpoint_sha256) -or
+        [string]$Config.source_checkpoint_sha256 -cnotmatch '^[0-9a-f]{64}$') {
+        throw "source_checkpoint_sha256 must be a lowercase SHA-256 digest with starting_weights."
+    }
 }
-elseif ($null -ne $Config.source_curriculum_step) {
-    throw "source_curriculum_step requires starting_weights."
+elseif ($null -ne $Config.source_curriculum_step -or
+        $null -ne $Config.source_checkpoint_sha256) {
+    throw "source_curriculum_step and source_checkpoint_sha256 require starting_weights."
 }
 
 $CheckpointEveryNEpochs = 0
@@ -272,6 +278,7 @@ if (-not [string]::IsNullOrWhiteSpace($Config.starting_weights)) {
     $StartingWeightsPath = Resolve-InputFile -Path $Config.starting_weights -SettingName "starting_weights"
     [void]$UvArgs.Add("--starting_weights=$StartingWeightsPath")
     [void]$UvArgs.Add("--source_curriculum_step=$($Config.source_curriculum_step)")
+    [void]$UvArgs.Add("--source_checkpoint_sha256=$($Config.source_checkpoint_sha256)")
 }
 
 $DisplayArgs = $UvArgs | ForEach-Object {
