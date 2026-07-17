@@ -373,6 +373,13 @@ class DataLoaderPipelineTests(unittest.TestCase):
         )
         self.assertEqual(ratio(config_root / "Mozarteum" / "finetuning.json"), 1.0)
 
+        single_resize = json.loads(
+            (config_root / "Polish_Scores" / "finetuning_single_resize.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(single_resize["data"]["skip_steps"], 282200)
+
     def test_vocabulary_iteration_reads_only_arrow_transcriptions(self):
         rows = _FakeArrowRows()
         with (

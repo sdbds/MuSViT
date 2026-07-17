@@ -1,13 +1,20 @@
 import json
+from dataclasses import dataclass
+from pathlib import Path
 
 from fire import Fire
 from loguru import logger
+import torch
 
 from . import _globals
 from .config.ExperimentConfigWrapper import ExperimentConfig, experiment_config_from_dict
 from .data import SyntheticGrandStaffDataset, CLFinetuningDataset, SynthRealFinetuningDataset
 from .smt_foundation import SMTFoundationConfig, SMTFoundationModelForCausalLM
-from .smt_trainer import ENCODER_TRAINING_MODES, SMTPP_Trainer
+from .smt_trainer import (
+    ENCODER_TRAINING_MODES,
+    SAMPLES_SEEN_CHECKPOINT_KEY,
+    SMTPP_Trainer,
+)
 from .data_augmentation.data_augmentation import set_up_processor
 
 from lightning.pytorch import Trainer
@@ -27,6 +34,14 @@ METRIC_VERSION = "canonical_v2"
 CHECKPOINT_MONITOR = "val_SER_v2"
 PRECISION = "16-mixed"
 ACCUMULATE_GRAD_BATCHES = 1
+
+
+@dataclass(frozen=True)
+class CheckpointRunState:
+    path: str
+    global_step: int
+    curriculum_step: int
+    curriculum_step_source: str
 
 
 def _validate_checkpoint_every_n_epochs(value: int) -> int:
@@ -75,6 +90,105 @@ def _validate_checkpoint_sources(from_checkpoint, starting_weights):
     if all(value is not None for value in normalized):
         raise ValueError("from_checkpoint and starting_weights are mutually exclusive")
     return tuple(normalized)
+
+
+def _validate_non_negative_integer(value, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field_name} must be a non-negative integer")
+    return value
+
+
+def _validate_protocol_version(value: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("protocol_version must be a non-empty string")
+    return value.strip()
+
+
+def _read_checkpoint_run_state(checkpoint_path: str) -> CheckpointRunState:
+    path = Path(checkpoint_path).expanduser().resolve()
+    payload = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+    if not isinstance(payload, dict):
+        raise ValueError(f"checkpoint must contain a dictionary payload: {path}")
+
+    global_step = _validate_non_negative_integer(
+        payload.get("global_step"),
+        "checkpoint global_step",
+    )
+    if SAMPLES_SEEN_CHECKPOINT_KEY in payload:
+        samples_seen = _validate_non_negative_integer(
+            payload[SAMPLES_SEEN_CHECKPOINT_KEY],
+            f"checkpoint {SAMPLES_SEEN_CHECKPOINT_KEY}",
+        )
+        hyper_parameters = payload.get("hyper_parameters", {})
+        if not isinstance(hyper_parameters, dict):
+            raise ValueError("checkpoint hyper_parameters must be a dictionary")
+        offset = _validate_non_negative_integer(
+            hyper_parameters.get("curriculum_step_offset", 0),
+            "checkpoint curriculum_step_offset",
+        )
+        curriculum_step = offset + samples_seen
+        curriculum_step_source = "checkpoint_samples_seen"
+    else:
+        curriculum_step = global_step
+        curriculum_step_source = "legacy_global_step"
+
+    del payload
+    return CheckpointRunState(
+        path=str(path),
+        global_step=global_step,
+        curriculum_step=curriculum_step,
+        curriculum_step_source=curriculum_step_source,
+    )
+
+
+def _validate_run_contract(*, config, from_checkpoint, starting_weights,
+                           max_steps: int, train: bool, protocol_version: str,
+                           source_curriculum_step: int | None):
+    protocol_version = _validate_protocol_version(protocol_version)
+    if from_checkpoint is not None:
+        if source_curriculum_step is not None:
+            raise ValueError(
+                "source_curriculum_step is only valid with starting_weights"
+            )
+        state = _read_checkpoint_run_state(from_checkpoint)
+        if train and max_steps <= state.global_step:
+            raise ValueError(
+                f"max_steps ({max_steps}) must exceed resumed checkpoint "
+                f"global_step ({state.global_step})"
+            )
+        return state
+
+    if starting_weights is not None:
+        if source_curriculum_step is None:
+            raise ValueError(
+                "source_curriculum_step is required with starting_weights"
+            )
+        source_curriculum_step = _validate_non_negative_integer(
+            source_curriculum_step,
+            "source_curriculum_step",
+        )
+        if protocol_version == PROTOCOL_VERSION:
+            raise ValueError(
+                "a weights-only experiment fork must use its own protocol_version"
+            )
+        if config.data.skip_steps != source_curriculum_step:
+            raise ValueError(
+                "config data.skip_steps must equal source_curriculum_step: "
+                f"{config.data.skip_steps} != {source_curriculum_step}"
+            )
+        state = _read_checkpoint_run_state(starting_weights)
+        if state.curriculum_step != source_curriculum_step:
+            raise ValueError(
+                "source_curriculum_step does not match checkpoint curriculum_step: "
+                f"{source_curriculum_step} != {state.curriculum_step}"
+            )
+        return state
+
+    if source_curriculum_step is not None:
+        raise ValueError("source_curriculum_step requires starting_weights")
+    if config.data.skip_steps != 0:
+        raise ValueError("fresh training requires data.skip_steps=0")
+    return None
 
 
 def _feature_grid_for_resolution(resolution: int, patch_size) -> tuple[int, int]:
@@ -149,7 +263,10 @@ def _build_trainer_kwargs(*, max_steps: int, validation_every_n_batches: int,
 def _build_protocol_metadata(*, max_steps, validation_every_n_batches,
                              from_checkpoint, starting_weights,
                              encoder_training_mode, encoder_unfreeze_step,
-                             resolution, reduce_ratio, batch_size):
+                             resolution, reduce_ratio, batch_size,
+                             protocol_version=PROTOCOL_VERSION,
+                             source_curriculum_step=None,
+                             checkpoint_state=None):
     if from_checkpoint is not None:
         checkpoint_source = from_checkpoint
         checkpoint_load_mode = "full"
@@ -160,13 +277,21 @@ def _build_protocol_metadata(*, max_steps, validation_every_n_batches,
         checkpoint_source = "foundation"
         checkpoint_load_mode = "fresh"
     return {
-        "protocol_version": PROTOCOL_VERSION,
+        "protocol_version": protocol_version,
         "metric_version": METRIC_VERSION,
         "max_steps": max_steps,
         "validation_every_n_batches": validation_every_n_batches,
         "checkpoint_monitor": CHECKPOINT_MONITOR,
         "checkpoint_source": checkpoint_source,
         "checkpoint_load_mode": checkpoint_load_mode,
+        "checkpoint_global_step": (
+            checkpoint_state.global_step if checkpoint_state is not None else None
+        ),
+        "source_curriculum_step": source_curriculum_step,
+        "source_curriculum_step_evidence": (
+            checkpoint_state.curriculum_step_source
+            if checkpoint_state is not None else None
+        ),
         "encoder_training_mode": encoder_training_mode,
         "encoder_unfreeze_step": encoder_unfreeze_step,
         "resolution": resolution,
@@ -208,7 +333,9 @@ def main(config: ExperimentConfig, experiment_name,
          max_steps: int = 320000, train: bool = True, starting_weights: str | None = None,
          attention_backend: str = "auto", checkpoint_every_n_epochs: int = 100,
          encoder_training_mode: str = "fine_tune",
-         validation_every_n_batches: int = 10000):
+         validation_every_n_batches: int = 10000,
+         protocol_version: str = PROTOCOL_VERSION,
+         source_curriculum_step: int | None = None):
     checkpoint_every_n_epochs = _validate_checkpoint_every_n_epochs(checkpoint_every_n_epochs)
     validation_every_n_batches = _validate_validation_every_n_batches(
         validation_every_n_batches
@@ -218,6 +345,15 @@ def main(config: ExperimentConfig, experiment_name,
     from_checkpoint, starting_weights = _validate_checkpoint_sources(
         from_checkpoint,
         starting_weights,
+    )
+    checkpoint_state = _validate_run_contract(
+        config=config,
+        from_checkpoint=from_checkpoint,
+        starting_weights=starting_weights,
+        max_steps=max_steps,
+        train=train,
+        protocol_version=protocol_version,
+        source_curriculum_step=source_curriculum_step,
     )
     if resolution is None:
         _globals.resolution = 1024
@@ -321,6 +457,9 @@ def main(config: ExperimentConfig, experiment_name,
             resolution=resolution,
             reduce_ratio=config.data.reduce_ratio,
             batch_size=data.batch_size,
+            protocol_version=protocol_version,
+            source_curriculum_step=source_curriculum_step,
+            checkpoint_state=checkpoint_state,
         )
     )
 
@@ -356,7 +495,9 @@ def launch(config_path: str, experiment_name: str,
            learning_rate: float | None = None, attention_backend: str = "auto",
            checkpoint_every_n_epochs: int = 100,
            encoder_training_mode: str = "fine_tune",
-           validation_every_n_batches: int = 10000):
+           validation_every_n_batches: int = 10000,
+           protocol_version: str = PROTOCOL_VERSION,
+           source_curriculum_step: int | None = None):
     checkpoint_every_n_epochs = _validate_checkpoint_every_n_epochs(checkpoint_every_n_epochs)
     validation_every_n_batches = _validate_validation_every_n_batches(
         validation_every_n_batches
@@ -380,7 +521,9 @@ def launch(config_path: str, experiment_name: str,
          resolution=resolution, max_steps=max_steps, train=train, starting_weights=starting_weights,
          attention_backend=attention_backend, checkpoint_every_n_epochs=checkpoint_every_n_epochs,
          encoder_training_mode=encoder_training_mode,
-         validation_every_n_batches=validation_every_n_batches)
+         validation_every_n_batches=validation_every_n_batches,
+         protocol_version=protocol_version,
+         source_curriculum_step=source_curriculum_step)
 
 
 if __name__ == "__main__":

@@ -33,7 +33,9 @@ def run(config_path: str, experiment_name: str,
         starting_weights: str | None = None, learning_rate: float | None = None,
         checkpoint_every_n_epochs: int = 100, attention_backend: str = "auto",
         encoder_training_mode: str = "fine_tune",
-        validation_every_n_batches: int = 10000):
+        validation_every_n_batches: int = 10000,
+        protocol_version: str = "full_page_omr_eval_v2",
+        source_curriculum_step: int | None = None):
     """Fine-tune MuSViT for full-page Optical Music Recognition.
 
     Args:
@@ -60,4 +62,6 @@ def run(config_path: str, experiment_name: str,
             attention_backend=attention_backend,
             encoder_training_mode=encoder_training_mode,
             validation_every_n_batches=validation_every_n_batches,
+            protocol_version=protocol_version,
+            source_curriculum_step=source_curriculum_step,
         )

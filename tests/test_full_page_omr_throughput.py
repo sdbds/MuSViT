@@ -125,6 +125,83 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                 starting_weights="initial.ckpt",
             )
 
+    def test_full_resume_endpoint_must_exceed_checkpoint_step(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint = Path(tmpdir) / "resume.ckpt"
+            torch.save({"global_step": 320000}, checkpoint)
+
+            with self.assertRaisesRegex(ValueError, "max_steps.*global_step"):
+                finetune._validate_run_contract(
+                    config=SimpleNamespace(data=SimpleNamespace(skip_steps=0)),
+                    from_checkpoint=str(checkpoint),
+                    starting_weights=None,
+                    max_steps=320000,
+                    train=True,
+                    protocol_version=finetune.PROTOCOL_VERSION,
+                    source_curriculum_step=None,
+                )
+
+    def test_weights_only_branch_binds_checkpoint_curriculum_and_protocol(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint = Path(tmpdir) / "source.ckpt"
+            torch.save({"global_step": 282200}, checkpoint)
+            config = SimpleNamespace(data=SimpleNamespace(skip_steps=282200))
+
+            state = finetune._validate_run_contract(
+                config=config,
+                from_checkpoint=None,
+                starting_weights=str(checkpoint),
+                max_steps=20000,
+                train=True,
+                protocol_version="full_page_omr_single_resize_v1",
+                source_curriculum_step=282200,
+            )
+
+        self.assertEqual(state.global_step, 282200)
+        self.assertEqual(state.curriculum_step, 282200)
+        self.assertEqual(state.curriculum_step_source, "legacy_global_step")
+
+    def test_weights_only_branch_rejects_implicit_or_mismatched_contract(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint = Path(tmpdir) / "source.ckpt"
+            torch.save(
+                {
+                    "global_step": 40,
+                    "full_page_omr_samples_seen": 30,
+                    "hyper_parameters": {"curriculum_step_offset": 10},
+                },
+                checkpoint,
+            )
+            base = dict(
+                config=SimpleNamespace(data=SimpleNamespace(skip_steps=40)),
+                from_checkpoint=None,
+                starting_weights=str(checkpoint),
+                max_steps=100,
+                train=True,
+                protocol_version="full_page_omr_resize_v1",
+            )
+
+            with self.assertRaisesRegex(ValueError, "source_curriculum_step.*required"):
+                finetune._validate_run_contract(
+                    **base,
+                    source_curriculum_step=None,
+                )
+            with self.assertRaisesRegex(ValueError, "skip_steps"):
+                finetune._validate_run_contract(
+                    **{**base, "config": SimpleNamespace(data=SimpleNamespace(skip_steps=39))},
+                    source_curriculum_step=40,
+                )
+            with self.assertRaisesRegex(ValueError, "own protocol_version"):
+                finetune._validate_run_contract(
+                    **{**base, "protocol_version": finetune.PROTOCOL_VERSION},
+                    source_curriculum_step=40,
+                )
+            with self.assertRaisesRegex(ValueError, "checkpoint curriculum_step"):
+                finetune._validate_run_contract(
+                    **{**base, "config": SimpleNamespace(data=SimpleNamespace(skip_steps=41))},
+                    source_curriculum_step=41,
+                )
+
         with self.assertRaisesRegex(ValueError, "mutually exclusive"):
             finetune.launch(
                 config_path="does-not-exist.json",
