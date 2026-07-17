@@ -339,19 +339,29 @@ class _LockedBenchmarkRuntime:
         }
 
     @staticmethod
-    def _external_inputs():
+    def _foundation_snapshot(snapshot_download):
+        kwargs = {
+            "repo_id": FOUNDATION_MODEL_ID,
+            "revision": FOUNDATION_REVISION,
+            "allow_patterns": ["config.json", "model.safetensors"],
+        }
+        try:
+            return snapshot_download(**kwargs, local_files_only=True)
+        except Exception:
+            try:
+                return snapshot_download(**kwargs)
+            except Exception as exc:
+                raise BenchmarkUnavailable(
+                    "locked foundation revision is unavailable: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+
+    @classmethod
+    def _external_inputs(cls):
         from datasets import load_dataset
         from huggingface_hub import snapshot_download
 
-        try:
-            snapshot = snapshot_download(
-                repo_id=FOUNDATION_MODEL_ID,
-                revision=FOUNDATION_REVISION,
-            )
-        except Exception as exc:
-            raise BenchmarkUnavailable(
-                "locked foundation revision is unavailable"
-            ) from exc
+        snapshot = cls._foundation_snapshot(snapshot_download)
         try:
             rows = load_dataset(
                 DATASET_ID,
@@ -360,7 +370,10 @@ class _LockedBenchmarkRuntime:
                 keep_in_memory=False,
             )
         except Exception as exc:
-            raise BenchmarkUnavailable("locked dataset revision is unavailable") from exc
+            raise BenchmarkUnavailable(
+                "locked dataset revision is unavailable: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
         if len(rows) < 10:
             raise BenchmarkUnavailable("locked dataset revision has fewer than 10 val rows")
         return snapshot, rows

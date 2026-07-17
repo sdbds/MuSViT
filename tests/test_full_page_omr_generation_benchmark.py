@@ -90,6 +90,19 @@ class LockedBenchmarkContractTests(unittest.TestCase):
                 os.environ.pop("CUDA_VISIBLE_DEVICES", None)
             else:
                 os.environ["CUDA_VISIBLE_DEVICES"] = previous
+
+    def test_foundation_snapshot_prefers_the_exact_cached_revision(self):
+        download = Mock(return_value="cached-snapshot")
+
+        snapshot = benchmark._LockedBenchmarkRuntime._foundation_snapshot(download)
+
+        self.assertEqual(snapshot, "cached-snapshot")
+        download.assert_called_once_with(
+            repo_id=benchmark.FOUNDATION_MODEL_ID,
+            revision=benchmark.FOUNDATION_REVISION,
+            allow_patterns=["config.json", "model.safetensors"],
+            local_files_only=True,
+        )
         with self.assertRaisesRegex(ValueError, "length"):
             benchmark.build_cycled_prefix(
                 [1, 7, 2],
