@@ -142,6 +142,14 @@ class CheckpointManifestTests(unittest.TestCase):
         with self.assertRaisesRegex(diagnostics.ManifestError, "pre"):
             diagnostics.load_manifest(path)
 
+    def test_post_checkpoint_must_be_at_or_after_the_unfreeze_boundary(self):
+        post = dict(self.post, global_step=119999)
+        manifest = _manifest(post, self.foundation_digest)
+        path = _write_manifest(self.root / "manifest.json", manifest)
+
+        with self.assertRaisesRegex(diagnostics.ManifestError, "post"):
+            diagnostics.load_manifest(path)
+
     def test_post_only_mode_without_pre_checkpoint_is_partial(self):
         manifest = _manifest(self.post, self.foundation_digest)
         loaded = diagnostics.load_manifest(

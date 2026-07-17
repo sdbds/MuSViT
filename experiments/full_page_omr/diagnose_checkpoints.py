@@ -186,6 +186,8 @@ def _validate_manifest(manifest):
         raise ManifestError("post-only mode must omit the pre checkpoint")
     for role, entry in checkpoints.items():
         _validate_checkpoint_entry(entry, f"manifest.checkpoints.{role}")
+    if checkpoints["post"]["global_step"] < ENCODER_UNFREEZE_STEP:
+        raise ManifestError("post checkpoint must be at or after encoder unfreezing")
     if "pre" in checkpoints:
         pre_step = checkpoints["pre"]["global_step"]
         post_step = checkpoints["post"]["global_step"]
