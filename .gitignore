@@ -240,3 +240,6 @@ models/
 
 # OS files
 .DS_Store
+
+# Local git worktrees
+.worktrees/
