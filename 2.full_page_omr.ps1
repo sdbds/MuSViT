@@ -33,7 +33,7 @@ $Features = @{
 
 $Runtime = @{
     cuda_visible_devices = "0"       # Use $null to leave CUDA device selection unchanged
-    cairo_dll_directory  = "E:\Roaming\baidu\BaiduNetdisk\module\ImageViewer"
+    cairo_dll_directory  = $null       # Prefer CAIROCFFI_DLL_DIRECTORIES or a Cairo DLL on PATH
     windows_num_workers  = 24          # Best measured long-run throughput on this workstation
 }
 

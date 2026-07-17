@@ -962,6 +962,7 @@ class SMTFoundationModelForCausalLM(PreTrainedModel):
     
     @torch.no_grad()
     def generate_token_ids(self, input, use_incremental=False):
+        """Generate raw token ids; incremental mode is benchmark-only until its gate passes."""
         if not isinstance(use_incremental, bool):
             raise TypeError("use_incremental must be a boolean")
 

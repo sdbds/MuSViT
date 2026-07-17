@@ -228,7 +228,8 @@ def compute_poliphony_metrics_legacy(hyp_array, gt_array):
     )
 
 
-# Compatibility for the running legacy call site until the trainer migration lands.
+# Deprecated compatibility alias for external legacy evaluators.
+# Migration tooling calls compute_poliphony_metrics_legacy() explicitly.
 compute_poliphony_metrics = compute_poliphony_metrics_legacy
 
 

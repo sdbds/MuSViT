@@ -56,6 +56,18 @@ uv sync
 
 This also installs the `musvit` console command into the project environment.
 
+### Windows Cairo dependency
+
+Full-page OMR and its tests import CairoSVG, which requires a native Cairo DLL on Windows. Install Cairo, then expose the directory containing `libcairo-2.dll` through the environment before launching training or `pytest`:
+
+```powershell
+$env:CAIROCFFI_DLL_DIRECTORIES = "C:\path\to\cairo\bin"
+$env:PATH = "$env:CAIROCFFI_DLL_DIRECTORIES;$env:PATH"
+uv run pytest -q
+```
+
+`2.full_page_omr.ps1` first checks its optional `Runtime.cairo_dll_directory`, then `CAIROCFFI_DLL_DIRECTORIES`, then `PATH`. The repository does not commit a machine-specific Cairo directory.
+
 <a name=environment-variables></a>
 ## 🔑 Environment Variables
 

@@ -496,6 +496,16 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
         self.assertEqual(report["actual_batch_shape_nchw"], [1, 3, 1024, 1024])
 
     @unittest.skipUnless(sys.platform == "win32", "PowerShell launcher is Windows-specific")
+    def test_powershell_cairo_directory_has_no_machine_specific_default(self):
+        script = (REPO_ROOT / "2.full_page_omr.ps1").read_text(encoding="utf-8")
+        setting = next(
+            line for line in script.splitlines()
+            if "cairo_dll_directory" in line and "=" in line
+        )
+
+        self.assertEqual(setting.split("=", 1)[1].split("#", 1)[0].strip(), "$null")
+
+    @unittest.skipUnless(sys.platform == "win32", "PowerShell launcher is Windows-specific")
     def test_powershell_dry_run_includes_default_checkpoint_interval(self):
         result = subprocess.run(
             [

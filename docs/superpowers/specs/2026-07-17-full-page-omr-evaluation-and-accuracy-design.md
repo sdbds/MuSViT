@@ -217,6 +217,8 @@ reference checkpoint、dataset revision 或 GPU 不可用时，本规格的门�
 
 self-KV 长度、静态 cross-KV 份数和生产 attention window 的内存契约全部通过。总体 gate 状态为 `failed`，因此 `generate_token_ids(use_incremental=False)` 继续作为生产默认值；本次结果不授权切换默认路径，也不修改任何既定阈值。
 
+增量路径的生命周期状态为 `benchmark-only`，生产调用者不得依赖它。下一次解码性能工作必须二选一：加入 CUDA Graphs 或其他明确优化后重新通过同一锁定 gate，或者删除增量实现及其专用测试；不得在没有新性能实验的功能修改中继续扩大这条维护面。
+
 ## 3. 验证与 checkpoint 协议
 
 ### 新协议默认值
