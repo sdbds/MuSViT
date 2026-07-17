@@ -1,5 +1,9 @@
 # Full-page OMR 训练吞吐与正确性修复规格
 
+> 本规格已经完成验收。后续的指标语义、增量解码、验证周期和精度实验由
+> [2026-07-17 full-page OMR 评测与精度协议](2026-07-17-full-page-omr-evaluation-and-accuracy-design.md)
+> 规定；后续规格不追溯修改本文的验收结论。
+
 ## 状态
 
 实施版。已按论文、官方 MuSViT model card 和官方下游配置重新核对，并于 2026-07-14 锁定默认训练协议为 `fine_tune`。自动化修复与旧 checkpoint 反序列化 smoke test 已完成；24-worker、200-step 本机验收单独记录，不用环境结果替代协议正确性。
