@@ -43,6 +43,7 @@ class CheckpointRunState:
     path: str
     global_step: int
     curriculum_step: int
+    curriculum_step_offset: int
     curriculum_step_source: str
 
 
@@ -131,6 +132,7 @@ def _read_checkpoint_run_state(checkpoint_path: str) -> CheckpointRunState:
         curriculum_step = offset + samples_seen
         curriculum_step_source = "checkpoint_samples_seen"
     else:
+        offset = 0
         curriculum_step = global_step
         curriculum_step_source = "legacy_global_step"
 
@@ -139,6 +141,7 @@ def _read_checkpoint_run_state(checkpoint_path: str) -> CheckpointRunState:
         path=str(path),
         global_step=global_step,
         curriculum_step=curriculum_step,
+        curriculum_step_offset=offset,
         curriculum_step_source=curriculum_step_source,
     )
 
@@ -153,6 +156,17 @@ def _validate_run_contract(*, config, from_checkpoint, starting_weights,
                 "source_curriculum_step is only valid with starting_weights"
             )
         state = _read_checkpoint_run_state(from_checkpoint)
+        requested_offset = config.data.skip_steps
+        if state.curriculum_step_source == "legacy_global_step" and requested_offset != 0:
+            raise ValueError(
+                "legacy full resume requires config data.skip_steps=0 because the "
+                "checkpoint has no curriculum_step_offset evidence"
+            )
+        if requested_offset != state.curriculum_step_offset:
+            raise ValueError(
+                "config data.skip_steps must match checkpoint curriculum_step_offset: "
+                f"{requested_offset} != {state.curriculum_step_offset}"
+            )
         if train and max_steps <= state.global_step:
             raise ValueError(
                 f"max_steps ({max_steps}) must exceed resumed checkpoint "
@@ -385,14 +399,14 @@ def _final_tensor_as_hwc(final: torch.Tensor) -> np.ndarray:
 
 def _write_resize_audit(data, *, experiment_name: str, protocol_version: str,
                         reduce_ratio: float, resolution: int,
-                        output_root=Path("logs")) -> Path:
+                        output_root=Path("logs")) -> Path | None:
     source = getattr(getattr(data, "train_dataset", None), "real_source", None)
     source_split = "train"
     if source is None:
         source = getattr(getattr(data, "val_dataset", None), "real_source", None)
         source_split = "val"
     if source is None or not hasattr(source, "resize_audit"):
-        raise ValueError("data module does not expose a real source for resize audit")
+        return None
 
     stages = source.resize_audit(0)
     final_shape = list(stages.final.shape)
@@ -596,7 +610,12 @@ def main(config: ExperimentConfig, experiment_name,
         reduce_ratio=config.data.reduce_ratio,
         resolution=resolution,
     )
-    protocol_metadata["resize_audit_path"] = str(resize_audit_path)
+    protocol_metadata["resize_audit_path"] = (
+        str(resize_audit_path) if resize_audit_path is not None else None
+    )
+    protocol_metadata["resize_audit_status"] = (
+        "archived" if resize_audit_path is not None else "not-applicable-synthetic-only"
+    )
     protocol_path = _write_protocol_metadata(experiment_name, protocol_metadata)
     logger.info("Local run protocol: {}", protocol_path)
     logger.info("{}", json.dumps(protocol_metadata, sort_keys=True))

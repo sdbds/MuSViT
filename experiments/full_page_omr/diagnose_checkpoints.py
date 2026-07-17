@@ -690,7 +690,9 @@ class _DefaultDiagnosticRuntime:
             raise DiagnosticError("could not query CUDA device 0 UUID") from exc
         if isinstance(raw_uuid, bytes):
             raw_uuid = raw_uuid.decode("ascii")
-        if not isinstance(raw_uuid, str) or not raw_uuid.strip():
+        elif not isinstance(raw_uuid, str):
+            raw_uuid = str(raw_uuid)
+        if not raw_uuid.strip():
             raise DiagnosticError("CUDA device 0 returned an invalid UUID")
         raw_uuid = raw_uuid.strip()
         return raw_uuid if raw_uuid.startswith("GPU-") else f"GPU-{raw_uuid}"

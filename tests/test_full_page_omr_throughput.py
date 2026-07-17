@@ -159,6 +159,53 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                     source_curriculum_step=None,
                 )
 
+    def test_full_resume_rejects_curriculum_offset_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            legacy = Path(tmpdir) / "legacy.ckpt"
+            torch.save({"global_step": 40}, legacy)
+            with self.assertRaisesRegex(ValueError, "legacy.*skip_steps=0"):
+                finetune._validate_run_contract(
+                    config=SimpleNamespace(data=SimpleNamespace(skip_steps=10)),
+                    from_checkpoint=str(legacy),
+                    starting_weights=None,
+                    max_steps=100,
+                    train=True,
+                    protocol_version=finetune.PROTOCOL_VERSION,
+                    source_curriculum_step=None,
+                )
+
+            current = Path(tmpdir) / "current.ckpt"
+            torch.save(
+                {
+                    "global_step": 40,
+                    "full_page_omr_samples_seen": 30,
+                    "hyper_parameters": {"curriculum_step_offset": 10},
+                },
+                current,
+            )
+            with self.assertRaisesRegex(ValueError, "curriculum_step_offset"):
+                finetune._validate_run_contract(
+                    config=SimpleNamespace(data=SimpleNamespace(skip_steps=9)),
+                    from_checkpoint=str(current),
+                    starting_weights=None,
+                    max_steps=100,
+                    train=True,
+                    protocol_version=finetune.PROTOCOL_VERSION,
+                    source_curriculum_step=None,
+                )
+
+            state = finetune._validate_run_contract(
+                config=SimpleNamespace(data=SimpleNamespace(skip_steps=10)),
+                from_checkpoint=str(current),
+                starting_weights=None,
+                max_steps=100,
+                train=True,
+                protocol_version=finetune.PROTOCOL_VERSION,
+                source_curriculum_step=None,
+            )
+
+        self.assertEqual(state.curriculum_step_offset, 10)
+
     def test_weights_only_branch_binds_checkpoint_curriculum_and_protocol(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             checkpoint = Path(tmpdir) / "source.ckpt"
@@ -330,6 +377,25 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
             self.assertEqual(report["final_shape_nchw"], [1, 3, 8, 8])
             for filename in ("raw.png", "intermediate.png", "final.png"):
                 self.assertTrue((path.parent / filename).is_file())
+
+    def test_resize_audit_is_not_applicable_to_synthetic_only_data(self):
+        module = SimpleNamespace(
+            train_dataset=object(),
+            val_dataset=object(),
+            batch_size=1,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = finetune._write_resize_audit(
+                module,
+                experiment_name="synthetic-only",
+                protocol_version=finetune.PROTOCOL_VERSION,
+                reduce_ratio=1.0,
+                resolution=1024,
+                output_root=Path(tmpdir),
+            )
+
+        self.assertIsNone(path)
 
     @unittest.skipUnless(sys.platform == "win32", "PowerShell launcher is Windows-specific")
     def test_powershell_dry_run_includes_default_checkpoint_interval(self):

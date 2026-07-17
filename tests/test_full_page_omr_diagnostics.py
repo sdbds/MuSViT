@@ -2,6 +2,7 @@ import hashlib
 import json
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -426,18 +427,24 @@ class DefaultDiagnosticRuntimeTests(unittest.TestCase):
         )
 
     def test_gpu_uuid_comes_from_the_actual_torch_device(self):
-        properties = SimpleNamespace(uuid="a70be80e-9cef-95c2-7557-52448110b38e")
-        with (
-            patch.object(torch.cuda, "get_device_properties", return_value=properties),
-            patch.object(
-                diagnostics.subprocess,
-                "run",
-                side_effect=AssertionError("driver index must not identify CUDA device"),
-            ),
-        ):
-            uuid = diagnostics._DefaultDiagnosticRuntime._visible_gpu_uuid()
+        values = (
+            "a70be80e-9cef-95c2-7557-52448110b38e",
+            uuid.UUID("a70be80e-9cef-95c2-7557-52448110b38e"),
+        )
+        for value in values:
+            properties = SimpleNamespace(uuid=value)
+            with (
+                self.subTest(value=type(value).__name__),
+                patch.object(torch.cuda, "get_device_properties", return_value=properties),
+                patch.object(
+                    diagnostics.subprocess,
+                    "run",
+                    side_effect=AssertionError("driver index must not identify CUDA device"),
+                ),
+            ):
+                actual = diagnostics._DefaultDiagnosticRuntime._visible_gpu_uuid()
 
-        self.assertEqual(uuid, "GPU-a70be80e-9cef-95c2-7557-52448110b38e")
+            self.assertEqual(actual, "GPU-a70be80e-9cef-95c2-7557-52448110b38e")
 
 
 if __name__ == "__main__":
