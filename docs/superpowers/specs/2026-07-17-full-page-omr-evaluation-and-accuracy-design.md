@@ -130,6 +130,8 @@ test_CER_legacy test_SER_legacy test_LER_legacy
 
 legacy 指标只用于说明切换差异，不参与 early stopping、checkpoint monitor 或实验排名。迁移验收只运行一次：对同一个 checkpoint 的完整 10 页 Polish Scores val 同时记录 v2 与 legacy 指标并归档逐页差值。该验收通过后，默认训练不再计算 legacy 指标。
 
+该一次性验收已在 source revision `a3b659d1e32c78fa76ad76f517a3cf7df74bece5` 上完成，使用锁定 checkpoint、dataset revision、RTX 4090 和 uncached greedy path。聚合结果为 `CER_v2=11.408327`、`SER_v2=13.400844`、`LER_v2=34.268900`；legacy 分别为 `9.764368`、`13.473862`、`34.565119`。10 页全部命中 EOS、无截断。CER 的 `+1.643959` 点变化主要来自 v2 改为真正的 Unicode 字符口径，不能解释为模型退化；完整身份与逐页差值归档于 `docs/superpowers/reports/2026-07-17-full-page-omr-metric-migration.md`。
+
 ### 距离实现
 
 删除应用代码中的 Python `levenshtein()`。所有评分视图使用已经锁定的 `editdistance.eval`。测试必须用短序列穷举或参数化样例证明它与旧动态规划的距离定义一致，不能只比较一个长样本的运行时间。
