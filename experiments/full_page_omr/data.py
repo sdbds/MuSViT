@@ -167,9 +167,10 @@ class _ArrowOMRSource:
     def __getitem__(self, index):
         sample = self.rows[index]
         image = np.asarray(sample['image'])
-        width = int(np.ceil(image.shape[1] * self.reduce_ratio))
-        height = int(np.ceil(image.shape[0] * self.reduce_ratio))
-        image = cv2.resize(image, (width, height))
+        if self.reduce_ratio != 1.0:
+            width = int(np.ceil(image.shape[1] * self.reduce_ratio))
+            height = int(np.ceil(image.shape[0] * self.reduce_ratio))
+            image = cv2.resize(image, (width, height))
         return image, self._tokenize(sample["transcription"])
 
     def iter_token_sequences(self):

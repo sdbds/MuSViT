@@ -2,10 +2,8 @@ import os
 
 import numpy as np
 from os import path
-from loguru import logger
 
 
-@logger.catch
 def check_and_retrieveVocabulary(YSequences, pathOfSequences, nameOfVoc, save=True):
     w2ipath = pathOfSequences + "/" + nameOfVoc + "w2i.npy"
     i2wpath = pathOfSequences + "/" + nameOfVoc + "i2w.npy"

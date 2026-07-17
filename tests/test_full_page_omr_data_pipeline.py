@@ -1,9 +1,11 @@
+import json
 import inspect
 import multiprocessing
 import pickle
 import random
 import sys
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -315,6 +317,61 @@ class DataLoaderPipelineTests(unittest.TestCase):
         self.assertEqual(tuple(image.shape), (1, 3, 2, 3))
         self.assertEqual(decoder_input.tolist(), [1, 2, 3])
         self.assertEqual(target.tolist(), [1, 2, 3])
+
+    def test_arrow_source_resizes_only_for_non_identity_ratio(self):
+        rows = _FakeArrowRows()
+        resized = np.zeros((2, 3, 3), dtype=np.uint8)
+        with (
+            patch.object(data, "load_dataset", return_value=rows),
+            patch.object(data, "parse_kern_file", return_value=["note"]),
+            patch.object(data.cv2, "resize", return_value=resized) as resize,
+        ):
+            source = data._ArrowOMRSource(
+                "example/dataset",
+                "train",
+                "bekern",
+                reduce_ratio=0.5,
+            )
+            image, _ = source[0]
+
+        resize.assert_called_once_with(rows.samples[0]["image"], (3, 2))
+        self.assertIs(image, resized)
+
+    def test_arrow_source_bypasses_opencv_for_identity_ratio(self):
+        rows = _FakeArrowRows()
+        with (
+            patch.object(data, "load_dataset", return_value=rows),
+            patch.object(data, "parse_kern_file", return_value=["note"]),
+            patch.object(data.cv2, "resize") as resize,
+        ):
+            source = data._ArrowOMRSource(
+                "example/dataset",
+                "train",
+                "bekern",
+                reduce_ratio=1.0,
+            )
+            image, _ = source[0]
+
+        resize.assert_not_called()
+        self.assertIs(image, rows.samples[0]["image"])
+
+    def test_single_resize_config_is_isolated_from_baselines(self):
+        config_root = (
+            Path(__file__).resolve().parents[1]
+            / "experiments"
+            / "full_page_omr"
+            / "config"
+        )
+
+        def ratio(path):
+            return json.loads(path.read_text(encoding="utf-8"))["data"]["reduce_ratio"]
+
+        self.assertEqual(ratio(config_root / "Polish_Scores" / "finetuning.json"), 0.5)
+        self.assertEqual(
+            ratio(config_root / "Polish_Scores" / "finetuning_single_resize.json"),
+            1.0,
+        )
+        self.assertEqual(ratio(config_root / "Mozarteum" / "finetuning.json"), 1.0)
 
     def test_vocabulary_iteration_reads_only_arrow_transcriptions(self):
         rows = _FakeArrowRows()
