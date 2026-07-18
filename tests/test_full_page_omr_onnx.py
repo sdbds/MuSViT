@@ -1,14 +1,25 @@
 import json
+from pathlib import Path
 
 import pytest
 import torch
 from safetensors.torch import save_file
 from transformers import ViTModel
 
+from experiments.full_page_omr import export_onnx
 from experiments.full_page_omr.export_onnx import (
+    ExportPaths,
     FullPageOMRDecoderWrapper,
     FullPageOMREncoderWrapper,
+    build_bundle_metadata,
+    build_preprocessor_config,
+    export_bundle,
+    export_decoder_graph,
+    export_encoder_graph,
     load_standalone_model,
+    parse_args,
+    validate_graph_files,
+    write_json_atomic,
 )
 from experiments.full_page_omr.smt_foundation.configuration_smt import (
     SMTFoundationConfig,
@@ -219,3 +230,202 @@ def test_standalone_loader_rejects_missing_state_key(tmp_path):
 
     with pytest.raises(RuntimeError, match="Missing key"):
         load_standalone_model(*assets)
+
+
+def test_export_encoder_graph_uses_locked_contract(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_export(model, args, output_path, **kwargs):
+        calls.append((model, args, Path(output_path), kwargs))
+        Path(output_path).write_bytes(b"encoder")
+
+    monkeypatch.setattr(torch.onnx, "export", fake_export)
+    monkeypatch.setattr(export_onnx, "_validate_onnx_graph", lambda _path: None)
+    target = tmp_path / "encoder.onnx"
+
+    export_encoder_graph(torch.nn.Identity(), target, torch.device("cpu"))
+
+    assert target.read_bytes() == b"encoder"
+    assert not (tmp_path / "encoder.onnx.tmp").exists()
+    _, args, temporary_path, kwargs = calls[0]
+    assert args[0].shape == (1, 3, 1024, 1024)
+    assert temporary_path.name == "encoder.onnx.tmp"
+    assert kwargs["opset_version"] == 20
+    assert kwargs["dynamo"] is False
+    assert kwargs["external_data"] is False
+    assert kwargs["input_names"] == ["pixel_values"]
+    assert kwargs["output_names"] == ["raw_features", "enhanced_features"]
+    assert kwargs["dynamic_axes"] is None
+
+
+def test_export_decoder_graph_has_only_dynamic_prefix_axis(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_export(model, args, output_path, **kwargs):
+        calls.append((model, args, Path(output_path), kwargs))
+        Path(output_path).write_bytes(b"decoder")
+
+    monkeypatch.setattr(torch.onnx, "export", fake_export)
+    monkeypatch.setattr(export_onnx, "_validate_onnx_graph", lambda _path: None)
+    target = tmp_path / "decoder.onnx"
+
+    export_decoder_graph(torch.nn.Identity(), target, torch.device("cpu"))
+
+    _, args, _, kwargs = calls[0]
+    assert args[0].shape == (1, 4096, 256)
+    assert args[1].shape == (1, 4096, 256)
+    assert args[2].shape == (1, 1)
+    assert kwargs["input_names"] == [
+        "raw_features",
+        "enhanced_features",
+        "token_ids",
+    ]
+    assert kwargs["output_names"] == ["next_token_logits"]
+    assert kwargs["dynamic_axes"] == {
+        "token_ids": {1: "sequence_length"},
+    }
+
+
+def test_validate_graph_files_rejects_empty_oversized_and_sidecar_files(tmp_path):
+    encoder = tmp_path / "encoder.onnx"
+    decoder = tmp_path / "decoder.onnx"
+    encoder.write_bytes(b"")
+    decoder.write_bytes(b"ok")
+    paths = ExportPaths.from_output_dir(tmp_path)
+
+    with pytest.raises(RuntimeError, match="empty"):
+        validate_graph_files(paths, max_onnx_bytes=10)
+
+    encoder.write_bytes(b"123456789")
+    with pytest.raises(RuntimeError, match="size limit"):
+        validate_graph_files(paths, max_onnx_bytes=10)
+
+    encoder.write_bytes(b"abc")
+    (tmp_path / "encoder.onnx.data").write_bytes(b"sidecar")
+    with pytest.raises(RuntimeError, match="external tensor data"):
+        validate_graph_files(paths, max_onnx_bytes=10)
+
+
+def test_atomic_json_and_bundle_metadata_record_runtime_contract(tmp_path):
+    paths = ExportPaths.from_output_dir(tmp_path)
+    preprocessor = build_preprocessor_config()
+    metadata = build_bundle_metadata(
+        paths=paths,
+        source={"weights_sha256": "abc"},
+        versions={"torch": "2.13.0", "onnxruntime": "1.27.0"},
+        providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+        validation={"status": "pending"},
+    )
+
+    write_json_atomic(paths.preprocessor_config, preprocessor)
+    write_json_atomic(paths.metadata, metadata)
+
+    assert not (tmp_path / "metadata.json.tmp").exists()
+    assert json.loads(paths.preprocessor_config.read_text(encoding="utf-8")) == {
+        "color": "RGB",
+        "do_normalize": False,
+        "do_rescale": True,
+        "do_resize": True,
+        "image_size": [1024, 1024],
+        "input_layout": "NCHW",
+        "interpolation": "bilinear",
+        "rescale_factor": 1 / 255,
+    }
+    loaded = json.loads(paths.metadata.read_text(encoding="utf-8"))
+    assert loaded["graphs"]["encoder"]["inputs"]["pixel_values"] == [
+        1,
+        3,
+        1024,
+        1024,
+    ]
+    assert loaded["graphs"]["decoder"]["inputs"]["token_ids"] == [
+        1,
+        "sequence_length",
+    ]
+    assert loaded["tokens"] == {"bos": 100, "eos": 183, "max_length": 7512}
+
+
+def test_parse_args_accepts_explicit_standalone_assets(tmp_path):
+    weights = tmp_path / "weights.safetensors"
+    model_config = tmp_path / "model.json"
+    encoder_config = tmp_path / "encoder.json"
+    output_dir = tmp_path / "onnx"
+
+    args = parse_args(
+        [
+            "--weights-path",
+            str(weights),
+            "--model-config-path",
+            str(model_config),
+            "--encoder-config-path",
+            str(encoder_config),
+            "--output-dir",
+            str(output_dir),
+            "--device",
+            "cpu",
+        ]
+    )
+
+    assert args.weights_path == weights
+    assert args.model_config_path == model_config
+    assert args.encoder_config_path == encoder_config
+    assert args.output_dir == output_dir
+    assert args.device == "cpu"
+    assert args.opset_version == 20
+
+
+class _FakeBundleModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.decoder = torch.nn.Identity()
+
+
+def test_export_bundle_writes_self_contained_configs_and_hashed_metadata(
+    tmp_path,
+    monkeypatch,
+):
+    weights = tmp_path / "weights.safetensors"
+    model_config = tmp_path / "model.json"
+    encoder_config = tmp_path / "encoder.json"
+    output_dir = tmp_path / "onnx"
+    weights.write_bytes(b"weights")
+    model_config.write_text("{}", encoding="utf-8")
+    encoder_config.write_text("{}", encoding="utf-8")
+    merged_config = {
+        "foundation_config": {"hidden_size": 768},
+        "w2i": {"<bos>": 100, "<eos>": 183},
+    }
+    monkeypatch.setattr(
+        export_onnx,
+        "load_standalone_model",
+        lambda *_args: (_FakeBundleModel(), merged_config),
+    )
+
+    def fake_encoder(_wrapper, path, _device, *, opset_version):
+        assert opset_version == 20
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_bytes(b"encoder graph")
+        return Path(path)
+
+    def fake_decoder(_wrapper, path, _device, *, opset_version):
+        assert opset_version == 20
+        Path(path).write_bytes(b"decoder graph")
+        return Path(path)
+
+    monkeypatch.setattr(export_onnx, "export_encoder_graph", fake_encoder)
+    monkeypatch.setattr(export_onnx, "export_decoder_graph", fake_decoder)
+
+    paths = export_bundle(
+        weights_path=weights,
+        model_config_path=model_config,
+        encoder_config_path=encoder_config,
+        output_dir=output_dir,
+        device=torch.device("cpu"),
+    )
+
+    assert json.loads(paths.config.read_text(encoding="utf-8")) == merged_config
+    metadata = json.loads(paths.metadata.read_text(encoding="utf-8"))
+    assert metadata["artifacts"]["encoder"]["bytes"] == len(b"encoder graph")
+    assert metadata["artifacts"]["decoder"]["bytes"] == len(b"decoder graph")
+    assert metadata["source"]["weights_sha256"] == export_onnx.sha256_file(weights)
+    assert metadata["validation"] == {"status": "not_run"}
