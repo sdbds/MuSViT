@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import numpy as np
@@ -15,6 +16,9 @@ from experiments.full_page_omr.export_onnx import (
     FullPageOMREncoderWrapper,
     build_bundle_metadata,
     build_preprocessor_config,
+    compare_arrays,
+    compare_greedy_results,
+    exact_fp32,
     export_bundle,
     export_decoder_graph,
     export_encoder_graph,
@@ -33,6 +37,7 @@ from experiments.full_page_omr.smt_foundation.configuration_smt import (
 )
 from experiments.full_page_omr.smt_foundation.modeling_smt import (
     Decoder,
+    MHA,
     PreparedDecoderFeatures,
     SMTFoundationModelForCausalLM,
 )
@@ -293,6 +298,46 @@ def test_export_decoder_graph_has_only_dynamic_prefix_axis(tmp_path, monkeypatch
     }
 
 
+class _CausalAttentionExportWrapper(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.attention = MHA(
+            embedding_dim=16,
+            num_heads=4,
+            attention_backend="eager",
+        )
+
+    def forward(self, sequence):
+        return self.attention(
+            sequence,
+            sequence,
+            sequence,
+            get_weights=False,
+            is_causal=True,
+        )
+
+
+def test_eager_causal_attention_exports_without_inplace_boolean_operator(tmp_path):
+    output_path = tmp_path / "causal_attention.onnx"
+
+    export_onnx._export_graph_atomic(
+        _CausalAttentionExportWrapper().eval(),
+        (torch.randn((3, 1, 16), dtype=torch.float32),),
+        output_path,
+        device=torch.device("cpu"),
+        input_names=["sequence"],
+        output_names=["attended"],
+        dynamic_axes={
+            "sequence": {0: "sequence_length"},
+            "attended": {0: "sequence_length"},
+        },
+        opset_version=20,
+    )
+
+    assert output_path.is_file()
+    assert output_path.stat().st_size > 0
+
+
 def test_validate_graph_files_rejects_empty_oversized_and_sidecar_files(tmp_path):
     encoder = tmp_path / "encoder.onnx"
     decoder = tmp_path / "decoder.onnx"
@@ -339,6 +384,7 @@ def test_atomic_json_and_bundle_metadata_record_runtime_contract(tmp_path):
         "rescale_factor": 1 / 255,
     }
     loaded = json.loads(paths.metadata.read_text(encoding="utf-8"))
+    assert loaded["bundle_status"] == "complete"
     assert loaded["graphs"]["encoder"]["inputs"]["pixel_values"] == [
         1,
         3,
@@ -370,6 +416,8 @@ def test_parse_args_accepts_explicit_standalone_assets(tmp_path):
             str(output_dir),
             "--device",
             "cpu",
+            "--verify-runtime",
+            "--verify-dataset",
         ]
     )
 
@@ -379,6 +427,8 @@ def test_parse_args_accepts_explicit_standalone_assets(tmp_path):
     assert args.output_dir == output_dir
     assert args.device == "cpu"
     assert args.opset_version == 20
+    assert args.verify_runtime is True
+    assert args.verify_dataset is True
 
 
 class _FakeBundleModel(torch.nn.Module):
@@ -421,6 +471,23 @@ def test_export_bundle_writes_self_contained_configs_and_hashed_metadata(
 
     monkeypatch.setattr(export_onnx, "export_encoder_graph", fake_encoder)
     monkeypatch.setattr(export_onnx, "export_decoder_graph", fake_decoder)
+    monkeypatch.setattr(
+        export_onnx,
+        "verify_runtime_parity",
+        lambda *_args, **_kwargs: {
+            "status": "passed",
+            "max_abs_error": 1e-6,
+        },
+    )
+    monkeypatch.setattr(
+        export_onnx,
+        "verify_dataset_parity",
+        lambda *_args, **_kwargs: {
+            "status": "passed",
+            "row": 0,
+            "token_count": 3,
+        },
+    )
 
     paths = export_bundle(
         weights_path=weights,
@@ -428,14 +495,116 @@ def test_export_bundle_writes_self_contained_configs_and_hashed_metadata(
         encoder_config_path=encoder_config,
         output_dir=output_dir,
         device=torch.device("cpu"),
+        verify_runtime=True,
+        verify_dataset=True,
     )
 
     assert json.loads(paths.config.read_text(encoding="utf-8")) == merged_config
     metadata = json.loads(paths.metadata.read_text(encoding="utf-8"))
     assert metadata["artifacts"]["encoder"]["bytes"] == len(b"encoder graph")
     assert metadata["artifacts"]["decoder"]["bytes"] == len(b"decoder graph")
+    assert metadata["artifacts"]["config"]["bytes"] == paths.config.stat().st_size
+    assert metadata["artifacts"]["preprocessor_config"]["bytes"] == (
+        paths.preprocessor_config.stat().st_size
+    )
+    assert metadata["bundle_status"] == "complete"
     assert metadata["source"]["weights_sha256"] == export_onnx.sha256_file(weights)
-    assert metadata["validation"] == {"status": "not_run"}
+    assert metadata["validation"] == {
+        "dataset_parity": {
+            "status": "passed",
+            "row": 0,
+            "token_count": 3,
+        },
+        "status": "passed",
+        "max_abs_error": 1e-6,
+    }
+
+
+def test_failed_reexport_preserves_previous_complete_bundle(tmp_path, monkeypatch):
+    weights = tmp_path / "weights.safetensors"
+    model_config = tmp_path / "model.json"
+    encoder_config = tmp_path / "encoder.json"
+    output_dir = tmp_path / "onnx"
+    output_dir.mkdir()
+    weights.write_bytes(b"weights")
+    model_config.write_text("{}", encoding="utf-8")
+    encoder_config.write_text("{}", encoding="utf-8")
+    stale_metadata = output_dir / "metadata.json"
+    stale_metadata.write_text('{"validation":{"status":"passed"}}', encoding="utf-8")
+    old_encoder = output_dir / "encoder.onnx"
+    old_encoder.write_bytes(b"previous encoder")
+    monkeypatch.setattr(
+        export_onnx,
+        "load_standalone_model",
+        lambda *_args: (_FakeBundleModel(), {}),
+    )
+    monkeypatch.setattr(
+        export_onnx,
+        "export_encoder_graph",
+        lambda *_args, **_kwargs: output_dir / "encoder.onnx",
+    )
+
+    def fail_decoder(*_args, **_kwargs):
+        raise RuntimeError("decoder export failed")
+
+    monkeypatch.setattr(export_onnx, "export_decoder_graph", fail_decoder)
+
+    with pytest.raises(RuntimeError, match="decoder export failed"):
+        export_bundle(
+            weights_path=weights,
+            model_config_path=model_config,
+            encoder_config_path=encoder_config,
+            output_dir=output_dir,
+            device=torch.device("cpu"),
+        )
+
+    assert stale_metadata.read_text(encoding="utf-8") == (
+        '{"validation":{"status":"passed"}}'
+    )
+    assert old_encoder.read_bytes() == b"previous encoder"
+
+
+def test_compare_arrays_enforces_fixed_fp32_tolerance():
+    expected = np.asarray([[1.0, -2.0]], dtype=np.float32)
+    actual = np.asarray([[1.00001, -2.00001]], dtype=np.float32)
+
+    metrics = compare_arrays("logits", expected, actual)
+
+    assert metrics["shape"] == [1, 2]
+    assert metrics["max_abs_error"] < 1e-4
+    with pytest.raises(AssertionError, match="outside rtol=0.0001, atol=0.0001"):
+        compare_arrays(
+            "logits",
+            expected,
+            np.asarray([[1.01, -2.0]], dtype=np.float32),
+        )
+
+
+def test_exact_fp32_disables_and_restores_torch_tf32_flags():
+    original_matmul = torch.backends.cuda.matmul.allow_tf32
+    original_cudnn = torch.backends.cudnn.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+        with exact_fp32():
+            assert torch.backends.cuda.matmul.allow_tf32 is False
+            assert torch.backends.cudnn.allow_tf32 is False
+
+        assert torch.backends.cuda.matmul.allow_tf32 is True
+        assert torch.backends.cudnn.allow_tf32 is True
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = original_matmul
+        torch.backends.cudnn.allow_tf32 = original_cudnn
+
+
+def test_verification_provider_is_explicit_for_requested_device():
+    assert export_onnx._verification_providers(torch.device("cuda")) == [
+        "CUDAExecutionProvider"
+    ]
+    assert export_onnx._verification_providers(torch.device("cpu")) == [
+        "CPUExecutionProvider"
+    ]
 
 
 def test_preprocess_page_matches_rgb_nchw_rescale_contract():
@@ -455,6 +624,70 @@ def test_preprocess_page_matches_rgb_nchw_rescale_contract():
     assert pixels.flags.c_contiguous
 
 
+def test_preprocess_page_matches_torchvision_uint8_division_exactly():
+    image = Image.new("RGB", (1, 1), color=(3, 6, 7))
+    config = {
+        "color": "RGB",
+        "image_size": [1, 1],
+        "interpolation": "bilinear",
+        "rescale_factor": 1 / 255,
+    }
+
+    pixels = preprocess_page(image, config)
+
+    expected = np.asarray([3, 6, 7], dtype=np.float32) / np.float32(255.0)
+    np.testing.assert_array_equal(pixels[0, :, 0, 0], expected)
+
+
+def test_preprocess_page_accepts_hwc_float_images_in_zero_one_range():
+    image = np.asarray([[[0.0, 0.5, 1.0]]], dtype=np.float32)
+    config = {
+        "color": "RGB",
+        "image_size": [1, 1],
+        "interpolation": "bilinear",
+        "rescale_factor": 1 / 255,
+    }
+
+    pixels = preprocess_page(image, config)
+
+    expected = np.asarray([0, 128, 255], dtype=np.float32) / np.float32(255.0)
+    np.testing.assert_array_equal(pixels[0, :, 0, 0], expected)
+
+
+def test_compare_greedy_results_requires_complete_sequence_and_decoded_parity():
+    reference = SimpleNamespace(
+        token_ids=(1, 3, 2),
+        terminated_by_eos=True,
+        truncated=False,
+    )
+    actual = SimpleNamespace(
+        token_ids=(1, 3, 2),
+        tokens=("note",),
+        terminated_by_eos=True,
+        truncated=False,
+    )
+
+    report = compare_greedy_results(
+        reference,
+        actual,
+        i2w={1: "<bos>", 2: "<eos>", 3: "note"},
+        eos_token_id=2,
+    )
+
+    assert report["token_count"] == 3
+    assert report["decoded_token_count"] == 1
+    assert len(report["token_ids_sha256"]) == 64
+
+    actual.token_ids = (1, 4, 2)
+    with pytest.raises(AssertionError, match="token-id sequence mismatch at index 1"):
+        compare_greedy_results(
+            reference,
+            actual,
+            i2w={1: "<bos>", 2: "<eos>", 3: "note", 4: "rest"},
+            eos_token_id=2,
+        )
+
+
 def test_resolve_providers_prefers_cuda_with_cpu_fallback():
     available = ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
 
@@ -468,8 +701,10 @@ def test_resolve_providers_prefers_cuda_with_cpu_fallback():
 
 
 class _FakeIO:
-    def __init__(self, name):
+    def __init__(self, name, tensor_type, shape):
         self.name = name
+        self.type = tensor_type
+        self.shape = shape
 
 
 class _FakeEncoderSession:
@@ -477,10 +712,13 @@ class _FakeEncoderSession:
         self.calls = []
 
     def get_inputs(self):
-        return [_FakeIO("pixel_values")]
+        return [_FakeIO("pixel_values", "tensor(float)", [1, 3, 1024, 1024])]
 
     def get_outputs(self):
-        return [_FakeIO("raw_features"), _FakeIO("enhanced_features")]
+        return [
+            _FakeIO("raw_features", "tensor(float)", [1, 4096, 256]),
+            _FakeIO("enhanced_features", "tensor(float)", [1, 4096, 256]),
+        ]
 
     def get_providers(self):
         return ["CUDAExecutionProvider", "CPUExecutionProvider"]
@@ -498,13 +736,13 @@ class _FakeDecoderSession:
 
     def get_inputs(self):
         return [
-            _FakeIO("raw_features"),
-            _FakeIO("enhanced_features"),
-            _FakeIO("token_ids"),
+            _FakeIO("raw_features", "tensor(float)", [1, 4096, 256]),
+            _FakeIO("enhanced_features", "tensor(float)", [1, 4096, 256]),
+            _FakeIO("token_ids", "tensor(int64)", [1, "sequence_length"]),
         ]
 
     def get_outputs(self):
-        return [_FakeIO("next_token_logits")]
+        return [_FakeIO("next_token_logits", "tensor(float)", [1, 215])]
 
     def get_providers(self):
         return ["CUDAExecutionProvider", "CPUExecutionProvider"]
@@ -529,6 +767,34 @@ def _write_runtime_bundle(tmp_path, *, maxlen=5):
     (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
     (tmp_path / "preprocessor_config.json").write_text(
         json.dumps(preprocessor),
+        encoding="utf-8",
+    )
+    artifacts = {}
+    for label, filename in (
+        ("encoder", "encoder.onnx"),
+        ("decoder", "decoder.onnx"),
+        ("config", "config.json"),
+        ("preprocessor_config", "preprocessor_config.json"),
+    ):
+        path = tmp_path / filename
+        artifacts[label] = {
+            "bytes": path.stat().st_size,
+            "sha256": export_onnx.sha256_file(path),
+        }
+    (tmp_path / "metadata.json").write_text(
+        json.dumps(
+            {
+                "artifacts": artifacts,
+                "bundle_status": "complete",
+                "files": {
+                    "encoder": "encoder.onnx",
+                    "decoder": "decoder.onnx",
+                    "config": "config.json",
+                    "preprocessor_config": "preprocessor_config.json",
+                },
+                "format_version": 1,
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -579,7 +845,9 @@ def test_runtime_reports_truncation_at_max_length(tmp_path):
 def test_runtime_rejects_malformed_session_contract(tmp_path):
     _write_runtime_bundle(tmp_path)
     encoder = _FakeEncoderSession()
-    encoder.get_outputs = lambda: [_FakeIO("wrong")]
+    encoder.get_outputs = lambda: [
+        _FakeIO("wrong", "tensor(float)", [1, 4096, 256])
+    ]
 
     with pytest.raises(ValueError, match="encoder output contract"):
         FullPageOMROnnxRuntime(
@@ -587,3 +855,76 @@ def test_runtime_rejects_malformed_session_contract(tmp_path):
             encoder_session=encoder,
             decoder_session=_FakeDecoderSession([2]),
         )
+
+
+def test_runtime_rejects_wrong_session_dtype_or_shape(tmp_path):
+    _write_runtime_bundle(tmp_path)
+    encoder = _FakeEncoderSession()
+    encoder.get_inputs = lambda: [
+        _FakeIO("pixel_values", "tensor(float16)", [1, 3, 512, 512])
+    ]
+
+    with pytest.raises(ValueError, match="encoder input contract mismatch"):
+        FullPageOMROnnxRuntime(
+            tmp_path,
+            encoder_session=encoder,
+            decoder_session=_FakeDecoderSession([2]),
+        )
+
+
+def test_runtime_rejects_missing_or_corrupt_bundle_metadata(tmp_path):
+    _write_runtime_bundle(tmp_path)
+    metadata_path = tmp_path / "metadata.json"
+    metadata_path.unlink()
+
+    with pytest.raises(RuntimeError, match="bundle metadata is missing"):
+        FullPageOMROnnxRuntime(
+            tmp_path,
+            encoder_session=_FakeEncoderSession(),
+            decoder_session=_FakeDecoderSession([2]),
+        )
+
+    _write_runtime_bundle(tmp_path)
+    (tmp_path / "encoder.onnx").write_bytes(b"corrupt encoder")
+    with pytest.raises(RuntimeError, match=r"encoder artifact (size|hash) mismatch"):
+        FullPageOMROnnxRuntime(
+            tmp_path,
+            encoder_session=_FakeEncoderSession(),
+            decoder_session=_FakeDecoderSession([2]),
+        )
+
+
+def test_runtime_preloads_cuda_dependencies_before_creating_sessions(
+    tmp_path,
+    monkeypatch,
+):
+    import onnxruntime as ort
+
+    _write_runtime_bundle(tmp_path)
+    state = {"preloaded": False}
+
+    def fake_preload_dlls():
+        state["preloaded"] = True
+
+    def fake_session(path, *, providers):
+        assert state["preloaded"] is True
+        assert providers == [
+            ("CUDAExecutionProvider", {"use_tf32": 0}),
+            "CPUExecutionProvider",
+        ]
+        if Path(path).name == "encoder.onnx":
+            return _FakeEncoderSession()
+        return _FakeDecoderSession([2])
+
+    monkeypatch.setattr(
+        ort,
+        "get_available_providers",
+        lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+    monkeypatch.setattr(ort, "preload_dlls", fake_preload_dlls)
+    monkeypatch.setattr(ort, "InferenceSession", fake_session)
+
+    runtime = FullPageOMROnnxRuntime(tmp_path)
+
+    assert state["preloaded"] is True
+    assert runtime.providers == ["CUDAExecutionProvider", "CPUExecutionProvider"]

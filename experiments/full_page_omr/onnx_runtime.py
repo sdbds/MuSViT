@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -7,6 +8,29 @@ from typing import Any, Sequence
 
 import numpy as np
 from PIL import Image
+
+
+_ENCODER_INPUT_CONTRACT = [
+    ("pixel_values", "tensor(float)", [1, 3, 1024, 1024]),
+]
+_ENCODER_OUTPUT_CONTRACT = [
+    ("raw_features", "tensor(float)", [1, 4096, 256]),
+    ("enhanced_features", "tensor(float)", [1, 4096, 256]),
+]
+_DECODER_INPUT_CONTRACT = [
+    ("raw_features", "tensor(float)", [1, 4096, 256]),
+    ("enhanced_features", "tensor(float)", [1, 4096, 256]),
+    ("token_ids", "tensor(int64)", [1, "sequence_length"]),
+]
+_DECODER_OUTPUT_CONTRACT = [
+    ("next_token_logits", "tensor(float)", [1, 215]),
+]
+_BUNDLE_FILES = {
+    "encoder": "encoder.onnx",
+    "decoder": "decoder.onnx",
+    "config": "config.json",
+    "preprocessor_config": "preprocessor_config.json",
+}
 
 
 @dataclass(frozen=True)
@@ -22,6 +46,45 @@ def _read_json_object(path: Path, *, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise TypeError(f"{label} must contain a JSON object: {path}")
     return value
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_bundle_metadata(bundle_dir: Path) -> dict[str, Any]:
+    metadata_path = bundle_dir / "metadata.json"
+    if not metadata_path.is_file():
+        raise RuntimeError(f"bundle metadata is missing: {metadata_path}")
+    metadata = _read_json_object(metadata_path, label="bundle metadata")
+    if metadata.get("format_version") != 1:
+        raise RuntimeError("unsupported bundle metadata format_version")
+    if metadata.get("bundle_status") != "complete":
+        raise RuntimeError("bundle metadata does not mark the bundle complete")
+    if metadata.get("files") != _BUNDLE_FILES:
+        raise RuntimeError("bundle file manifest does not match the runtime contract")
+
+    artifacts = metadata.get("artifacts")
+    if not isinstance(artifacts, dict):
+        raise RuntimeError("bundle metadata artifacts must be an object")
+    for label, filename in _BUNDLE_FILES.items():
+        artifact = artifacts.get(label)
+        if not isinstance(artifact, dict):
+            raise RuntimeError(f"{label} artifact metadata is missing")
+        path = bundle_dir / filename
+        if not path.is_file():
+            raise RuntimeError(f"{label} artifact is missing: {path}")
+        expected_bytes = artifact.get("bytes")
+        if not isinstance(expected_bytes, int) or path.stat().st_size != expected_bytes:
+            raise RuntimeError(f"{label} artifact size mismatch")
+        expected_hash = artifact.get("sha256")
+        if not isinstance(expected_hash, str) or _sha256_file(path) != expected_hash:
+            raise RuntimeError(f"{label} artifact hash mismatch")
+    return metadata
 
 
 def resolve_providers(
@@ -66,7 +129,34 @@ def _coerce_image(image: str | Path | Image.Image | np.ndarray) -> Image.Image:
     if isinstance(image, Image.Image):
         return image.copy()
     if isinstance(image, np.ndarray):
-        return Image.fromarray(image)
+        array = np.asarray(image)
+        if array.ndim not in (2, 3) or 0 in array.shape:
+            raise ValueError("NumPy images must be non-empty HxW or HxWxC arrays")
+        if array.ndim == 3 and array.shape[2] not in (1, 3, 4):
+            raise ValueError("NumPy image channels must be 1, 3, or 4")
+        if np.issubdtype(array.dtype, np.floating):
+            if not np.isfinite(array).all():
+                raise ValueError("floating-point NumPy images must be finite")
+            minimum = float(array.min())
+            maximum = float(array.max())
+            if minimum < 0 or maximum > 255:
+                raise ValueError("floating-point NumPy images must be in [0, 1] or [0, 255]")
+            if maximum <= 1:
+                array = array * np.float32(255.0)
+            array = np.rint(array).astype(np.uint8)
+        elif array.dtype == np.bool_:
+            array = array.astype(np.uint8) * np.uint8(255)
+        elif array.dtype != np.uint8:
+            if not np.issubdtype(array.dtype, np.integer):
+                raise TypeError("NumPy images must use integer or floating-point values")
+            minimum = int(array.min())
+            maximum = int(array.max())
+            if minimum < 0 or maximum > 255:
+                raise ValueError("integer NumPy images must be in [0, 255]")
+            array = array.astype(np.uint8)
+        if array.ndim == 3 and array.shape[2] == 1:
+            array = array[:, :, 0]
+        return Image.fromarray(np.ascontiguousarray(array))
     with Image.open(Path(image)) as opened:
         return opened.copy()
 
@@ -87,31 +177,38 @@ def preprocess_page(
     prepared = _coerce_image(image).convert("RGB")
     prepared = prepared.resize((width, height), Image.Resampling.BILINEAR)
     pixels = np.asarray(prepared, dtype=np.float32)
-    pixels *= np.float32(config.get("rescale_factor", 1 / 255))
+    rescale_factor = float(config.get("rescale_factor", 1 / 255))
+    if rescale_factor == 1 / 255:
+        pixels /= np.float32(255.0)
+    else:
+        pixels *= np.float32(rescale_factor)
     pixels = pixels.transpose(2, 0, 1)[None, ...]
     return np.ascontiguousarray(pixels, dtype=np.float32)
 
 
-def _session_names(session, method_name: str) -> list[str]:
-    return [value.name for value in getattr(session, method_name)()]
+def _session_contract(session, method_name: str) -> list[tuple[str, str, list[Any]]]:
+    return [
+        (value.name, value.type, list(value.shape))
+        for value in getattr(session, method_name)()
+    ]
 
 
 def _require_contract(
     session,
     *,
     label: str,
-    input_names: list[str],
-    output_names: list[str],
+    input_contract: list[tuple[str, str, list[Any]]],
+    output_contract: list[tuple[str, str, list[Any]]],
 ) -> None:
-    actual_inputs = _session_names(session, "get_inputs")
-    actual_outputs = _session_names(session, "get_outputs")
-    if actual_inputs != input_names:
+    actual_inputs = _session_contract(session, "get_inputs")
+    actual_outputs = _session_contract(session, "get_outputs")
+    if actual_inputs != input_contract:
         raise ValueError(
-            f"{label} input contract mismatch: {actual_inputs!r} != {input_names!r}"
+            f"{label} input contract mismatch: {actual_inputs!r} != {input_contract!r}"
         )
-    if actual_outputs != output_names:
+    if actual_outputs != output_contract:
         raise ValueError(
-            f"{label} output contract mismatch: {actual_outputs!r} != {output_names!r}"
+            f"{label} output contract mismatch: {actual_outputs!r} != {output_contract!r}"
         )
 
 
@@ -125,6 +222,7 @@ class FullPageOMROnnxRuntime:
         decoder_session=None,
     ):
         self.bundle_dir = Path(bundle_dir).resolve()
+        self.metadata = _validate_bundle_metadata(self.bundle_dir)
         self.config = _read_json_object(
             self.bundle_dir / "config.json",
             label="model config",
@@ -137,30 +235,45 @@ class FullPageOMROnnxRuntime:
         if encoder_session is None or decoder_session is None:
             import onnxruntime as ort
 
-            resolved_providers = resolve_providers(providers)
+            available_providers = ort.get_available_providers()
+            resolved_providers = resolve_providers(
+                providers,
+                available=available_providers,
+            )
+            if (
+                "CUDAExecutionProvider" in resolved_providers
+                and hasattr(ort, "preload_dlls")
+            ):
+                ort.preload_dlls()
+            session_providers = [
+                (provider, {"use_tf32": 0})
+                if provider == "CUDAExecutionProvider"
+                else provider
+                for provider in resolved_providers
+            ]
             if encoder_session is None:
                 encoder_session = ort.InferenceSession(
                     str(self.bundle_dir / "encoder.onnx"),
-                    providers=resolved_providers,
+                    providers=session_providers,
                 )
             if decoder_session is None:
                 decoder_session = ort.InferenceSession(
                     str(self.bundle_dir / "decoder.onnx"),
-                    providers=resolved_providers,
+                    providers=session_providers,
                 )
         self.encoder_session = encoder_session
         self.decoder_session = decoder_session
         _require_contract(
             self.encoder_session,
             label="encoder",
-            input_names=["pixel_values"],
-            output_names=["raw_features", "enhanced_features"],
+            input_contract=_ENCODER_INPUT_CONTRACT,
+            output_contract=_ENCODER_OUTPUT_CONTRACT,
         )
         _require_contract(
             self.decoder_session,
             label="decoder",
-            input_names=["raw_features", "enhanced_features", "token_ids"],
-            output_names=["next_token_logits"],
+            input_contract=_DECODER_INPUT_CONTRACT,
+            output_contract=_DECODER_OUTPUT_CONTRACT,
         )
 
         raw_i2w = self.config.get("i2w")

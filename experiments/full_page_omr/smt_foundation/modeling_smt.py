@@ -232,11 +232,20 @@ class MHA(nn.Module):
         key_positions = torch.arange(source_len, device=device)
         allowed = torch.ones((target_len, source_len), dtype=torch.bool, device=device)
         if is_causal:
-            allowed &= key_positions <= query_positions.unsqueeze(1)
+            allowed = torch.logical_and(
+                allowed,
+                key_positions <= query_positions.unsqueeze(1),
+            )
         if window_size[0] >= 0:
-            allowed &= key_positions >= query_positions.unsqueeze(1) - window_size[0]
+            allowed = torch.logical_and(
+                allowed,
+                key_positions >= query_positions.unsqueeze(1) - window_size[0],
+            )
         if window_size[1] >= 0:
-            allowed &= key_positions <= query_positions.unsqueeze(1) + window_size[1]
+            allowed = torch.logical_and(
+                allowed,
+                key_positions <= query_positions.unsqueeze(1) + window_size[1],
+            )
         return allowed
 
     def _can_use_flash_attention_2(self, q, k, v, attn_mask, key_pad_mask, get_weights):

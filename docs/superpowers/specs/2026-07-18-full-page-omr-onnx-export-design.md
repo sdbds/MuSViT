@@ -186,9 +186,12 @@ experiments/full_page_omr/weights/polish_scores_cl_CL_onnx/
 ```
 
 The exporter defaults to the first checkpoint's safetensors/config pair but
-accepts explicit paths. It writes through temporary paths and only replaces final
-artifacts after each export succeeds, so a failed run cannot masquerade as a
-complete bundle.
+accepts explicit paths. It builds and verifies all five files in a sibling
+staging directory, then swaps the complete directory into place. A failed
+re-export leaves the previous bundle intact. The runtime requires the completion
+manifest and verifies the declared size and SHA-256 of both graphs and both
+configuration files before creating sessions, so a mixed or modified bundle is
+rejected.
 
 ## Export And Runtime Environment
 
@@ -198,8 +201,9 @@ complete bundle.
 - Runtime validation: the qinglong-captions `musvit-onnx` dependency profile,
   whose `onnx-base` profile selects ONNX Runtime GPU from the CUDA 13 package
   index on Windows.
-- Execution providers: CUDA when available, with CPU fallback used for portable
-  smoke validation.
+- Execution providers: the CUDA validation gate explicitly requires the CUDA
+  provider; it cannot silently degrade to CPU. A separate CPU-only session runs
+  the encoder and one decoder step for portable smoke validation.
 
 PyTorch performs ONNX serialization. ONNX Runtime is the deployment engine and
 the independent execution oracle; it is not described as the exporter.
