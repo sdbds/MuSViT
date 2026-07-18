@@ -991,10 +991,16 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--checkpoint_every_n_epochs=100", result.stdout)
-        self.assertIn("--validation_every_n_batches=10000", result.stdout)
-        self.assertIn("--max_steps=320000", result.stdout)
+        self.assertIn("--max_steps=4000000", result.stdout)
+        self.assertIn("--validation_every_n_epochs=2000", result.stdout)
+        self.assertIn("--task_learning_rate=0.0001", result.stdout)
+        self.assertIn("--encoder_learning_rate=0.00001", result.stdout)
+        self.assertIn("--weight_decay=0.01", result.stdout)
+        self.assertIn("--wsd_warmup_steps=10000", result.stdout)
+        self.assertIn("--wsd_decay_steps=400000", result.stdout)
         self.assertIn("--encoder_training_mode=fine_tune", result.stdout)
-        self.assertIn("--protocol_version=full_page_omr_eval_v2", result.stdout)
+        self.assertIn("--protocol_version=full_page_omr_adamw_wsd_4m_v1", result.stdout)
+        self.assertNotIn("--validation_every_n_batches", result.stdout)
         self.assertIn("(num_workers=24)", result.stdout)
 
     def test_missing_best_checkpoint_saves_an_end_checkpoint(self):

@@ -5,6 +5,15 @@ param (
 
 $ErrorActionPreference = "Stop"
 
+function Format-CanonicalDecimal {
+    param (
+        [Parameter(Mandatory = $true)]
+        [double]$Value
+    )
+
+    return $Value.ToString("0.0################", [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
 #region Configuration
 
 $Config = @{
@@ -15,12 +24,19 @@ $Config = @{
     finetuning             = "CL"     # Supported: CL, SR, CL1
     encoder_training_mode  = "fine_tune" # Supported: fine_tune, linear_probe
     resolution             = $null    # $null uses the experiment default (1024)
-    max_steps              = 320000   # Absolute Trainer endpoint for the v2 baseline
-    validation_every_n_batches = 10000 # Validate by cumulative training batches
+    max_steps                  = 4000000 # Absolute Trainer endpoint for the AdamW/WSD protocol
+    validation_every_n_epochs  = 2000    # Validate on the declared epoch cadence
     checkpoint_every_n_epochs = 100   # Periodic full checkpoint interval
-    learning_rate          = $null    # $null uses the experiment default (1e-4)
+    task_learning_rate        = 0.0001
+    encoder_learning_rate     = 0.00001
+    weight_decay              = 0.01
+    wsd_warmup_steps          = 10000
+    wsd_decay_steps           = 400000
+    wsd_warmup_type           = "linear"
+    wsd_decay_type            = "cosine"
+    wsd_min_lr_ratio          = 0.0
     attention_backend      = "auto"   # auto: FA2 -> SDPA -> eager fallback
-    protocol_version       = "full_page_omr_eval_v2"
+    protocol_version       = "full_page_omr_adamw_wsd_4m_v1"
     source_curriculum_step = $null    # Required with starting_weights
     source_checkpoint_sha256 = $null  # Required with starting_weights
     from_checkpoint        = $null    # Start a fresh Trainer run
@@ -215,17 +231,58 @@ if (-not [int]::TryParse([string]$Config.checkpoint_every_n_epochs, [ref]$Checkp
 }
 $Config.checkpoint_every_n_epochs = $CheckpointEveryNEpochs
 
-$ValidationEveryNBatches = 0
-if (-not [int]::TryParse([string]$Config.validation_every_n_batches, [ref]$ValidationEveryNBatches) -or $ValidationEveryNBatches -lt 1) {
-    throw "validation_every_n_batches must be a positive integer."
+$ValidationEveryNEpochs = 0
+if (-not [int]::TryParse([string]$Config.validation_every_n_epochs, [ref]$ValidationEveryNEpochs) -or $ValidationEveryNEpochs -lt 1) {
+    throw "validation_every_n_epochs must be a positive integer."
 }
-$Config.validation_every_n_batches = $ValidationEveryNBatches
+$Config.validation_every_n_epochs = $ValidationEveryNEpochs
 
 $MaxSteps = 0
 if (-not [int]::TryParse([string]$Config.max_steps, [ref]$MaxSteps) -or $MaxSteps -lt 1) {
     throw "max_steps must be a positive integer for production training."
 }
 $Config.max_steps = $MaxSteps
+
+foreach ($LearningRateName in @("task_learning_rate", "encoder_learning_rate")) {
+    $LearningRate = 0.0
+    if (-not [double]::TryParse([string]$Config[$LearningRateName], [ref]$LearningRate) -or
+        [double]::IsNaN($LearningRate) -or [double]::IsInfinity($LearningRate) -or $LearningRate -le 0) {
+        throw "$LearningRateName must be a positive finite number."
+    }
+    $Config[$LearningRateName] = $LearningRate
+}
+
+foreach ($NonNegativeNumberName in @("weight_decay", "wsd_min_lr_ratio")) {
+    $NonNegativeNumber = 0.0
+    if (-not [double]::TryParse([string]$Config[$NonNegativeNumberName], [ref]$NonNegativeNumber) -or
+        [double]::IsNaN($NonNegativeNumber) -or [double]::IsInfinity($NonNegativeNumber) -or $NonNegativeNumber -lt 0) {
+        throw "$NonNegativeNumberName must be a non-negative finite number."
+    }
+    $Config[$NonNegativeNumberName] = $NonNegativeNumber
+}
+
+$WsdWarmupSteps = 0
+if (-not [int]::TryParse([string]$Config.wsd_warmup_steps, [ref]$WsdWarmupSteps) -or $WsdWarmupSteps -lt 0) {
+    throw "wsd_warmup_steps must be a non-negative integer."
+}
+$Config.wsd_warmup_steps = $WsdWarmupSteps
+
+$WsdDecaySteps = 0
+if (-not [int]::TryParse([string]$Config.wsd_decay_steps, [ref]$WsdDecaySteps) -or $WsdDecaySteps -lt 1) {
+    throw "wsd_decay_steps must be a positive integer."
+}
+$Config.wsd_decay_steps = $WsdDecaySteps
+
+$SupportedWsdTypes = @("linear", "cosine", "1-sqrt")
+if ($Config.wsd_warmup_type -notin $SupportedWsdTypes) {
+    throw "Unsupported wsd_warmup_type '$($Config.wsd_warmup_type)'. Choose: $($SupportedWsdTypes -join ', ')."
+}
+if ($Config.wsd_decay_type -notin $SupportedWsdTypes) {
+    throw "Unsupported wsd_decay_type '$($Config.wsd_decay_type)'. Choose: $($SupportedWsdTypes -join ', ')."
+}
+if (([long]$Config.wsd_warmup_steps + [long]$Config.wsd_decay_steps) -ge [long]$Config.max_steps) {
+    throw "wsd_warmup_steps + wsd_decay_steps must be less than max_steps."
+}
 
 $SupportedFinetuningModes = @("CL", "SR", "CL1")
 if ($Config.finetuning -notin $SupportedFinetuningModes) {
@@ -258,17 +315,22 @@ $UvArgs = [System.Collections.ArrayList]::new()
 [void]$UvArgs.Add("--finetuning=$($Config.finetuning)")
 [void]$UvArgs.Add("--encoder_training_mode=$($Config.encoder_training_mode)")
 [void]$UvArgs.Add("--max_steps=$($Config.max_steps)")
-[void]$UvArgs.Add("--validation_every_n_batches=$($Config.validation_every_n_batches)")
+[void]$UvArgs.Add("--validation_every_n_epochs=$($Config.validation_every_n_epochs)")
 [void]$UvArgs.Add("--checkpoint_every_n_epochs=$($Config.checkpoint_every_n_epochs)")
+[void]$UvArgs.Add("--task_learning_rate=$(Format-CanonicalDecimal $Config.task_learning_rate)")
+[void]$UvArgs.Add("--encoder_learning_rate=$(Format-CanonicalDecimal $Config.encoder_learning_rate)")
+[void]$UvArgs.Add("--weight_decay=$(Format-CanonicalDecimal $Config.weight_decay)")
+[void]$UvArgs.Add("--wsd_warmup_steps=$($Config.wsd_warmup_steps)")
+[void]$UvArgs.Add("--wsd_decay_steps=$($Config.wsd_decay_steps)")
+[void]$UvArgs.Add("--wsd_warmup_type=$($Config.wsd_warmup_type)")
+[void]$UvArgs.Add("--wsd_decay_type=$($Config.wsd_decay_type)")
+[void]$UvArgs.Add("--wsd_min_lr_ratio=$(Format-CanonicalDecimal $Config.wsd_min_lr_ratio)")
 [void]$UvArgs.Add("--train=$($Features.train.ToString().ToLowerInvariant())")
 [void]$UvArgs.Add("--attention_backend=$($Config.attention_backend)")
 [void]$UvArgs.Add("--protocol_version=$($Config.protocol_version)")
 
 if ($null -ne $Config.resolution) {
     [void]$UvArgs.Add("--resolution=$($Config.resolution)")
-}
-if ($null -ne $Config.learning_rate) {
-    [void]$UvArgs.Add("--learning_rate=$($Config.learning_rate)")
 }
 if (-not [string]::IsNullOrWhiteSpace($Config.from_checkpoint)) {
     $CheckpointPath = Resolve-InputFile -Path $Config.from_checkpoint -SettingName "from_checkpoint"
