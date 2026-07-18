@@ -242,25 +242,34 @@ def _validate_run_contract(*, config, from_checkpoint, starting_weights,
                 f"resumed max_steps ({max_steps}) must equal checkpoint "
                 f"WSD total ({checkpoint_max_steps})"
             )
-        if expected_optimizer_identity is not None:
-            if not isinstance(expected_optimizer_identity, dict):
-                raise TypeError("expected_optimizer_identity must be a dictionary")
-            mismatches = {
-                key: (state.optimizer_identity.get(key), expected_value)
-                for key, expected_value in expected_optimizer_identity.items()
-                if state.optimizer_identity.get(key) != expected_value
-            }
-            if mismatches:
-                raise ValueError(
-                    f"checkpoint optimizer protocol mismatch: {mismatches}"
-                )
-        elif state.optimizer_identity["run_protocol_version"] != protocol_version:
+        if state.optimizer_identity["run_protocol_version"] != protocol_version:
             raise ValueError(
                 "checkpoint optimizer protocol mismatch: "
                 f"run_protocol_version="
                 f"{state.optimizer_identity['run_protocol_version']!r}, "
                 f"expected={protocol_version!r}"
             )
+        if expected_optimizer_identity is not None:
+            if not isinstance(expected_optimizer_identity, dict):
+                raise TypeError("expected_optimizer_identity must be a dictionary")
+            expected_keys = set(expected_optimizer_identity)
+            required_keys = set(_OPTIMIZER_IDENTITY_KEYS)
+            if expected_keys != required_keys:
+                raise ValueError(
+                    "expected_optimizer_identity must contain the exact optimizer "
+                    "identity keys: "
+                    f"missing={sorted(required_keys - expected_keys)}, "
+                    f"extra={sorted(expected_keys - required_keys)}"
+                )
+            mismatches = {
+                key: (state.optimizer_identity[key], expected_optimizer_identity[key])
+                for key in _OPTIMIZER_IDENTITY_KEYS
+                if state.optimizer_identity[key] != expected_optimizer_identity[key]
+            }
+            if mismatches:
+                raise ValueError(
+                    f"checkpoint optimizer protocol mismatch: {mismatches}"
+                )
         return state
 
     if starting_weights is not None:

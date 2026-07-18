@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
+from lightning.pytorch.trainer.states import TrainerFn
 
 from experiments.full_page_omr import data, entrypoint, finetune
 from experiments.full_page_omr import smt_trainer
@@ -245,6 +246,76 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                         **_optimizer_identity(),
                         "max_steps": 4_000_001,
                     },
+                )
+
+    def test_expected_optimizer_identity_requires_exact_keys(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint = Path(tmpdir) / "resume.ckpt"
+            torch.save(
+                {
+                    "global_step": 40,
+                    "full_page_omr_samples_seen": 40,
+                    "hyper_parameters": {
+                        "curriculum_step_offset": 0,
+                        **_optimizer_identity(),
+                    },
+                },
+                checkpoint,
+            )
+            base = dict(
+                config=SimpleNamespace(data=SimpleNamespace(skip_steps=0)),
+                from_checkpoint=str(checkpoint),
+                starting_weights=None,
+                max_steps=4_000_000,
+                train=True,
+                protocol_version="full_page_omr_adamw_wsd_4m_v1",
+                source_curriculum_step=None,
+                source_checkpoint_sha256=None,
+            )
+
+            invalid_identities = (
+                {},
+                {
+                    key: value
+                    for key, value in _optimizer_identity().items()
+                    if key != "optimizer_protocol"
+                },
+                {**_optimizer_identity(), "unexpected": "value"},
+            )
+            for identity in invalid_identities:
+                with self.subTest(keys=set(identity)):
+                    with self.assertRaisesRegex(ValueError, "exact optimizer identity keys"):
+                        finetune._validate_run_contract(
+                            **base,
+                            expected_optimizer_identity=identity,
+                        )
+
+    def test_expected_optimizer_identity_does_not_bypass_protocol_version(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint = Path(tmpdir) / "resume.ckpt"
+            torch.save(
+                {
+                    "global_step": 40,
+                    "full_page_omr_samples_seen": 40,
+                    "hyper_parameters": {
+                        "curriculum_step_offset": 0,
+                        **_optimizer_identity(),
+                    },
+                },
+                checkpoint,
+            )
+
+            with self.assertRaisesRegex(ValueError, "run_protocol_version"):
+                finetune._validate_run_contract(
+                    config=SimpleNamespace(data=SimpleNamespace(skip_steps=0)),
+                    from_checkpoint=str(checkpoint),
+                    starting_weights=None,
+                    max_steps=4_000_000,
+                    train=True,
+                    protocol_version="different_protocol_v1",
+                    source_curriculum_step=None,
+                    source_checkpoint_sha256=None,
+                    expected_optimizer_identity=_optimizer_identity(),
                 )
 
     def test_weights_only_load_ignores_source_optimizer_identity(self):
@@ -872,6 +943,10 @@ class SMTPPTrainerThroughputTests(unittest.TestCase):
             "wrong_name": lambda groups: groups[0].__setitem__("name", "legacy"),
             "wrong_lr": lambda groups: groups[0].__setitem__("initial_lr", 2e-5),
             "wrong_decay": lambda groups: groups[0].__setitem__("weight_decay", 0.0),
+            "trailing_scalar": lambda groups: groups.append(0),
+            "bool_weight_decay": lambda groups: groups[1].__setitem__(
+                "weight_decay", False
+            ),
         }
         for name, mutate in mutations.items():
             with self.subTest(name=name):
@@ -879,6 +954,38 @@ class SMTPPTrainerThroughputTests(unittest.TestCase):
                 mutate(malformed["optimizer_states"][0]["param_groups"])
                 with self.assertRaisesRegex(ValueError, "parameter-group mismatch"):
                     module.on_load_checkpoint(malformed)
+
+    def test_testing_load_bypasses_only_optimizer_resume_checks(self):
+        module = SMTPP_Trainer(
+            SimpleNamespace(padding_token=0),
+            _TinyModel(),
+            encoder_unfreeze_step=120000,
+        )
+        weights_only_checkpoint = self._full_checkpoint(module)
+        del weights_only_checkpoint["optimizer_states"]
+        del weights_only_checkpoint["lr_schedulers"]
+
+        module.trainer = SimpleNamespace(
+            state=SimpleNamespace(fn=TrainerFn.TESTING),
+        )
+        module.on_load_checkpoint(weights_only_checkpoint)
+        wrong_mode = {
+            **weights_only_checkpoint,
+            "hyper_parameters": {
+                **weights_only_checkpoint["hyper_parameters"],
+                "encoder_training_mode": "linear_probe",
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "encoder_training_mode"):
+            module.on_load_checkpoint(wrong_mode)
+
+        unattached = SMTPP_Trainer(
+            SimpleNamespace(padding_token=0),
+            _TinyModel(),
+            encoder_unfreeze_step=120000,
+        )
+        with self.assertRaisesRegex(ValueError, "one AdamW optimizer state"):
+            unattached.on_load_checkpoint(weights_only_checkpoint)
 
     def test_legacy_checkpoint_cannot_be_resumed_as_linear_probe(self):
         module = SMTPP_Trainer(

@@ -2,6 +2,7 @@ import torch
 import random
 import wandb
 import lightning.pytorch as L
+from lightning.pytorch.trainer.states import TrainerFn
 from loguru import logger
 
 from .eval.eval_functions import (
@@ -170,23 +171,45 @@ class SMTPP_Trainer(L.LightningModule):
             raise ValueError("full resume requires exactly one WSD scheduler state")
 
         saved_groups = optimizer_state.get("param_groups", [])
-        if not isinstance(saved_groups, list):
-            saved_groups = []
         expected_groups = self.optimizer_protocol_metadata()["optimizer_groups"]
+        if (
+            not isinstance(saved_groups, list)
+            or len(saved_groups) != len(expected_groups)
+            or not all(isinstance(group, dict) for group in saved_groups)
+        ):
+            raise ValueError(
+                "checkpoint AdamW parameter-group mismatch: "
+                f"saved={saved_groups!r}"
+            )
         saved_schema = [
             (group.get("name"), group.get("initial_lr"), group.get("weight_decay"))
             for group in saved_groups
-            if isinstance(group, dict)
         ]
         expected_schema = [
             (group["name"], group["learning_rate"], group["weight_decay"])
             for group in expected_groups
         ]
-        if saved_schema != expected_schema:
+        schema_matches = all(
+            all(
+                type(saved_value) is type(expected_value)
+                and saved_value == expected_value
+                for saved_value, expected_value in zip(saved_group, expected_group)
+            )
+            for saved_group, expected_group in zip(saved_schema, expected_schema)
+        )
+        if not schema_matches:
             raise ValueError(
                 "checkpoint AdamW parameter-group mismatch: "
                 f"saved={saved_schema}, expected={expected_schema}"
             )
+
+    def _is_evaluation_checkpoint_load(self):
+        trainer = self._trainer
+        return trainer is not None and trainer.state.fn in {
+            TrainerFn.TESTING,
+            TrainerFn.VALIDATING,
+            TrainerFn.PREDICTING,
+        }
     
     def forward(self, input, last_preds):
         return self.model(input, last_preds)
@@ -223,8 +246,9 @@ class SMTPP_Trainer(L.LightningModule):
         hyper_parameters = checkpoint.get("hyper_parameters", {})
         if not isinstance(hyper_parameters, dict):
             raise ValueError("checkpoint hyper_parameters must be a dictionary")
-        self._validate_optimizer_checkpoint_identity(hyper_parameters)
-        self._validate_optimizer_checkpoint_state(checkpoint)
+        if not self._is_evaluation_checkpoint_load():
+            self._validate_optimizer_checkpoint_identity(hyper_parameters)
+            self._validate_optimizer_checkpoint_state(checkpoint)
 
         checkpoint_mode = hyper_parameters.get("encoder_training_mode")
         if checkpoint_mode is None:
