@@ -2,7 +2,9 @@ import json
 from pathlib import Path
 
 import pytest
+import numpy as np
 import torch
+from PIL import Image
 from safetensors.torch import save_file
 from transformers import ViTModel
 
@@ -20,6 +22,11 @@ from experiments.full_page_omr.export_onnx import (
     parse_args,
     validate_graph_files,
     write_json_atomic,
+)
+from experiments.full_page_omr.onnx_runtime import (
+    FullPageOMROnnxRuntime,
+    preprocess_page,
+    resolve_providers,
 )
 from experiments.full_page_omr.smt_foundation.configuration_smt import (
     SMTFoundationConfig,
@@ -429,3 +436,154 @@ def test_export_bundle_writes_self_contained_configs_and_hashed_metadata(
     assert metadata["artifacts"]["decoder"]["bytes"] == len(b"decoder graph")
     assert metadata["source"]["weights_sha256"] == export_onnx.sha256_file(weights)
     assert metadata["validation"] == {"status": "not_run"}
+
+
+def test_preprocess_page_matches_rgb_nchw_rescale_contract():
+    image = Image.new("L", (1, 1), color=128)
+    config = {
+        "color": "RGB",
+        "image_size": [2, 2],
+        "interpolation": "bilinear",
+        "rescale_factor": 1 / 255,
+    }
+
+    pixels = preprocess_page(image, config)
+
+    assert pixels.shape == (1, 3, 2, 2)
+    assert pixels.dtype == np.float32
+    np.testing.assert_allclose(pixels, np.float32(128 / 255), rtol=0, atol=0)
+    assert pixels.flags.c_contiguous
+
+
+def test_resolve_providers_prefers_cuda_with_cpu_fallback():
+    available = ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
+
+    assert resolve_providers(None, available=available) == [
+        "CUDAExecutionProvider",
+        "CPUExecutionProvider",
+    ]
+    assert resolve_providers(["CPUExecutionProvider"], available=available) == [
+        "CPUExecutionProvider"
+    ]
+
+
+class _FakeIO:
+    def __init__(self, name):
+        self.name = name
+
+
+class _FakeEncoderSession:
+    def __init__(self):
+        self.calls = []
+
+    def get_inputs(self):
+        return [_FakeIO("pixel_values")]
+
+    def get_outputs(self):
+        return [_FakeIO("raw_features"), _FakeIO("enhanced_features")]
+
+    def get_providers(self):
+        return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+    def run(self, output_names, feeds):
+        self.calls.append((output_names, feeds))
+        raw = np.zeros((1, 4, 16), dtype=np.float32)
+        return [raw, raw + 1]
+
+
+class _FakeDecoderSession:
+    def __init__(self, generated_ids):
+        self.generated_ids = iter(generated_ids)
+        self.prefixes = []
+
+    def get_inputs(self):
+        return [
+            _FakeIO("raw_features"),
+            _FakeIO("enhanced_features"),
+            _FakeIO("token_ids"),
+        ]
+
+    def get_outputs(self):
+        return [_FakeIO("next_token_logits")]
+
+    def get_providers(self):
+        return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+    def run(self, output_names, feeds):
+        del output_names
+        self.prefixes.append(feeds["token_ids"].copy())
+        logits = np.full((1, 5), -10.0, dtype=np.float32)
+        logits[0, next(self.generated_ids)] = 10.0
+        return [logits]
+
+
+def _write_runtime_bundle(tmp_path, *, maxlen=5):
+    config = {
+        "i2w": {"0": "<pad>", "1": "<bos>", "2": "<eos>", "3": "note", "4": "rest"},
+        "w2i": {"<pad>": 0, "<bos>": 1, "<eos>": 2, "note": 3, "rest": 4},
+        "maxlen": maxlen,
+    }
+    preprocessor = build_preprocessor_config()
+    (tmp_path / "encoder.onnx").write_bytes(b"encoder")
+    (tmp_path / "decoder.onnx").write_bytes(b"decoder")
+    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    (tmp_path / "preprocessor_config.json").write_text(
+        json.dumps(preprocessor),
+        encoding="utf-8",
+    )
+
+
+def test_runtime_encodes_once_and_grows_complete_prefix_until_eos(tmp_path):
+    _write_runtime_bundle(tmp_path)
+    encoder = _FakeEncoderSession()
+    decoder = _FakeDecoderSession([3, 4, 2])
+
+    runtime = FullPageOMROnnxRuntime(
+        tmp_path,
+        encoder_session=encoder,
+        decoder_session=decoder,
+    )
+    result = runtime.generate_pixel_values(
+        np.zeros((1, 3, 1024, 1024), dtype=np.float32)
+    )
+
+    assert len(encoder.calls) == 1
+    assert [prefix.tolist() for prefix in decoder.prefixes] == [
+        [[1]],
+        [[1, 3]],
+        [[1, 3, 4]],
+    ]
+    assert result.token_ids == (1, 3, 4, 2)
+    assert result.tokens == ("note", "rest")
+    assert result.terminated_by_eos is True
+    assert result.truncated is False
+
+
+def test_runtime_reports_truncation_at_max_length(tmp_path):
+    _write_runtime_bundle(tmp_path, maxlen=3)
+    runtime = FullPageOMROnnxRuntime(
+        tmp_path,
+        encoder_session=_FakeEncoderSession(),
+        decoder_session=_FakeDecoderSession([3, 4]),
+    )
+
+    result = runtime.generate_pixel_values(
+        np.zeros((1, 3, 1024, 1024), dtype=np.float32)
+    )
+
+    assert result.token_ids == (1, 3, 4)
+    assert result.terminated_by_eos is False
+    assert result.truncated is True
+
+
+def test_runtime_rejects_malformed_session_contract(tmp_path):
+    _write_runtime_bundle(tmp_path)
+    encoder = _FakeEncoderSession()
+    encoder.get_outputs = lambda: [_FakeIO("wrong")]
+
+    with pytest.raises(ValueError, match="encoder output contract"):
+        FullPageOMROnnxRuntime(
+            tmp_path,
+            encoder_session=encoder,
+            decoder_session=_FakeDecoderSession([2]),
+        )
