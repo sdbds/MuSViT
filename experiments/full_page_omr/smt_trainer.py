@@ -1,3 +1,4 @@
+import copy
 import torch
 import random
 import wandb
@@ -17,6 +18,8 @@ from .optimization import (
     build_adamw,
     build_wsd_scheduler,
     optimizer_protocol_metadata,
+    same_typed_value,
+    validate_adamw_wsd_resume_state,
 )
 
 
@@ -51,7 +54,8 @@ class SMTPP_Trainer(L.LightningModule):
                  wsd_decay_steps=400_000,
                  wsd_warmup_type="linear",
                  wsd_decay_type="cosine",
-                 wsd_min_lr_ratio=0.0):
+                 wsd_min_lr_ratio=0.0,
+                 protocol_snapshot=None):
         super().__init__()
         if (
             not isinstance(encoder_training_mode, str)
@@ -100,14 +104,27 @@ class SMTPP_Trainer(L.LightningModule):
             decay_type=wsd_decay_type,
             min_lr_ratio=wsd_min_lr_ratio,
         )
+        if protocol_snapshot is not None and not isinstance(protocol_snapshot, dict):
+            raise TypeError("protocol_snapshot must be a dictionary")
+        self.protocol_snapshot = copy.deepcopy(protocol_snapshot)
 
         self.preds = []
         self.grtrs = []
 
         self.save_hyperparameters(ignore=["smt_model", "enforce_checkpoint_protocol"])
+        self.hparams["protocol_snapshot"] = copy.deepcopy(self.protocol_snapshot)
+        self.hparams.update({
+            "optimizer": "AdamW",
+            "optimizer_implementation": "torch.optim.AdamW",
+            "torch_version": str(torch.__version__),
+            "optimizer_betas": list(self.optimizer_config.betas),
+            "optimizer_eps": self.optimizer_config.eps,
+            "optimizer_amsgrad": self.optimizer_config.amsgrad,
+            "wsd_num_cycles": self.optimizer_config.num_cycles,
+        })
         self.model.freeze_encoder()
         self.unfrozen_vision = False
-    
+
     def configure_optimizers(self):
         optimizer = build_adamw(self.model, self.optimizer_config)
         scheduler = build_wsd_scheduler(optimizer, self.optimizer_config)
@@ -124,84 +141,28 @@ class SMTPP_Trainer(L.LightningModule):
     def optimizer_protocol_metadata(self):
         return optimizer_protocol_metadata(self.model, self.optimizer_config)
 
-    def _optimizer_checkpoint_identity(self):
-        config = self.optimizer_config
-        return {
-            "run_protocol_version": self.hparams.run_protocol_version,
-            "optimizer_protocol": config.protocol,
-            "task_learning_rate": config.task_learning_rate,
-            "encoder_learning_rate": config.encoder_learning_rate,
-            "weight_decay": config.weight_decay,
-            "max_steps": config.max_steps,
-            "wsd_warmup_steps": config.warmup_steps,
-            "wsd_decay_steps": config.decay_steps,
-            "wsd_warmup_type": config.warmup_type,
-            "wsd_decay_type": config.decay_type,
-            "wsd_min_lr_ratio": config.min_lr_ratio,
-        }
-
     def _validate_optimizer_checkpoint_identity(self, hyper_parameters):
-        expected = self._optimizer_checkpoint_identity()
-        missing = [key for key in expected if key not in hyper_parameters]
-        if missing:
+        if self.protocol_snapshot is None:
             raise ValueError(
-                f"checkpoint is missing optimizer protocol evidence: {missing}"
+                "full resume requires a complete expected protocol_snapshot"
             )
-        mismatches = {
-            key: (hyper_parameters[key], value)
-            for key, value in expected.items()
-            if hyper_parameters[key] != value
-        }
-        if mismatches:
+        saved_snapshot = hyper_parameters.get("protocol_snapshot")
+        if saved_snapshot is None:
             raise ValueError(
-                f"checkpoint optimizer protocol mismatch: {mismatches}"
+                "checkpoint is missing protocol_snapshot evidence required for full resume"
+            )
+        if not same_typed_value(saved_snapshot, self.protocol_snapshot):
+            raise ValueError(
+                "checkpoint protocol snapshot mismatch: "
+                f"saved={saved_snapshot!r}, expected={self.protocol_snapshot!r}"
             )
 
     def _validate_optimizer_checkpoint_state(self, checkpoint):
-        optimizer_states = checkpoint.get("optimizer_states")
-        scheduler_states = checkpoint.get("lr_schedulers")
-        if not isinstance(optimizer_states, list) or len(optimizer_states) != 1:
-            raise ValueError("full resume requires exactly one AdamW optimizer state")
-        if not isinstance(scheduler_states, list) or len(scheduler_states) != 1:
-            raise ValueError("full resume requires exactly one WSD scheduler state")
-        optimizer_state = optimizer_states[0]
-        if not isinstance(optimizer_state, dict):
-            raise ValueError("full resume requires exactly one AdamW optimizer state")
-        if not isinstance(scheduler_states[0], dict):
-            raise ValueError("full resume requires exactly one WSD scheduler state")
-
-        saved_groups = optimizer_state.get("param_groups", [])
-        expected_groups = self.optimizer_protocol_metadata()["optimizer_groups"]
-        if (
-            not isinstance(saved_groups, list)
-            or len(saved_groups) != len(expected_groups)
-            or not all(isinstance(group, dict) for group in saved_groups)
-        ):
-            raise ValueError(
-                "checkpoint AdamW parameter-group mismatch: "
-                f"saved={saved_groups!r}"
-            )
-        saved_schema = [
-            (group.get("name"), group.get("initial_lr"), group.get("weight_decay"))
-            for group in saved_groups
-        ]
-        expected_schema = [
-            (group["name"], group["learning_rate"], group["weight_decay"])
-            for group in expected_groups
-        ]
-        schema_matches = all(
-            all(
-                type(saved_value) is type(expected_value)
-                and saved_value == expected_value
-                for saved_value, expected_value in zip(saved_group, expected_group)
-            )
-            for saved_group, expected_group in zip(saved_schema, expected_schema)
+        validate_adamw_wsd_resume_state(
+            checkpoint,
+            self.model,
+            self.optimizer_config,
         )
-        if not schema_matches:
-            raise ValueError(
-                "checkpoint AdamW parameter-group mismatch: "
-                f"saved={saved_schema}, expected={expected_schema}"
-            )
 
     def _is_evaluation_checkpoint_load(self):
         trainer = self._trainer
@@ -243,12 +204,14 @@ class SMTPP_Trainer(L.LightningModule):
         if not self.enforce_checkpoint_protocol:
             return
 
+        if self._is_evaluation_checkpoint_load():
+            return
+
         hyper_parameters = checkpoint.get("hyper_parameters", {})
         if not isinstance(hyper_parameters, dict):
             raise ValueError("checkpoint hyper_parameters must be a dictionary")
-        if not self._is_evaluation_checkpoint_load():
-            self._validate_optimizer_checkpoint_identity(hyper_parameters)
-            self._validate_optimizer_checkpoint_state(checkpoint)
+        self._validate_optimizer_checkpoint_identity(hyper_parameters)
+        self._validate_optimizer_checkpoint_state(checkpoint)
 
         checkpoint_mode = hyper_parameters.get("encoder_training_mode")
         if checkpoint_mode is None:
@@ -312,9 +275,17 @@ class SMTPP_Trainer(L.LightningModule):
         )
 
     def on_save_checkpoint(self, checkpoint):
+        if self.protocol_snapshot is None:
+            raise ValueError("checkpoint save requires a complete protocol_snapshot")
         checkpoint[SAMPLES_SEEN_CHECKPOINT_KEY] = _validate_non_negative_integer(
             self.samples_seen,
             SAMPLES_SEEN_CHECKPOINT_KEY,
+        )
+        hyper_parameters = checkpoint.setdefault("hyper_parameters", {})
+        if not isinstance(hyper_parameters, dict):
+            raise ValueError("checkpoint hyper_parameters must be a dictionary")
+        hyper_parameters["protocol_snapshot"] = copy.deepcopy(
+            self.protocol_snapshot
         )
 
     def training_step(self, batch):

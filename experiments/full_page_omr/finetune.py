@@ -2,6 +2,7 @@ import json
 import hashlib
 import re
 import uuid
+import copy
 from dataclasses import dataclass, fields
 from pathlib import Path
 
@@ -15,7 +16,12 @@ from . import _globals
 from .config.ExperimentConfigWrapper import ExperimentConfig, experiment_config_from_dict
 from .data import SyntheticGrandStaffDataset, CLFinetuningDataset, SynthRealFinetuningDataset
 from .smt_foundation import SMTFoundationConfig, SMTFoundationModelForCausalLM
-from .optimization import AdamWWSDConfig
+from .optimization import (
+    AdamWWSDConfig,
+    optimizer_protocol_metadata,
+    same_typed_value,
+    validate_adamw_wsd_resume_state,
+)
 from .smt_trainer import (
     ENCODER_TRAINING_MODES,
     SAMPLES_SEEN_CHECKPOINT_KEY,
@@ -47,30 +53,15 @@ CANONICAL_VALIDATION_EVERY_N_EPOCHS = 2_000
 @dataclass(frozen=True)
 class CheckpointRunState:
     path: str
-    global_step: int
-    curriculum_step: int
+    global_step: int | None
+    curriculum_step: int | None
     curriculum_step_offset: int
     curriculum_step_source: str
     sha256: str | None
-    optimizer_identity: dict | None
+    protocol_snapshot: dict | None
 
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
-_OPTIMIZER_IDENTITY_KEYS = (
-    "run_protocol_version",
-    "optimizer_protocol",
-    "task_learning_rate",
-    "encoder_learning_rate",
-    "weight_decay",
-    "max_steps",
-    "wsd_warmup_steps",
-    "wsd_decay_steps",
-    "wsd_warmup_type",
-    "wsd_decay_type",
-    "wsd_min_lr_ratio",
-)
-
-
 def _validate_checkpoint_every_n_epochs(value: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError("checkpoint_every_n_epochs must be a positive integer")
@@ -92,23 +83,6 @@ def _normalize_task_learning_rate(task_learning_rate, learning_rate):
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
         raise ValueError("task_learning_rate must be positive")
     return float(value)
-
-
-def _expected_optimizer_identity(protocol_version: str,
-                                 config: AdamWWSDConfig) -> dict:
-    return {
-        "run_protocol_version": protocol_version,
-        "optimizer_protocol": config.protocol,
-        "task_learning_rate": config.task_learning_rate,
-        "encoder_learning_rate": config.encoder_learning_rate,
-        "weight_decay": config.weight_decay,
-        "max_steps": config.max_steps,
-        "wsd_warmup_steps": config.warmup_steps,
-        "wsd_decay_steps": config.decay_steps,
-        "wsd_warmup_type": config.warmup_type,
-        "wsd_decay_type": config.decay_type,
-        "wsd_min_lr_ratio": config.min_lr_ratio,
-    }
 
 
 def _validate_canonical_protocol_contract(
@@ -196,7 +170,10 @@ def _sha256_file(path: Path) -> str:
 
 
 def _read_checkpoint_run_state(checkpoint_path: str,
-                               *, expected_sha256: str | None = None) -> CheckpointRunState:
+                               *, expected_sha256: str | None = None,
+                               allow_missing_global_step: bool = False,
+                               require_samples_seen: bool = False,
+                               resume_state_validator=None) -> CheckpointRunState:
     path = Path(checkpoint_path).expanduser().resolve()
     if expected_sha256 is not None:
         if not isinstance(expected_sha256, str) or _SHA256_RE.fullmatch(expected_sha256) is None:
@@ -212,20 +189,19 @@ def _read_checkpoint_run_state(checkpoint_path: str,
     if not isinstance(payload, dict):
         raise ValueError(f"checkpoint must contain a dictionary payload: {path}")
 
-    global_step = _validate_non_negative_integer(
-        payload.get("global_step"),
-        "checkpoint global_step",
-    )
+    if allow_missing_global_step and "global_step" not in payload:
+        global_step = None
+    else:
+        global_step = _validate_non_negative_integer(
+            payload.get("global_step"),
+            "checkpoint global_step",
+        )
     hyper_parameters = payload.get("hyper_parameters", {})
     if not isinstance(hyper_parameters, dict):
         raise ValueError("checkpoint hyper_parameters must be a dictionary")
-    optimizer_identity = {
-        key: hyper_parameters[key]
-        for key in _OPTIMIZER_IDENTITY_KEYS
-        if key in hyper_parameters
-    }
-    if not optimizer_identity:
-        optimizer_identity = None
+    protocol_snapshot = hyper_parameters.get("protocol_snapshot")
+    if protocol_snapshot is not None and not isinstance(protocol_snapshot, dict):
+        raise ValueError("checkpoint protocol_snapshot must be a dictionary")
     if SAMPLES_SEEN_CHECKPOINT_KEY in payload:
         samples_seen = _validate_non_negative_integer(
             payload[SAMPLES_SEEN_CHECKPOINT_KEY],
@@ -238,10 +214,18 @@ def _read_checkpoint_run_state(checkpoint_path: str,
         curriculum_step = offset + samples_seen
         curriculum_step_source = "checkpoint_samples_seen"
     else:
+        if require_samples_seen:
+            raise ValueError(
+                f"full resume requires checkpoint {SAMPLES_SEEN_CHECKPOINT_KEY}"
+            )
         offset = 0
         curriculum_step = global_step
-        curriculum_step_source = "legacy_global_step"
+        curriculum_step_source = (
+            "legacy_global_step" if global_step is not None else "unavailable"
+        )
 
+    if resume_state_validator is not None:
+        resume_state_validator(payload)
     del payload
     return CheckpointRunState(
         path=str(path),
@@ -250,7 +234,7 @@ def _read_checkpoint_run_state(checkpoint_path: str,
         curriculum_step_offset=offset,
         curriculum_step_source=curriculum_step_source,
         sha256=actual_sha256,
-        optimizer_identity=optimizer_identity,
+        protocol_snapshot=copy.deepcopy(protocol_snapshot),
     )
 
 
@@ -258,7 +242,9 @@ def _validate_run_contract(*, config, from_checkpoint, starting_weights,
                            max_steps: int, train: bool, protocol_version: str,
                            source_curriculum_step: int | None,
                            source_checkpoint_sha256: str | None = None,
-                           expected_optimizer_identity: dict | None = None):
+                           expected_protocol_snapshot: dict | None = None,
+                           expected_model=None,
+                           optimizer_config: AdamWWSDConfig | None = None):
     protocol_version = _validate_protocol_version(protocol_version)
     if from_checkpoint is not None:
         if source_curriculum_step is not None or source_checkpoint_sha256 is not None:
@@ -266,7 +252,25 @@ def _validate_run_contract(*, config, from_checkpoint, starting_weights,
                 "source_curriculum_step and source_checkpoint_sha256 are only valid "
                 "with starting_weights"
             )
-        state = _read_checkpoint_run_state(from_checkpoint)
+        if not train:
+            return _read_checkpoint_run_state(
+                from_checkpoint,
+                allow_missing_global_step=True,
+            )
+        if expected_model is None or optimizer_config is None:
+            raise ValueError(
+                "full resume requires the expected model and optimizer config "
+                "for state validation"
+            )
+        state = _read_checkpoint_run_state(
+            from_checkpoint,
+            require_samples_seen=True,
+            resume_state_validator=lambda payload: validate_adamw_wsd_resume_state(
+                payload,
+                expected_model,
+                optimizer_config,
+            ),
+        )
         requested_offset = config.data.skip_steps
         if state.curriculum_step_source == "legacy_global_step" and requested_offset != 0:
             raise ValueError(
@@ -283,52 +287,41 @@ def _validate_run_contract(*, config, from_checkpoint, starting_weights,
                 f"max_steps ({max_steps}) must exceed resumed checkpoint "
                 f"global_step ({state.global_step})"
             )
-        if state.optimizer_identity is None:
+        if expected_protocol_snapshot is None or not isinstance(
+            expected_protocol_snapshot,
+            dict,
+        ):
             raise ValueError(
-                "checkpoint is missing optimizer protocol evidence required for full resume"
+                "full resume requires a complete expected protocol_snapshot"
             )
-        missing = [
-            key for key in _OPTIMIZER_IDENTITY_KEYS
-            if key not in state.optimizer_identity
-        ]
-        if missing:
+        if state.protocol_snapshot is None:
             raise ValueError(
-                f"checkpoint is missing optimizer protocol evidence: {missing}"
+                "checkpoint is missing protocol_snapshot evidence required for full resume"
             )
-        checkpoint_max_steps = state.optimizer_identity["max_steps"]
+        if not same_typed_value(
+            state.protocol_snapshot,
+            expected_protocol_snapshot,
+        ):
+            raise ValueError(
+                "checkpoint protocol snapshot mismatch: "
+                f"saved={state.protocol_snapshot!r}, "
+                f"expected={expected_protocol_snapshot!r}"
+            )
+        checkpoint_max_steps = state.protocol_snapshot.get("trainer", {}).get(
+            "max_steps"
+        )
         if max_steps != checkpoint_max_steps:
             raise ValueError(
                 f"resumed max_steps ({max_steps}) must equal checkpoint "
                 f"WSD total ({checkpoint_max_steps})"
             )
-        if state.optimizer_identity["run_protocol_version"] != protocol_version:
+        if state.protocol_snapshot.get("protocol_version") != protocol_version:
             raise ValueError(
-                "checkpoint optimizer protocol mismatch: "
-                f"run_protocol_version="
-                f"{state.optimizer_identity['run_protocol_version']!r}, "
+                "checkpoint protocol snapshot mismatch: "
+                f"protocol_version="
+                f"{state.protocol_snapshot.get('protocol_version')!r}, "
                 f"expected={protocol_version!r}"
             )
-        if expected_optimizer_identity is not None:
-            if not isinstance(expected_optimizer_identity, dict):
-                raise TypeError("expected_optimizer_identity must be a dictionary")
-            expected_keys = set(expected_optimizer_identity)
-            required_keys = set(_OPTIMIZER_IDENTITY_KEYS)
-            if expected_keys != required_keys:
-                raise ValueError(
-                    "expected_optimizer_identity must contain the exact optimizer "
-                    "identity keys: "
-                    f"missing={sorted(required_keys - expected_keys)}, "
-                    f"extra={sorted(expected_keys - required_keys)}"
-                )
-            mismatches = {
-                key: (state.optimizer_identity[key], expected_optimizer_identity[key])
-                for key in _OPTIMIZER_IDENTITY_KEYS
-                if state.optimizer_identity[key] != expected_optimizer_identity[key]
-            }
-            if mismatches:
-                raise ValueError(
-                    f"checkpoint optimizer protocol mismatch: {mismatches}"
-                )
         return state
 
     if starting_weights is not None:
@@ -442,6 +435,122 @@ def _build_trainer_kwargs(*, max_steps: int, validation_every_n_epochs: int,
     }
 
 
+def _build_protocol_snapshot(*, max_steps, validation_every_n_epochs,
+                             encoder_training_mode, encoder_unfreeze_step,
+                             curriculum_step_offset, resolution, reduce_ratio,
+                             batch_size, protocol_version,
+                             expected_training_batches_per_epoch,
+                             curriculum_steady_mixture_step,
+                             finetuning_technique, attention_backend,
+                             tokenization_mode, num_workers,
+                             checkpoint_every_n_epochs, optimizer_metadata,
+                             foundation_architecture=None,
+                             foundation_weights=None):
+    required_optimizer_fields = {
+        "optimizer",
+        "optimizer_implementation",
+        "torch_version",
+        "optimizer_protocol",
+        "optimizer_betas",
+        "optimizer_eps",
+        "optimizer_amsgrad",
+        "optimizer_groups",
+        "scheduler",
+        "scheduler_interval",
+        "scheduler_frequency",
+        "wsd_max_steps",
+        "wsd_warmup_steps",
+        "wsd_stable_steps",
+        "wsd_decay_steps",
+        "wsd_warmup_type",
+        "wsd_decay_type",
+        "wsd_min_lr_ratio",
+        "wsd_num_cycles",
+    }
+    missing = required_optimizer_fields - set(optimizer_metadata)
+    if missing:
+        raise ValueError(
+            "optimizer metadata is incomplete for protocol_snapshot: "
+            f"{sorted(missing)}"
+        )
+    expected_validation_count = None
+    if expected_training_batches_per_epoch:
+        expected_validation_count = max_steps // (
+            expected_training_batches_per_epoch * validation_every_n_epochs
+        )
+    snapshot = {
+        "protocol_version": protocol_version,
+        "optimizer": {
+            "class": optimizer_metadata["optimizer"],
+            "implementation": optimizer_metadata["optimizer_implementation"],
+            "torch_version": optimizer_metadata["torch_version"],
+            "protocol": optimizer_metadata["optimizer_protocol"],
+            "betas": optimizer_metadata["optimizer_betas"],
+            "eps": optimizer_metadata["optimizer_eps"],
+            "amsgrad": optimizer_metadata["optimizer_amsgrad"],
+            "groups": optimizer_metadata["optimizer_groups"],
+        },
+        "scheduler": {
+            "helper": optimizer_metadata["scheduler"],
+            "interval": optimizer_metadata["scheduler_interval"],
+            "frequency": optimizer_metadata["scheduler_frequency"],
+            "max_steps": optimizer_metadata["wsd_max_steps"],
+            "warmup_steps": optimizer_metadata["wsd_warmup_steps"],
+            "stable_steps": optimizer_metadata["wsd_stable_steps"],
+            "decay_steps": optimizer_metadata["wsd_decay_steps"],
+            "warmup_type": optimizer_metadata["wsd_warmup_type"],
+            "decay_type": optimizer_metadata["wsd_decay_type"],
+            "min_lr_ratio": optimizer_metadata["wsd_min_lr_ratio"],
+            "num_cycles": optimizer_metadata["wsd_num_cycles"],
+        },
+        "trainer": {
+            "max_steps": max_steps,
+            "max_epochs": MAX_EPOCHS,
+            "precision": PRECISION,
+            "batch_size": batch_size,
+            "accumulate_grad_batches": ACCUMULATE_GRAD_BATCHES,
+        },
+        "validation": {
+            "every_n_epochs": validation_every_n_epochs,
+            "first_epoch": validation_every_n_epochs,
+            "expected_count": expected_validation_count,
+            "expected_training_batches_per_epoch": expected_training_batches_per_epoch,
+            "val_check_interval": 1.0,
+            "num_sanity_val_steps": 0,
+        },
+        "curriculum": {
+            "encoder_training_mode": encoder_training_mode,
+            "encoder_unfreeze_step": encoder_unfreeze_step,
+            "steady_mixture_step": curriculum_steady_mixture_step,
+            "step_offset": curriculum_step_offset,
+        },
+        "metrics": {
+            "version": METRIC_VERSION,
+            "monitor": CHECKPOINT_MONITOR,
+        },
+        "input": {
+            "resolution": resolution,
+            "reduce_ratio": reduce_ratio,
+            "tokenization_mode": tokenization_mode,
+        },
+        "model": {
+            "foundation_architecture": foundation_architecture,
+            "foundation_weights": foundation_weights,
+            "finetuning_technique": finetuning_technique,
+            "attention_backend": attention_backend,
+        },
+        "data": {
+            "num_workers": num_workers,
+        },
+        "checkpointing": {
+            "every_n_epochs": checkpoint_every_n_epochs,
+            "metric_save_top_k": 2,
+            "metric_save_weights_only": True,
+        },
+    }
+    return copy.deepcopy(snapshot)
+
+
 def _build_protocol_metadata(*, max_steps, validation_every_n_epochs,
                              from_checkpoint, starting_weights,
                              encoder_training_mode, encoder_unfreeze_step,
@@ -458,10 +567,13 @@ def _build_protocol_metadata(*, max_steps, validation_every_n_epochs,
                              expected_training_batches_per_epoch=None,
                              curriculum_steady_mixture_step=320_000,
                              optimizer_metadata=None,
-                             trainer_max_steps=None):
+                             trainer_max_steps=None,
+                             train=True,
+                             foundation_architecture=None,
+                             foundation_weights=None):
     if from_checkpoint is not None:
         checkpoint_source = from_checkpoint
-        checkpoint_load_mode = "full"
+        checkpoint_load_mode = "full" if train else "evaluation_weights_only"
     elif starting_weights is not None:
         checkpoint_source = starting_weights
         checkpoint_load_mode = "weights_only"
@@ -517,13 +629,35 @@ def _build_protocol_metadata(*, max_steps, validation_every_n_epochs,
         "batch_size": batch_size,
         "accumulate_grad_batches": ACCUMULATE_GRAD_BATCHES,
     }
-    if optimizer_metadata is not None:
-        collisions = set(metadata) & set(optimizer_metadata)
-        if collisions:
-            raise ValueError(
-                f"optimizer metadata collides with run metadata: {sorted(collisions)}"
-            )
-        metadata.update(optimizer_metadata)
+    if optimizer_metadata is None:
+        raise ValueError("optimizer_metadata is required for complete protocol metadata")
+    collisions = set(metadata) & set(optimizer_metadata)
+    if collisions:
+        raise ValueError(
+            f"optimizer metadata collides with run metadata: {sorted(collisions)}"
+        )
+    metadata.update(optimizer_metadata)
+    metadata["protocol_snapshot"] = _build_protocol_snapshot(
+        max_steps=max_steps,
+        validation_every_n_epochs=validation_every_n_epochs,
+        encoder_training_mode=encoder_training_mode,
+        encoder_unfreeze_step=encoder_unfreeze_step,
+        curriculum_step_offset=curriculum_step_offset,
+        resolution=resolution,
+        reduce_ratio=reduce_ratio,
+        batch_size=batch_size,
+        protocol_version=protocol_version,
+        expected_training_batches_per_epoch=expected_training_batches_per_epoch,
+        curriculum_steady_mixture_step=curriculum_steady_mixture_step,
+        finetuning_technique=finetuning_technique,
+        attention_backend=attention_backend,
+        tokenization_mode=tokenization_mode,
+        num_workers=num_workers,
+        checkpoint_every_n_epochs=checkpoint_every_n_epochs,
+        optimizer_metadata=optimizer_metadata,
+        foundation_architecture=foundation_architecture,
+        foundation_weights=foundation_weights,
+    )
     return metadata
 
 
@@ -743,20 +877,6 @@ def main(config: ExperimentConfig, experiment_name,
         from_checkpoint,
         starting_weights,
     )
-    checkpoint_state = _validate_run_contract(
-        config=config,
-        from_checkpoint=from_checkpoint,
-        starting_weights=starting_weights,
-        max_steps=protocol_max_steps,
-        train=train,
-        protocol_version=protocol_version,
-        source_curriculum_step=source_curriculum_step,
-        source_checkpoint_sha256=source_checkpoint_sha256,
-        expected_optimizer_identity=_expected_optimizer_identity(
-            protocol_version,
-            optimizer_config,
-        ),
-    )
     if resolution is None:
         _globals.resolution = 1024
     else:
@@ -809,6 +929,62 @@ def main(config: ExperimentConfig, experiment_name,
         data.num_workers,
     )
 
+    optimizer_metadata = optimizer_protocol_metadata(model, optimizer_config)
+    protocol_metadata = _build_protocol_metadata(
+        max_steps=protocol_max_steps,
+        trainer_max_steps=trainer_max_steps,
+        validation_every_n_epochs=validation_every_n_epochs,
+        from_checkpoint=from_checkpoint,
+        starting_weights=starting_weights,
+        encoder_training_mode=encoder_training_mode,
+        encoder_unfreeze_step=encoder_unfreeze_step,
+        resolution=resolution,
+        reduce_ratio=config.data.reduce_ratio,
+        batch_size=data.batch_size,
+        protocol_version=protocol_version,
+        source_curriculum_step=source_curriculum_step,
+        curriculum_step_offset=curriculum_step_offset,
+        finetuning_technique=finetuning_technique,
+        attention_backend=attention_backend,
+        tokenization_mode=data.tokenization_mode,
+        num_workers=data.num_workers,
+        checkpoint_every_n_epochs=checkpoint_every_n_epochs,
+        expected_training_batches_per_epoch=len(data.train_dataset),
+        curriculum_steady_mixture_step=320_000,
+        optimizer_metadata=optimizer_metadata,
+        train=train,
+        foundation_architecture=foundation_architecture,
+        foundation_weights=foundation_weights,
+    )
+    protocol_snapshot = protocol_metadata["protocol_snapshot"]
+    checkpoint_state = _validate_run_contract(
+        config=config,
+        from_checkpoint=from_checkpoint,
+        starting_weights=starting_weights,
+        max_steps=protocol_max_steps,
+        train=train,
+        protocol_version=protocol_version,
+        source_curriculum_step=source_curriculum_step,
+        source_checkpoint_sha256=source_checkpoint_sha256,
+        expected_protocol_snapshot=protocol_snapshot,
+        expected_model=model,
+        optimizer_config=optimizer_config,
+    )
+    if checkpoint_state is not None:
+        protocol_metadata.update({
+            "checkpoint_source": checkpoint_state.path,
+            "checkpoint_global_step": checkpoint_state.global_step,
+            "checkpoint_sha256": checkpoint_state.sha256,
+            "source_curriculum_step": (
+                source_curriculum_step
+                if source_curriculum_step is not None
+                else checkpoint_state.curriculum_step
+            ),
+            "source_curriculum_step_evidence": (
+                checkpoint_state.curriculum_step_source
+            ),
+        })
+
     optimizer_wrapper_kwargs = {
         "run_protocol_version": protocol_version,
         "optimizer_protocol": optimizer_config.protocol,
@@ -821,6 +997,7 @@ def main(config: ExperimentConfig, experiment_name,
         "wsd_warmup_type": optimizer_config.warmup_type,
         "wsd_decay_type": optimizer_config.decay_type,
         "wsd_min_lr_ratio": optimizer_config.min_lr_ratio,
+        "protocol_snapshot": protocol_snapshot,
     }
     if starting_weights is None:
         model_wrapper = SMTPP_Trainer(
@@ -860,30 +1037,6 @@ def main(config: ExperimentConfig, experiment_name,
         finetuning_technique,
     )
 
-    protocol_metadata = _build_protocol_metadata(
-        max_steps=protocol_max_steps,
-        trainer_max_steps=trainer_max_steps,
-        validation_every_n_epochs=validation_every_n_epochs,
-        from_checkpoint=from_checkpoint,
-        starting_weights=starting_weights,
-        encoder_training_mode=encoder_training_mode,
-        encoder_unfreeze_step=encoder_unfreeze_step,
-        resolution=resolution,
-        reduce_ratio=config.data.reduce_ratio,
-        batch_size=data.batch_size,
-        protocol_version=protocol_version,
-        source_curriculum_step=source_curriculum_step,
-        checkpoint_state=checkpoint_state,
-        curriculum_step_offset=curriculum_step_offset,
-        finetuning_technique=finetuning_technique,
-        attention_backend=attention_backend,
-        tokenization_mode=data.tokenization_mode,
-        num_workers=data.num_workers,
-        checkpoint_every_n_epochs=checkpoint_every_n_epochs,
-        expected_training_batches_per_epoch=len(data.train_dataset),
-        curriculum_steady_mixture_step=320_000,
-        optimizer_metadata=model_wrapper.optimizer_protocol_metadata(),
-    )
     run_record_id = uuid.uuid4().hex
     run_record_root = Path("logs") / "run_instances" / run_record_id
     protocol_metadata["run_record_id"] = run_record_id

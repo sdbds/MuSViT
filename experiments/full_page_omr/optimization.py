@@ -6,6 +6,7 @@ from transformers.optimization import get_wsd_schedule
 
 
 OPTIMIZER_PROTOCOL = "adamw_wsd_v1"
+SAMPLES_SEEN_CHECKPOINT_KEY = "full_page_omr_samples_seen"
 
 
 @dataclass(frozen=True)
@@ -158,6 +159,7 @@ def optimizer_protocol_metadata(model: nn.Module, config: AdamWWSDConfig) -> dic
         "optimizer_groups": [
             {
                 "name": group["name"],
+                "parameter_tensor_count": len(group["params"]),
                 "parameter_count": sum(parameter.numel() for parameter in group["params"]),
                 "learning_rate": group["lr"],
                 "weight_decay": group["weight_decay"],
@@ -179,3 +181,111 @@ def optimizer_protocol_metadata(model: nn.Module, config: AdamWWSDConfig) -> dic
         "encoder_learning_rate": config.encoder_learning_rate,
         "weight_decay": config.weight_decay,
     }
+
+
+def same_typed_value(actual, expected) -> bool:
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return actual.keys() == expected.keys() and all(
+            same_typed_value(actual[key], value)
+            for key, value in expected.items()
+        )
+    if isinstance(expected, (list, tuple)):
+        return len(actual) == len(expected) and all(
+            same_typed_value(actual_value, expected_value)
+            for actual_value, expected_value in zip(actual, expected)
+        )
+    return actual == expected
+
+
+def validate_adamw_wsd_resume_state(checkpoint: dict, model: nn.Module,
+                                    config: AdamWWSDConfig) -> None:
+    """Fail before Lightning can restore state that changes the locked protocol."""
+    if not isinstance(checkpoint, dict):
+        raise ValueError("full resume checkpoint must be a dictionary")
+    global_step = checkpoint.get("global_step")
+    if isinstance(global_step, bool) or not isinstance(global_step, int) or global_step < 0:
+        raise ValueError("full resume requires a non-negative checkpoint global_step")
+    samples_seen = checkpoint.get(SAMPLES_SEEN_CHECKPOINT_KEY)
+    if isinstance(samples_seen, bool) or not isinstance(samples_seen, int) or samples_seen < 0:
+        raise ValueError(
+            f"full resume requires a non-negative {SAMPLES_SEEN_CHECKPOINT_KEY}"
+        )
+
+    optimizer_states = checkpoint.get("optimizer_states")
+    scheduler_states = checkpoint.get("lr_schedulers")
+    if not isinstance(optimizer_states, list) or len(optimizer_states) != 1:
+        raise ValueError("full resume requires exactly one AdamW optimizer state")
+    if not isinstance(scheduler_states, list) or len(scheduler_states) != 1:
+        raise ValueError("full resume requires exactly one WSD scheduler state")
+    optimizer_state = optimizer_states[0]
+    scheduler_state = scheduler_states[0]
+    if not isinstance(optimizer_state, dict):
+        raise ValueError("full resume requires exactly one AdamW optimizer state")
+    if not isinstance(scheduler_state, dict):
+        raise ValueError("full resume requires exactly one WSD scheduler state")
+
+    expected_optimizer = build_adamw(model, config)
+    expected_scheduler = build_wsd_scheduler(expected_optimizer, config)
+    expected_optimizer_state = expected_optimizer.state_dict()
+    expected_groups = expected_optimizer_state["param_groups"]
+    saved_groups = optimizer_state.get("param_groups")
+    if (
+        not isinstance(saved_groups, list)
+        or len(saved_groups) != len(expected_groups)
+        or not all(isinstance(group, dict) for group in saved_groups)
+    ):
+        raise ValueError(
+            "checkpoint AdamW parameter-group mismatch: "
+            f"saved={saved_groups!r}"
+        )
+
+    expected_base_lrs = expected_scheduler.state_dict()["base_lrs"]
+    expected_multiplier = expected_scheduler.lr_lambdas[0](global_step)
+    expected_current_lrs = [
+        base_lr * expected_multiplier for base_lr in expected_base_lrs
+    ]
+    for index, (saved_group, expected_group, expected_lr) in enumerate(
+        zip(saved_groups, expected_groups, expected_current_lrs)
+    ):
+        if saved_group.keys() != expected_group.keys():
+            raise ValueError(
+                "checkpoint AdamW parameter-group mismatch: "
+                f"group {index} keys differ"
+            )
+        if not same_typed_value(saved_group.get("params"), expected_group["params"]):
+            raise ValueError(
+                "checkpoint AdamW parameter-group mismatch: "
+                f"group {index} parameter order/count differs"
+            )
+        for key, expected_value in expected_group.items():
+            if key == "params":
+                continue
+            if key == "lr":
+                expected_value = expected_lr
+            if not same_typed_value(saved_group[key], expected_value):
+                raise ValueError(
+                    "checkpoint AdamW parameter-group mismatch: "
+                    f"group {index} field {key!r} is {saved_group[key]!r}, "
+                    f"expected {expected_value!r}"
+                )
+
+    expected_scheduler_state = expected_scheduler.state_dict()
+    if scheduler_state.keys() != expected_scheduler_state.keys():
+        raise ValueError("checkpoint WSD scheduler state mismatch: keys differ")
+    dynamic_expected = {
+        "base_lrs": expected_base_lrs,
+        "last_epoch": global_step,
+        "_step_count": global_step + 1,
+        "_last_lr": expected_current_lrs,
+    }
+    for key, expected_value in expected_scheduler_state.items():
+        if key in dynamic_expected:
+            expected_value = dynamic_expected[key]
+        if not same_typed_value(scheduler_state[key], expected_value):
+            raise ValueError(
+                "checkpoint WSD scheduler state mismatch: "
+                f"{key}={scheduler_state[key]!r}, expected={expected_value!r} "
+                f"at global_step={global_step}"
+            )
