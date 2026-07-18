@@ -15,6 +15,7 @@ from . import _globals
 from .config.ExperimentConfigWrapper import ExperimentConfig, experiment_config_from_dict
 from .data import SyntheticGrandStaffDataset, CLFinetuningDataset, SynthRealFinetuningDataset
 from .smt_foundation import SMTFoundationConfig, SMTFoundationModelForCausalLM
+from .optimization import AdamWWSDConfig
 from .smt_trainer import (
     ENCODER_TRAINING_MODES,
     SAMPLES_SEEN_CHECKPOINT_KEY,
@@ -34,7 +35,7 @@ DATASETS_TYPE = {
     "R": None
 }
 
-PROTOCOL_VERSION = "full_page_omr_eval_v2"
+PROTOCOL_VERSION = "full_page_omr_adamw_wsd_4m_v1"
 METRIC_VERSION = "canonical_v2"
 CHECKPOINT_MONITOR = "val_SER_v2"
 PRECISION = "16-mixed"
@@ -74,10 +75,38 @@ def _validate_checkpoint_every_n_epochs(value: int) -> int:
     return value
 
 
-def _validate_validation_every_n_batches(value: int) -> int:
+def _validate_validation_every_n_epochs(value: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise ValueError("validation_every_n_batches must be a positive integer")
+        raise ValueError("validation_every_n_epochs must be a positive integer")
     return value
+
+
+def _normalize_task_learning_rate(task_learning_rate, learning_rate):
+    if task_learning_rate is not None and learning_rate is not None:
+        raise ValueError("task_learning_rate and learning_rate are mutually exclusive")
+    value = task_learning_rate if task_learning_rate is not None else learning_rate
+    if value is None:
+        value = 1e-4
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise ValueError("task_learning_rate must be positive")
+    return float(value)
+
+
+def _expected_optimizer_identity(protocol_version: str,
+                                 config: AdamWWSDConfig) -> dict:
+    return {
+        "run_protocol_version": protocol_version,
+        "optimizer_protocol": config.protocol,
+        "task_learning_rate": config.task_learning_rate,
+        "encoder_learning_rate": config.encoder_learning_rate,
+        "weight_decay": config.weight_decay,
+        "max_steps": config.max_steps,
+        "wsd_warmup_steps": config.warmup_steps,
+        "wsd_decay_steps": config.decay_steps,
+        "wsd_warmup_type": config.warmup_type,
+        "wsd_decay_type": config.decay_type,
+        "wsd_min_lr_ratio": config.min_lr_ratio,
+    }
 
 
 def _validate_max_steps(value: int, *, train: bool) -> int:
@@ -368,13 +397,13 @@ def _build_metric_checkpointer(experiment_name: str,
     )
 
 
-def _build_trainer_kwargs(*, max_steps: int, validation_every_n_batches: int,
+def _build_trainer_kwargs(*, max_steps: int, validation_every_n_epochs: int,
                           callbacks, logger):
     return {
-        "max_epochs": 100000,
+        "max_epochs": 100_000,
         "max_steps": max_steps,
-        "check_val_every_n_epoch": None,
-        "val_check_interval": validation_every_n_batches,
+        "check_val_every_n_epoch": validation_every_n_epochs,
+        "val_check_interval": 1.0,
         "num_sanity_val_steps": 0,
         "callbacks": callbacks,
         "logger": logger,
@@ -383,7 +412,7 @@ def _build_trainer_kwargs(*, max_steps: int, validation_every_n_batches: int,
     }
 
 
-def _build_protocol_metadata(*, max_steps, validation_every_n_batches,
+def _build_protocol_metadata(*, max_steps, validation_every_n_epochs,
                              from_checkpoint, starting_weights,
                              encoder_training_mode, encoder_unfreeze_step,
                              resolution, reduce_ratio, batch_size,
@@ -395,7 +424,10 @@ def _build_protocol_metadata(*, max_steps, validation_every_n_batches,
                              attention_backend=None,
                              tokenization_mode=None,
                              num_workers=None,
-                             checkpoint_every_n_epochs=None):
+                             checkpoint_every_n_epochs=None,
+                             expected_training_batches_per_epoch=None,
+                             curriculum_steady_mixture_step=320_000,
+                             optimizer_metadata=None):
     if from_checkpoint is not None:
         checkpoint_source = from_checkpoint
         checkpoint_load_mode = "full"
@@ -410,11 +442,19 @@ def _build_protocol_metadata(*, max_steps, validation_every_n_batches,
     recorded_source_curriculum_step = source_curriculum_step
     if recorded_source_curriculum_step is None and checkpoint_state is not None:
         recorded_source_curriculum_step = checkpoint_state.curriculum_step
-    return {
+    validation_expected_count = None
+    if expected_training_batches_per_epoch:
+        validation_expected_count = max_steps // (
+            expected_training_batches_per_epoch * validation_every_n_epochs
+        )
+    metadata = {
         "protocol_version": protocol_version,
         "metric_version": METRIC_VERSION,
         "max_steps": max_steps,
-        "validation_every_n_batches": validation_every_n_batches,
+        "validation_every_n_epochs": validation_every_n_epochs,
+        "validation_first_epoch": validation_every_n_epochs,
+        "validation_expected_count": validation_expected_count,
+        "expected_training_batches_per_epoch": expected_training_batches_per_epoch,
         "checkpoint_monitor": CHECKPOINT_MONITOR,
         "checkpoint_source": checkpoint_source,
         "checkpoint_load_mode": checkpoint_load_mode,
@@ -432,6 +472,7 @@ def _build_protocol_metadata(*, max_steps, validation_every_n_batches,
         ),
         "encoder_training_mode": encoder_training_mode,
         "encoder_unfreeze_step": encoder_unfreeze_step,
+        "curriculum_steady_mixture_step": curriculum_steady_mixture_step,
         "finetuning_technique": finetuning_technique,
         "attention_backend": attention_backend,
         "tokenization_mode": tokenization_mode,
@@ -439,12 +480,18 @@ def _build_protocol_metadata(*, max_steps, validation_every_n_batches,
         "checkpoint_every_n_epochs": checkpoint_every_n_epochs,
         "resolution": resolution,
         "reduce_ratio": reduce_ratio,
-        "optimizer": "Adam",
-        "learning_rate": _globals.learning_rate,
         "precision": PRECISION,
         "batch_size": batch_size,
         "accumulate_grad_batches": ACCUMULATE_GRAD_BATCHES,
     }
+    if optimizer_metadata is not None:
+        collisions = set(metadata) & set(optimizer_metadata)
+        if collisions:
+            raise ValueError(
+                f"optimizer metadata collides with run metadata: {sorted(collisions)}"
+            )
+        metadata.update(optimizer_metadata)
+    return metadata
 
 
 def _run_record_directory(experiment_name: str, protocol_version: str,
@@ -614,19 +661,41 @@ def _run_test(trainer, model_wrapper, data, checkpoint_path):
 def main(config: ExperimentConfig, experiment_name,
          foundation_architecture="ViTMAEBase", foundation_weights="carlospm12/LSMT-MAE-Base-1024-16",
          finetuning_technique="CL", from_checkpoint: str | None = None, resolution: int | None = None,
-         max_steps: int = 320000, train: bool = True, starting_weights: str | None = None,
+         max_steps: int = 4_000_000, train: bool = True, starting_weights: str | None = None,
+         task_learning_rate: float | None = None,
+         learning_rate: float | None = None,
+         encoder_learning_rate: float = 1e-5, weight_decay: float = 0.01,
+         wsd_warmup_steps: int = 10_000, wsd_decay_steps: int = 400_000,
+         wsd_warmup_type: str = "linear", wsd_decay_type: str = "cosine",
+         wsd_min_lr_ratio: float = 0.0,
          attention_backend: str = "auto", checkpoint_every_n_epochs: int = 100,
          encoder_training_mode: str = "fine_tune",
-         validation_every_n_batches: int = 10000,
+         validation_every_n_epochs: int = 2_000,
          protocol_version: str = PROTOCOL_VERSION,
          source_curriculum_step: int | None = None,
          source_checkpoint_sha256: str | None = None):
     checkpoint_every_n_epochs = _validate_checkpoint_every_n_epochs(checkpoint_every_n_epochs)
-    validation_every_n_batches = _validate_validation_every_n_batches(
-        validation_every_n_batches
+    validation_every_n_epochs = _validate_validation_every_n_epochs(
+        validation_every_n_epochs
     )
     max_steps = _validate_max_steps(max_steps, train=train)
     encoder_training_mode = _validate_encoder_training_mode(encoder_training_mode)
+    protocol_version = _validate_protocol_version(protocol_version)
+    task_learning_rate = _normalize_task_learning_rate(
+        task_learning_rate,
+        learning_rate,
+    )
+    optimizer_config = AdamWWSDConfig(
+        task_learning_rate=task_learning_rate,
+        encoder_learning_rate=encoder_learning_rate,
+        weight_decay=weight_decay,
+        max_steps=max_steps,
+        warmup_steps=wsd_warmup_steps,
+        decay_steps=wsd_decay_steps,
+        warmup_type=wsd_warmup_type,
+        decay_type=wsd_decay_type,
+        min_lr_ratio=wsd_min_lr_ratio,
+    )
     from_checkpoint, starting_weights = _validate_checkpoint_sources(
         from_checkpoint,
         starting_weights,
@@ -640,6 +709,10 @@ def main(config: ExperimentConfig, experiment_name,
         protocol_version=protocol_version,
         source_curriculum_step=source_curriculum_step,
         source_checkpoint_sha256=source_checkpoint_sha256,
+        expected_optimizer_identity=_expected_optimizer_identity(
+            protocol_version,
+            optimizer_config,
+        ),
     )
     if resolution is None:
         _globals.resolution = 1024
@@ -693,6 +766,19 @@ def main(config: ExperimentConfig, experiment_name,
         data.num_workers,
     )
 
+    optimizer_wrapper_kwargs = {
+        "run_protocol_version": protocol_version,
+        "optimizer_protocol": optimizer_config.protocol,
+        "task_learning_rate": optimizer_config.task_learning_rate,
+        "encoder_learning_rate": optimizer_config.encoder_learning_rate,
+        "weight_decay": optimizer_config.weight_decay,
+        "max_steps": optimizer_config.max_steps,
+        "wsd_warmup_steps": optimizer_config.warmup_steps,
+        "wsd_decay_steps": optimizer_config.decay_steps,
+        "wsd_warmup_type": optimizer_config.warmup_type,
+        "wsd_decay_type": optimizer_config.decay_type,
+        "wsd_min_lr_ratio": optimizer_config.min_lr_ratio,
+    }
     if starting_weights is None:
         model_wrapper = SMTPP_Trainer(
             smt_config,
@@ -702,6 +788,7 @@ def main(config: ExperimentConfig, experiment_name,
             curriculum_step_offset=curriculum_step_offset,
             batch_size=data.batch_size,
             accumulate_grad_batches=ACCUMULATE_GRAD_BATCHES,
+            **optimizer_wrapper_kwargs,
         )
     else:
         model_wrapper = SMTPP_Trainer.load_from_checkpoint(
@@ -715,6 +802,7 @@ def main(config: ExperimentConfig, experiment_name,
             accumulate_grad_batches=ACCUMULATE_GRAD_BATCHES,
             enforce_checkpoint_protocol=False,
             weights_only=False,
+            **optimizer_wrapper_kwargs,
         )
         model_wrapper.enforce_checkpoint_protocol = True
 
@@ -731,7 +819,7 @@ def main(config: ExperimentConfig, experiment_name,
 
     protocol_metadata = _build_protocol_metadata(
         max_steps=max_steps,
-        validation_every_n_batches=validation_every_n_batches,
+        validation_every_n_epochs=validation_every_n_epochs,
         from_checkpoint=from_checkpoint,
         starting_weights=starting_weights,
         encoder_training_mode=encoder_training_mode,
@@ -748,6 +836,9 @@ def main(config: ExperimentConfig, experiment_name,
         tokenization_mode=data.tokenization_mode,
         num_workers=data.num_workers,
         checkpoint_every_n_epochs=checkpoint_every_n_epochs,
+        expected_training_batches_per_epoch=len(data.train_dataset),
+        curriculum_steady_mixture_step=320_000,
+        optimizer_metadata=model_wrapper.optimizer_protocol_metadata(),
     )
     run_record_id = uuid.uuid4().hex
     run_record_root = Path("logs") / "run_instances" / run_record_id
@@ -792,7 +883,7 @@ def main(config: ExperimentConfig, experiment_name,
 
     trainer = Trainer(**_build_trainer_kwargs(
         max_steps=max_steps,
-        validation_every_n_batches=validation_every_n_batches,
+        validation_every_n_epochs=validation_every_n_epochs,
         callbacks=trainer_callbacks,
         logger=wandb_logger,
     ))
@@ -818,20 +909,30 @@ def main(config: ExperimentConfig, experiment_name,
 def launch(config_path: str, experiment_name: str,
            foundation_architecture="ViTMAEBase", foundation_weights="carlospm12/LSMT-MAE-Base-1024-16",
            finetuning: str = "CL", from_checkpoint: str | None = None, resolution: int | None = None,
-           max_steps: int = 320000, train: bool = True, starting_weights: str | None = None,
-           learning_rate: float | None = None, attention_backend: str = "auto",
+           max_steps: int = 4_000_000, train: bool = True, starting_weights: str | None = None,
+           task_learning_rate: float | None = None,
+           learning_rate: float | None = None,
+           encoder_learning_rate: float = 1e-5, weight_decay: float = 0.01,
+           wsd_warmup_steps: int = 10_000, wsd_decay_steps: int = 400_000,
+           wsd_warmup_type: str = "linear", wsd_decay_type: str = "cosine",
+           wsd_min_lr_ratio: float = 0.0, attention_backend: str = "auto",
            checkpoint_every_n_epochs: int = 100,
            encoder_training_mode: str = "fine_tune",
-           validation_every_n_batches: int = 10000,
+           validation_every_n_epochs: int = 2_000,
            protocol_version: str = PROTOCOL_VERSION,
            source_curriculum_step: int | None = None,
            source_checkpoint_sha256: str | None = None):
     checkpoint_every_n_epochs = _validate_checkpoint_every_n_epochs(checkpoint_every_n_epochs)
-    validation_every_n_batches = _validate_validation_every_n_batches(
-        validation_every_n_batches
+    validation_every_n_epochs = _validate_validation_every_n_epochs(
+        validation_every_n_epochs
     )
     max_steps = _validate_max_steps(max_steps, train=train)
     encoder_training_mode = _validate_encoder_training_mode(encoder_training_mode)
+    protocol_version = _validate_protocol_version(protocol_version)
+    task_learning_rate = _normalize_task_learning_rate(
+        task_learning_rate,
+        learning_rate,
+    )
     from_checkpoint, starting_weights = _validate_checkpoint_sources(
         from_checkpoint,
         starting_weights,
@@ -840,16 +941,18 @@ def launch(config_path: str, experiment_name: str,
         config_dict = json.load(file)
         config = experiment_config_from_dict(config_dict)
 
-    if learning_rate is not None:
-        _globals.learning_rate = learning_rate
-
     main(config=config, experiment_name=experiment_name,
          foundation_architecture=foundation_architecture,
          foundation_weights=foundation_weights, finetuning_technique=finetuning, from_checkpoint=from_checkpoint,
          resolution=resolution, max_steps=max_steps, train=train, starting_weights=starting_weights,
+         task_learning_rate=task_learning_rate,
+         encoder_learning_rate=encoder_learning_rate, weight_decay=weight_decay,
+         wsd_warmup_steps=wsd_warmup_steps, wsd_decay_steps=wsd_decay_steps,
+         wsd_warmup_type=wsd_warmup_type, wsd_decay_type=wsd_decay_type,
+         wsd_min_lr_ratio=wsd_min_lr_ratio,
          attention_backend=attention_backend, checkpoint_every_n_epochs=checkpoint_every_n_epochs,
          encoder_training_mode=encoder_training_mode,
-         validation_every_n_batches=validation_every_n_batches,
+         validation_every_n_epochs=validation_every_n_epochs,
          protocol_version=protocol_version,
          source_curriculum_step=source_curriculum_step,
          source_checkpoint_sha256=source_checkpoint_sha256)

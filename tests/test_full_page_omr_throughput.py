@@ -71,11 +71,16 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
         self.assertEqual(signature.parameters["checkpoint_every_n_epochs"].default, 100)
         self.assertEqual(signature.parameters["attention_backend"].default, "auto")
         self.assertEqual(signature.parameters["encoder_training_mode"].default, "fine_tune")
-        self.assertEqual(signature.parameters["validation_every_n_batches"].default, 10000)
-        self.assertEqual(signature.parameters["max_steps"].default, 320000)
+        self.assertEqual(signature.parameters["validation_every_n_epochs"].default, 2_000)
+        self.assertEqual(signature.parameters["max_steps"].default, 4_000_000)
+        self.assertEqual(signature.parameters["task_learning_rate"].default, None)
+        self.assertEqual(signature.parameters["encoder_learning_rate"].default, 1e-5)
+        self.assertEqual(signature.parameters["weight_decay"].default, 0.01)
+        self.assertEqual(signature.parameters["wsd_warmup_steps"].default, 10_000)
+        self.assertEqual(signature.parameters["wsd_decay_steps"].default, 400_000)
         self.assertEqual(
             signature.parameters["protocol_version"].default,
-            "full_page_omr_eval_v2",
+            "full_page_omr_adamw_wsd_4m_v1",
         )
 
         config_path = REPO_ROOT / "experiments/full_page_omr/config/Polish_Scores/finetuning.json"
@@ -86,7 +91,12 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                 checkpoint_every_n_epochs=37,
                 attention_backend="sdpa",
                 encoder_training_mode="linear_probe",
-                validation_every_n_batches=25000,
+                validation_every_n_epochs=2500,
+                task_learning_rate=2e-4,
+                encoder_learning_rate=2e-5,
+                weight_decay=0.02,
+                wsd_warmup_steps=20_000,
+                wsd_decay_steps=500_000,
                 protocol_version="full_page_omr_resize_v1",
                 source_curriculum_step=282200,
                 source_checkpoint_sha256="a" * 64,
@@ -95,7 +105,12 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
         self.assertEqual(launch.call_args.kwargs["checkpoint_every_n_epochs"], 37)
         self.assertEqual(launch.call_args.kwargs["attention_backend"], "sdpa")
         self.assertEqual(launch.call_args.kwargs["encoder_training_mode"], "linear_probe")
-        self.assertEqual(launch.call_args.kwargs["validation_every_n_batches"], 25000)
+        self.assertEqual(launch.call_args.kwargs["validation_every_n_epochs"], 2500)
+        self.assertEqual(launch.call_args.kwargs["task_learning_rate"], 2e-4)
+        self.assertEqual(launch.call_args.kwargs["encoder_learning_rate"], 2e-5)
+        self.assertEqual(launch.call_args.kwargs["weight_decay"], 0.02)
+        self.assertEqual(launch.call_args.kwargs["wsd_warmup_steps"], 20_000)
+        self.assertEqual(launch.call_args.kwargs["wsd_decay_steps"], 500_000)
         self.assertEqual(
             launch.call_args.kwargs["protocol_version"],
             "full_page_omr_resize_v1",
@@ -123,7 +138,12 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                     "test-run",
                     checkpoint_every_n_epochs=37,
                     encoder_training_mode="linear_probe",
-                    validation_every_n_batches=25000,
+                    validation_every_n_epochs=2500,
+                    task_learning_rate=2e-4,
+                    encoder_learning_rate=2e-5,
+                    weight_decay=0.02,
+                    wsd_warmup_steps=20_000,
+                    wsd_decay_steps=500_000,
                     protocol_version="full_page_omr_resize_v1",
                     source_curriculum_step=282200,
                     source_checkpoint_sha256="a" * 64,
@@ -131,8 +151,13 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
 
         self.assertEqual(main.call_args.kwargs["checkpoint_every_n_epochs"], 37)
         self.assertEqual(main.call_args.kwargs["encoder_training_mode"], "linear_probe")
-        self.assertEqual(main.call_args.kwargs["validation_every_n_batches"], 25000)
-        self.assertEqual(main.call_args.kwargs["max_steps"], 320000)
+        self.assertEqual(main.call_args.kwargs["validation_every_n_epochs"], 2500)
+        self.assertEqual(main.call_args.kwargs["max_steps"], 4_000_000)
+        self.assertEqual(main.call_args.kwargs["task_learning_rate"], 2e-4)
+        self.assertEqual(main.call_args.kwargs["encoder_learning_rate"], 2e-5)
+        self.assertEqual(main.call_args.kwargs["weight_decay"], 0.02)
+        self.assertEqual(main.call_args.kwargs["wsd_warmup_steps"], 20_000)
+        self.assertEqual(main.call_args.kwargs["wsd_decay_steps"], 500_000)
         self.assertEqual(
             main.call_args.kwargs["protocol_version"],
             "full_page_omr_resize_v1",
@@ -150,14 +175,127 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
     def test_validation_interval_and_production_max_steps_are_validated(self):
         for value in (0, -1, True, 1.5):
             with self.subTest(interval=value), self.assertRaises(ValueError):
-                finetune._validate_validation_every_n_batches(value)
-        self.assertEqual(finetune._validate_validation_every_n_batches(10000), 10000)
+                finetune._validate_validation_every_n_epochs(value)
+        self.assertEqual(finetune._validate_validation_every_n_epochs(2000), 2000)
 
         for value in (0, -1, True, 1.5):
             with self.subTest(max_steps=value), self.assertRaises(ValueError):
                 finetune._validate_max_steps(value, train=True)
-        self.assertEqual(finetune._validate_max_steps(320000, train=True), 320000)
+        self.assertEqual(finetune._validate_max_steps(4_000_000, train=True), 4_000_000)
         self.assertEqual(finetune._validate_max_steps(-1, train=False), -1)
+
+    def test_deprecated_learning_rate_alias_is_normalized(self):
+        self.assertEqual(finetune._normalize_task_learning_rate(None, None), 1e-4)
+        self.assertEqual(finetune._normalize_task_learning_rate(2e-4, None), 2e-4)
+        self.assertEqual(finetune._normalize_task_learning_rate(None, 3e-4), 3e-4)
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            finetune._normalize_task_learning_rate(2e-4, 3e-4)
+        for value in (0, -1e-4, True, "1e-4"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "positive"):
+                finetune._normalize_task_learning_rate(value, None)
+
+    def test_main_passes_exact_optimizer_identity_to_full_resume_contract(self):
+        config = SimpleNamespace(data=SimpleNamespace(skip_steps=0))
+        with patch.object(
+            finetune,
+            "_validate_run_contract",
+            side_effect=RuntimeError("contract captured"),
+        ) as validate_contract:
+            with self.assertRaisesRegex(RuntimeError, "contract captured"):
+                finetune.main(
+                    config,
+                    "test-run",
+                    from_checkpoint="resume.ckpt",
+                    max_steps=4_000_000,
+                    task_learning_rate=2e-4,
+                    encoder_learning_rate=2e-5,
+                    weight_decay=0.02,
+                    wsd_warmup_steps=20_000,
+                    wsd_decay_steps=500_000,
+                )
+
+        self.assertEqual(
+            validate_contract.call_args.kwargs["expected_optimizer_identity"],
+            {
+                "run_protocol_version": finetune.PROTOCOL_VERSION,
+                "optimizer_protocol": "adamw_wsd_v1",
+                "task_learning_rate": 2e-4,
+                "encoder_learning_rate": 2e-5,
+                "weight_decay": 0.02,
+                "max_steps": 4_000_000,
+                "wsd_warmup_steps": 20_000,
+                "wsd_decay_steps": 500_000,
+                "wsd_warmup_type": "linear",
+                "wsd_decay_type": "cosine",
+                "wsd_min_lr_ratio": 0.0,
+            },
+        )
+
+    def test_main_passes_optimizer_arguments_to_fresh_and_weights_only_wrappers(self):
+        train_dataset = SimpleNamespace(w2i={"<pad>": 0}, i2w={0: "<pad>"})
+        data_module = SimpleNamespace(
+            train_dataset=train_dataset,
+            encoder_unfreeze_step=120_000,
+            curriculum_step_offset=0,
+            tokenization_mode="bekern",
+            batch_size=1,
+            num_workers=0,
+        )
+        config = SimpleNamespace(data=SimpleNamespace(skip_steps=0, reduce_ratio=0.5))
+        model = SimpleNamespace(
+            encoder=SimpleNamespace(config=SimpleNamespace(patch_size=16))
+        )
+        optimizer_kwargs = {
+            "run_protocol_version": finetune.PROTOCOL_VERSION,
+            "task_learning_rate": 2e-4,
+            "encoder_learning_rate": 2e-5,
+            "weight_decay": 0.02,
+            "max_steps": 4_000_000,
+            "wsd_warmup_steps": 20_000,
+            "wsd_decay_steps": 500_000,
+            "wsd_warmup_type": "linear",
+            "wsd_decay_type": "cosine",
+            "wsd_min_lr_ratio": 0.0,
+        }
+
+        for starting_weights in (None, "weights.ckpt"):
+            with self.subTest(starting_weights=starting_weights):
+                trainer_class = Mock()
+                trainer_class.side_effect = RuntimeError("wrapper captured")
+                trainer_class.load_from_checkpoint.side_effect = RuntimeError(
+                    "wrapper captured"
+                )
+                with (
+                    patch.object(finetune, "_validate_run_contract", return_value=None),
+                    patch.dict(finetune.DATASETS_TYPE, {"CL": lambda _: data_module}),
+                    patch.object(finetune, "set_up_processor"),
+                    patch.object(finetune, "SMTFoundationConfig", return_value=object()),
+                    patch.object(
+                        finetune,
+                        "SMTFoundationModelForCausalLM",
+                        return_value=model,
+                    ),
+                    patch.object(finetune, "SMTPP_Trainer", trainer_class),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "wrapper captured"):
+                        finetune.main(
+                            config,
+                            "test-run",
+                            starting_weights=starting_weights,
+                            task_learning_rate=2e-4,
+                            encoder_learning_rate=2e-5,
+                            weight_decay=0.02,
+                            wsd_warmup_steps=20_000,
+                            wsd_decay_steps=500_000,
+                        )
+
+                call = (
+                    trainer_class.call_args
+                    if starting_weights is None
+                    else trainer_class.load_from_checkpoint.call_args
+                )
+                for key, value in optimizer_kwargs.items():
+                    self.assertEqual(call.kwargs[key], value)
 
     def test_encoder_training_mode_is_validated(self):
         self.assertEqual(finetune._validate_encoder_training_mode("fine_tune"), "fine_tune")
@@ -430,7 +568,7 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
             )
             metadata = finetune._build_protocol_metadata(
                 max_steps=100,
-                validation_every_n_batches=10,
+                validation_every_n_epochs=10,
                 from_checkpoint=str(current),
                 starting_weights=None,
                 encoder_training_mode="fine_tune",
@@ -553,29 +691,43 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
         self.assertIn("{step}", checkpointer.filename)
         self.assertIn("{val_SER_v2:.4f}", checkpointer.filename)
 
-    def test_trainer_kwargs_use_step_based_validation_without_early_stopping(self):
+    def test_trainer_kwargs_use_epoch_validation_without_early_stopping(self):
         callbacks = [object(), object()]
         logger = object()
 
         kwargs = finetune._build_trainer_kwargs(
-            max_steps=320000,
-            validation_every_n_batches=10000,
+            max_steps=4_000_000,
+            validation_every_n_epochs=2_000,
             callbacks=callbacks,
             logger=logger,
         )
 
-        self.assertEqual(kwargs["max_steps"], 320000)
-        self.assertIsNone(kwargs["check_val_every_n_epoch"])
-        self.assertEqual(kwargs["val_check_interval"], 10000)
+        self.assertEqual(kwargs["max_steps"], 4_000_000)
+        self.assertEqual(kwargs["max_epochs"], 100_000)
+        self.assertEqual(kwargs["check_val_every_n_epoch"], 2_000)
+        self.assertEqual(kwargs["val_check_interval"], 1.0)
+        self.assertEqual(kwargs["num_sanity_val_steps"], 0)
         self.assertEqual(kwargs["callbacks"], callbacks)
         self.assertEqual(len(kwargs["callbacks"]), 2)
         self.assertEqual(kwargs["precision"], "16-mixed")
         self.assertEqual(kwargs["accumulate_grad_batches"], 1)
 
     def test_protocol_metadata_records_metric_and_run_contract(self):
+        optimizer_metadata = {
+            "optimizer": "AdamW",
+            "optimizer_protocol": "adamw_wsd_v1",
+            "task_learning_rate": 1e-4,
+            "encoder_learning_rate": 1e-5,
+            "weight_decay": 0.01,
+            "scheduler": "transformers.get_wsd_schedule",
+            "wsd_max_steps": 4_000_000,
+            "wsd_warmup_steps": 10_000,
+            "wsd_stable_steps": 3_590_000,
+            "wsd_decay_steps": 400_000,
+        }
         metadata = finetune._build_protocol_metadata(
-            max_steps=320000,
-            validation_every_n_batches=10000,
+            max_steps=4_000_000,
+            validation_every_n_epochs=2_000,
             from_checkpoint=None,
             starting_weights=None,
             encoder_training_mode="fine_tune",
@@ -583,15 +735,26 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
             resolution=1024,
             reduce_ratio=0.5,
             batch_size=1,
+            expected_training_batches_per_epoch=83,
+            curriculum_steady_mixture_step=320_000,
+            optimizer_metadata=optimizer_metadata,
         )
 
-        self.assertEqual(metadata["protocol_version"], "full_page_omr_eval_v2")
+        self.assertEqual(metadata["protocol_version"], "full_page_omr_adamw_wsd_4m_v1")
         self.assertEqual(metadata["metric_version"], "canonical_v2")
         self.assertEqual(metadata["checkpoint_monitor"], "val_SER_v2")
         self.assertEqual(metadata["checkpoint_source"], "foundation")
         self.assertEqual(metadata["checkpoint_load_mode"], "fresh")
         self.assertEqual(metadata["accumulate_grad_batches"], 1)
         self.assertEqual(metadata["reduce_ratio"], 0.5)
+        self.assertEqual(metadata["validation_every_n_epochs"], 2_000)
+        self.assertEqual(metadata["validation_first_epoch"], 2_000)
+        self.assertEqual(metadata["validation_expected_count"], 24)
+        self.assertEqual(metadata["expected_training_batches_per_epoch"], 83)
+        self.assertEqual(metadata["curriculum_steady_mixture_step"], 320_000)
+        self.assertEqual(metadata["optimizer"], "AdamW")
+        self.assertEqual(metadata["wsd_stable_steps"], 3_590_000)
+        self.assertNotIn("learning_rate", metadata)
 
     def test_protocol_metadata_is_archived_locally(self):
         metadata = {"protocol_version": "full_page_omr_resize_v1", "max_steps": 20000}
