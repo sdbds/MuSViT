@@ -11,7 +11,12 @@ from .eval.eval_functions import (
     compute_canonical_metrics,
 )
 
-from . import _globals
+from .optimization import (
+    AdamWWSDConfig,
+    build_adamw,
+    build_wsd_scheduler,
+    optimizer_protocol_metadata,
+)
 
 
 ENCODER_TRAINING_MODES = frozenset({"fine_tune", "linear_probe"})
@@ -34,7 +39,18 @@ class SMTPP_Trainer(L.LightningModule):
     def __init__(self, smt_config, smt_model, encoder_training_mode="fine_tune",
                  encoder_unfreeze_step=None, curriculum_step_offset=0,
                  batch_size=1, accumulate_grad_batches=1,
-                 enforce_checkpoint_protocol=True):
+                 enforce_checkpoint_protocol=True,
+                 run_protocol_version="full_page_omr_adamw_wsd_4m_v1",
+                 optimizer_protocol="adamw_wsd_v1",
+                 task_learning_rate=1e-4,
+                 encoder_learning_rate=1e-5,
+                 weight_decay=0.01,
+                 max_steps=4_000_000,
+                 wsd_warmup_steps=10_000,
+                 wsd_decay_steps=400_000,
+                 wsd_warmup_type="linear",
+                 wsd_decay_type="cosine",
+                 wsd_min_lr_ratio=0.0):
         super().__init__()
         if (
             not isinstance(encoder_training_mode, str)
@@ -71,6 +87,18 @@ class SMTPP_Trainer(L.LightningModule):
         self.accumulate_grad_batches = accumulate_grad_batches
         self.enforce_checkpoint_protocol = enforce_checkpoint_protocol
         self.samples_seen = 0
+        self.optimizer_config = AdamWWSDConfig(
+            protocol=optimizer_protocol,
+            task_learning_rate=task_learning_rate,
+            encoder_learning_rate=encoder_learning_rate,
+            weight_decay=weight_decay,
+            max_steps=max_steps,
+            warmup_steps=wsd_warmup_steps,
+            decay_steps=wsd_decay_steps,
+            warmup_type=wsd_warmup_type,
+            decay_type=wsd_decay_type,
+            min_lr_ratio=wsd_min_lr_ratio,
+        )
 
         self.preds = []
         self.grtrs = []
@@ -80,7 +108,20 @@ class SMTPP_Trainer(L.LightningModule):
         self.unfrozen_vision = False
     
     def configure_optimizers(self):
-        return torch.optim.Adam(list(self.model.parameters()), lr=_globals.learning_rate, amsgrad=False)
+        optimizer = build_adamw(self.model, self.optimizer_config)
+        scheduler = build_wsd_scheduler(optimizer, self.optimizer_config)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+                "name": "wsd",
+            },
+        }
+
+    def optimizer_protocol_metadata(self):
+        return optimizer_protocol_metadata(self.model, self.optimizer_config)
     
     def forward(self, input, last_preds):
         return self.model(input, last_preds)

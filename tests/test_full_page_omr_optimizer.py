@@ -7,6 +7,7 @@ from experiments.full_page_omr.optimization import (
     AdamWWSDConfig,
     build_adamw,
     build_adamw_parameter_groups,
+    build_wsd_scheduler,
 )
 
 
@@ -88,3 +89,41 @@ class AdamWWSDParameterGroupTests(unittest.TestCase):
         parameter.grad = torch.ones_like(parameter)
         optimizer.step()
         self.assertFalse(torch.equal(parameter, before))
+
+
+class AdamWWSDTransitionTests(unittest.TestCase):
+    def setUp(self):
+        self.model = TinyOMRModel()
+        self.config = AdamWWSDConfig()
+
+    def test_wsd_lambda_boundaries(self):
+        optimizer = build_adamw(self.model, self.config)
+        scheduler = build_wsd_scheduler(optimizer, self.config)
+        lr_lambda = scheduler.lr_lambdas[0]
+        self.assertEqual(lr_lambda(0), 0.0)
+        self.assertEqual(lr_lambda(10_000), 1.0)
+        self.assertEqual(lr_lambda(3_600_000), 1.0)
+        self.assertEqual(lr_lambda(4_000_000), 0.0)
+
+    def test_optimizer_and_scheduler_state_resume_without_lr_jump(self):
+        optimizer = build_adamw(self.model, self.config)
+        scheduler = build_wsd_scheduler(optimizer, self.config)
+        for _ in range(25):
+            optimizer.step()
+            scheduler.step()
+        optimizer_state = optimizer.state_dict()
+        scheduler_state = scheduler.state_dict()
+        expected_lr = scheduler.get_last_lr()
+
+        restored_model = TinyOMRModel()
+        restored_optimizer = build_adamw(restored_model, self.config)
+        restored_scheduler = build_wsd_scheduler(restored_optimizer, self.config)
+        restored_optimizer.load_state_dict(optimizer_state)
+        restored_scheduler.load_state_dict(scheduler_state)
+        self.assertEqual(restored_scheduler.get_last_lr(), expected_lr)
+
+        optimizer.step()
+        scheduler.step()
+        restored_optimizer.step()
+        restored_scheduler.step()
+        self.assertEqual(restored_scheduler.get_last_lr(), scheduler.get_last_lr())

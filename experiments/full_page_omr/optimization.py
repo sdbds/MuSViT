@@ -2,6 +2,7 @@ from dataclasses import asdict, dataclass
 
 import torch
 from torch import nn
+from transformers.optimization import get_wsd_schedule
 
 
 OPTIMIZER_PROTOCOL = "adamw_wsd_v1"
@@ -129,3 +130,50 @@ def build_adamw(model: nn.Module, config: AdamWWSDConfig) -> torch.optim.AdamW:
         eps=config.eps,
         amsgrad=config.amsgrad,
     )
+
+
+def build_wsd_scheduler(optimizer, config: AdamWWSDConfig):
+    return get_wsd_schedule(
+        optimizer,
+        num_warmup_steps=config.warmup_steps,
+        num_decay_steps=config.decay_steps,
+        num_training_steps=config.max_steps,
+        warmup_type=config.warmup_type,
+        decay_type=config.decay_type,
+        min_lr_ratio=config.min_lr_ratio,
+        num_cycles=config.num_cycles,
+    )
+
+
+def optimizer_protocol_metadata(model: nn.Module, config: AdamWWSDConfig) -> dict:
+    groups = build_adamw_parameter_groups(model, config)
+    return {
+        "optimizer": "AdamW",
+        "optimizer_protocol": config.protocol,
+        "optimizer_betas": list(config.betas),
+        "optimizer_eps": config.eps,
+        "optimizer_amsgrad": config.amsgrad,
+        "optimizer_groups": [
+            {
+                "name": group["name"],
+                "parameter_count": sum(parameter.numel() for parameter in group["params"]),
+                "learning_rate": group["lr"],
+                "weight_decay": group["weight_decay"],
+            }
+            for group in groups
+        ],
+        "scheduler": "transformers.get_wsd_schedule",
+        "scheduler_interval": "step",
+        "scheduler_frequency": 1,
+        "wsd_max_steps": config.max_steps,
+        "wsd_warmup_steps": config.warmup_steps,
+        "wsd_stable_steps": config.stable_steps,
+        "wsd_decay_steps": config.decay_steps,
+        "wsd_warmup_type": config.warmup_type,
+        "wsd_decay_type": config.decay_type,
+        "wsd_min_lr_ratio": config.min_lr_ratio,
+        "wsd_num_cycles": config.num_cycles,
+        "task_learning_rate": config.task_learning_rate,
+        "encoder_learning_rate": config.encoder_learning_rate,
+        "weight_decay": config.weight_decay,
+    }

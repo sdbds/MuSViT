@@ -32,7 +32,8 @@ class _TinyModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.ones(()))
-        self.encoder = torch.nn.Linear(1, 1, bias=False)
+        self.task_bias = torch.nn.Parameter(torch.zeros(()))
+        self.encoder = torch.nn.Linear(1, 1)
 
     def freeze_encoder(self):
         for parameter in self.encoder.parameters():
@@ -566,6 +567,20 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
 
 
 class SMTPPTrainerThroughputTests(unittest.TestCase):
+    def test_configure_optimizers_uses_step_based_adamw_wsd(self):
+        module = SMTPP_Trainer(
+            SimpleNamespace(padding_token=0),
+            _TinyModel(),
+            encoder_training_mode="fine_tune",
+            encoder_unfreeze_step=120000,
+        )
+
+        configured = module.configure_optimizers()
+
+        self.assertIsInstance(configured["optimizer"], torch.optim.AdamW)
+        self.assertEqual(configured["lr_scheduler"]["interval"], "step")
+        self.assertEqual(configured["lr_scheduler"]["frequency"], 1)
+
     def test_hyperparameters_do_not_serialize_model_object(self):
         module = SMTPP_Trainer(
             SimpleNamespace(padding_token=0),
