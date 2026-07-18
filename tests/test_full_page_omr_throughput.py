@@ -28,6 +28,23 @@ def _sha256_file(path):
     return digest.hexdigest()
 
 
+def _optimizer_identity(*, max_steps=4_000_000,
+                        run_protocol_version="full_page_omr_adamw_wsd_4m_v1"):
+    return {
+        "run_protocol_version": run_protocol_version,
+        "optimizer_protocol": "adamw_wsd_v1",
+        "task_learning_rate": 1e-4,
+        "encoder_learning_rate": 1e-5,
+        "weight_decay": 0.01,
+        "max_steps": max_steps,
+        "wsd_warmup_steps": 10_000,
+        "wsd_decay_steps": 400_000,
+        "wsd_warmup_type": "linear",
+        "wsd_decay_type": "cosine",
+        "wsd_min_lr_ratio": 0.0,
+    }
+
+
 class _TinyModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -174,6 +191,81 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                     source_checkpoint_sha256=None,
                 )
 
+    def test_full_resume_rejects_checkpoint_without_optimizer_identity(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint = Path(tmpdir) / "legacy-adam.ckpt"
+            torch.save(
+                {
+                    "global_step": 40,
+                    "full_page_omr_samples_seen": 40,
+                    "hyper_parameters": {"curriculum_step_offset": 0},
+                },
+                checkpoint,
+            )
+
+            with self.assertRaisesRegex(ValueError, "optimizer protocol"):
+                finetune._validate_run_contract(
+                    config=SimpleNamespace(data=SimpleNamespace(skip_steps=0)),
+                    from_checkpoint=str(checkpoint),
+                    starting_weights=None,
+                    max_steps=4_000_000,
+                    train=True,
+                    protocol_version="full_page_omr_adamw_wsd_4m_v1",
+                    source_curriculum_step=None,
+                    source_checkpoint_sha256=None,
+                    expected_optimizer_identity=_optimizer_identity(),
+                )
+
+    def test_full_resume_requires_requested_max_steps_to_match_wsd_total(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint = Path(tmpdir) / "resume.ckpt"
+            torch.save(
+                {
+                    "global_step": 40,
+                    "full_page_omr_samples_seen": 40,
+                    "hyper_parameters": {
+                        "curriculum_step_offset": 0,
+                        **_optimizer_identity(),
+                    },
+                },
+                checkpoint,
+            )
+
+            with self.assertRaisesRegex(ValueError, "max_steps.*WSD total"):
+                finetune._validate_run_contract(
+                    config=SimpleNamespace(data=SimpleNamespace(skip_steps=0)),
+                    from_checkpoint=str(checkpoint),
+                    starting_weights=None,
+                    max_steps=4_000_001,
+                    train=True,
+                    protocol_version="full_page_omr_adamw_wsd_4m_v1",
+                    source_curriculum_step=None,
+                    source_checkpoint_sha256=None,
+                    expected_optimizer_identity={
+                        **_optimizer_identity(),
+                        "max_steps": 4_000_001,
+                    },
+                )
+
+    def test_weights_only_load_ignores_source_optimizer_identity(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint = Path(tmpdir) / "legacy-weights.ckpt"
+            torch.save({"global_step": 40}, checkpoint)
+
+            state = finetune._validate_run_contract(
+                config=SimpleNamespace(data=SimpleNamespace(skip_steps=40)),
+                from_checkpoint=None,
+                starting_weights=str(checkpoint),
+                max_steps=4_000_000,
+                train=True,
+                protocol_version="weights_only_fork_v1",
+                source_curriculum_step=40,
+                source_checkpoint_sha256=_sha256_file(checkpoint),
+                expected_optimizer_identity=_optimizer_identity(),
+            )
+
+        self.assertIsNone(state.optimizer_identity)
+
     def test_full_resume_rejects_curriculum_offset_mismatch(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             legacy = Path(tmpdir) / "legacy.ckpt"
@@ -195,7 +287,13 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                 {
                     "global_step": 40,
                     "full_page_omr_samples_seen": 30,
-                    "hyper_parameters": {"curriculum_step_offset": 10},
+                    "hyper_parameters": {
+                        "curriculum_step_offset": 10,
+                        **_optimizer_identity(
+                            max_steps=100,
+                            run_protocol_version=finetune.PROTOCOL_VERSION,
+                        ),
+                    },
                 },
                 current,
             )
@@ -223,6 +321,13 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
             )
 
         self.assertEqual(state.curriculum_step_offset, 10)
+        self.assertEqual(
+            state.optimizer_identity,
+            _optimizer_identity(
+                max_steps=100,
+                run_protocol_version=finetune.PROTOCOL_VERSION,
+            ),
+        )
 
     def test_full_resume_records_checkpoint_provenance(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -231,7 +336,13 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                 {
                     "global_step": 40,
                     "full_page_omr_samples_seen": 30,
-                    "hyper_parameters": {"curriculum_step_offset": 10},
+                    "hyper_parameters": {
+                        "curriculum_step_offset": 10,
+                        **_optimizer_identity(
+                            max_steps=100,
+                            run_protocol_version=finetune.PROTOCOL_VERSION,
+                        ),
+                    },
                 },
                 current,
             )
@@ -567,6 +678,20 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
 
 
 class SMTPPTrainerThroughputTests(unittest.TestCase):
+    def _full_checkpoint(self, module, **hyper_parameter_overrides):
+        configured = module.configure_optimizers()
+        hyper_parameters = dict(module.hparams)
+        hyper_parameters.update(hyper_parameter_overrides)
+        return {
+            "global_step": 0,
+            "full_page_omr_samples_seen": 0,
+            "hyper_parameters": hyper_parameters,
+            "optimizer_states": [configured["optimizer"].state_dict()],
+            "lr_schedulers": [
+                configured["lr_scheduler"]["scheduler"].state_dict()
+            ],
+        }
+
     def test_configure_optimizers_uses_step_based_adamw_wsd(self):
         module = SMTPP_Trainer(
             SimpleNamespace(padding_token=0),
@@ -650,29 +775,110 @@ class SMTPPTrainerThroughputTests(unittest.TestCase):
             encoder_training_mode="fine_tune",
             encoder_unfreeze_step=120000,
         )
-        checkpoint = {
-            "hyper_parameters": {
-                "encoder_training_mode": "linear_probe",
-                "encoder_unfreeze_step": 120000,
-            }
-        }
+        checkpoint = self._full_checkpoint(
+            module,
+            encoder_training_mode="linear_probe",
+        )
 
         with self.assertRaisesRegex(ValueError, "encoder_training_mode"):
             module.on_load_checkpoint(checkpoint)
 
-    def test_legacy_checkpoint_uses_explicit_protocol_with_warning(self):
+    def test_full_resume_rejects_legacy_adam_checkpoint(self):
         module = SMTPP_Trainer(
             SimpleNamespace(padding_token=0),
             _TinyModel(),
             encoder_training_mode="fine_tune",
             encoder_unfreeze_step=120000,
         )
+        checkpoint = {"hyper_parameters": {
+            "encoder_training_mode": "fine_tune",
+            "encoder_unfreeze_step": 120000,
+            "curriculum_step_offset": 0,
+        }}
 
-        with patch.object(smt_trainer.logger, "warning") as warning:
-            module.on_load_checkpoint({"hyper_parameters": {}, "global_step": 73})
+        with self.assertRaisesRegex(ValueError, "optimizer protocol"):
+            module.on_load_checkpoint(checkpoint)
 
-        self.assertEqual(module.samples_seen, 73)
-        self.assertEqual(warning.call_count, 2)
+    def test_weights_only_load_may_bypass_legacy_optimizer_protocol(self):
+        module = SMTPP_Trainer(
+            SimpleNamespace(padding_token=0),
+            _TinyModel(),
+            encoder_unfreeze_step=120000,
+            enforce_checkpoint_protocol=False,
+        )
+
+        module.on_load_checkpoint({"hyper_parameters": {}})
+
+    def test_full_resume_accepts_exact_adamw_wsd_identity(self):
+        module = SMTPP_Trainer(
+            SimpleNamespace(padding_token=0),
+            _TinyModel(),
+            encoder_unfreeze_step=120000,
+        )
+        configured = module.configure_optimizers()
+        checkpoint = {
+            "hyper_parameters": dict(module.hparams),
+            "optimizer_states": [configured["optimizer"].state_dict()],
+            "lr_schedulers": [
+                configured["lr_scheduler"]["scheduler"].state_dict()
+            ],
+        }
+
+        module.on_load_checkpoint(checkpoint)
+
+    def test_full_resume_rejects_optimizer_identity_mismatch(self):
+        module = SMTPP_Trainer(
+            SimpleNamespace(padding_token=0),
+            _TinyModel(),
+            encoder_unfreeze_step=120000,
+        )
+        checkpoint = self._full_checkpoint(module, task_learning_rate=2e-4)
+
+        with self.assertRaisesRegex(ValueError, "optimizer protocol mismatch"):
+            module.on_load_checkpoint(checkpoint)
+
+    def test_full_resume_requires_one_optimizer_and_scheduler_state(self):
+        module = SMTPP_Trainer(
+            SimpleNamespace(padding_token=0),
+            _TinyModel(),
+            encoder_unfreeze_step=120000,
+        )
+        checkpoint = self._full_checkpoint(module)
+
+        for field, value, message in (
+            ("optimizer_states", [], "one AdamW optimizer state"),
+            ("optimizer_states", checkpoint["optimizer_states"] * 2,
+             "one AdamW optimizer state"),
+            ("lr_schedulers", [], "one WSD scheduler state"),
+            ("lr_schedulers", checkpoint["lr_schedulers"] * 2,
+             "one WSD scheduler state"),
+        ):
+            with self.subTest(field=field, count=len(value)):
+                malformed = {**checkpoint, field: value}
+                with self.assertRaisesRegex(ValueError, message):
+                    module.on_load_checkpoint(malformed)
+
+    def test_full_resume_rejects_changed_optimizer_group_schema(self):
+        module = SMTPP_Trainer(
+            SimpleNamespace(padding_token=0),
+            _TinyModel(),
+            encoder_unfreeze_step=120000,
+        )
+        checkpoint = self._full_checkpoint(module)
+
+        mutations = {
+            "missing": lambda groups: groups.pop(),
+            "reordered": lambda groups: groups.reverse(),
+            "wrong_name": lambda groups: groups[0].__setitem__("name", "legacy"),
+            "wrong_lr": lambda groups: groups[0].__setitem__("initial_lr", 2e-5),
+            "wrong_decay": lambda groups: groups[0].__setitem__("weight_decay", 0.0),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                malformed = self._full_checkpoint(module)
+                mutate(malformed["optimizer_states"][0]["param_groups"])
+                with self.assertRaisesRegex(ValueError, "parameter-group mismatch"):
+                    module.on_load_checkpoint(malformed)
 
     def test_legacy_checkpoint_cannot_be_resumed_as_linear_probe(self):
         module = SMTPP_Trainer(
@@ -682,7 +888,7 @@ class SMTPPTrainerThroughputTests(unittest.TestCase):
             encoder_unfreeze_step=120000,
         )
 
-        with self.assertRaisesRegex(ValueError, "legacy.*fine_tune"):
+        with self.assertRaisesRegex(ValueError, "optimizer protocol"):
             module.on_load_checkpoint({"hyper_parameters": {}})
 
     def test_new_checkpoint_requires_unfreeze_boundary_metadata(self):
@@ -692,7 +898,8 @@ class SMTPPTrainerThroughputTests(unittest.TestCase):
             encoder_training_mode="fine_tune",
             encoder_unfreeze_step=120000,
         )
-        checkpoint = {"hyper_parameters": {"encoder_training_mode": "fine_tune"}}
+        checkpoint = self._full_checkpoint(module)
+        del checkpoint["hyper_parameters"]["encoder_unfreeze_step"]
 
         with self.assertRaisesRegex(ValueError, "encoder_unfreeze_step"):
             module.on_load_checkpoint(checkpoint)
@@ -705,13 +912,7 @@ class SMTPPTrainerThroughputTests(unittest.TestCase):
             encoder_unfreeze_step=120000,
             curriculum_step_offset=120000,
         )
-        checkpoint = {
-            "hyper_parameters": {
-                "encoder_training_mode": "fine_tune",
-                "encoder_unfreeze_step": 120000,
-                "curriculum_step_offset": 0,
-            }
-        }
+        checkpoint = self._full_checkpoint(module, curriculum_step_offset=0)
 
         with self.assertRaisesRegex(ValueError, "curriculum_step_offset"):
             module.on_load_checkpoint(checkpoint)
@@ -827,24 +1028,13 @@ class SMTPPTrainerThroughputTests(unittest.TestCase):
             encoder_training_mode="fine_tune",
             encoder_unfreeze_step=120000,
         )
-        checkpoint["hyper_parameters"] = {
-            "encoder_training_mode": "fine_tune",
-            "encoder_unfreeze_step": 120000,
-            "curriculum_step_offset": 0,
-        }
+        checkpoint.update(self._full_checkpoint(restored))
+        checkpoint["full_page_omr_samples_seen"] = 41
         restored.on_load_checkpoint(checkpoint)
 
         self.assertEqual(restored.samples_seen, 41)
 
     def test_legacy_samples_seen_migration_requires_unit_batch_and_accumulation(self):
-        checkpoint = {
-            "global_step": 73,
-            "hyper_parameters": {
-                "encoder_training_mode": "fine_tune",
-                "encoder_unfreeze_step": 120000,
-                "curriculum_step_offset": 0,
-            },
-        }
         for kwargs in ({"batch_size": 2}, {"accumulate_grad_batches": 4}):
             with self.subTest(kwargs=kwargs):
                 module = SMTPP_Trainer(
@@ -854,6 +1044,9 @@ class SMTPPTrainerThroughputTests(unittest.TestCase):
                     encoder_unfreeze_step=120000,
                     **kwargs,
                 )
+                checkpoint = self._full_checkpoint(module)
+                checkpoint["global_step"] = 73
+                del checkpoint["full_page_omr_samples_seen"]
 
                 with self.assertRaisesRegex(ValueError, "samples_seen"):
                     module.on_load_checkpoint(checkpoint)

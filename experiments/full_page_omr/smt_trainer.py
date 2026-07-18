@@ -122,6 +122,71 @@ class SMTPP_Trainer(L.LightningModule):
 
     def optimizer_protocol_metadata(self):
         return optimizer_protocol_metadata(self.model, self.optimizer_config)
+
+    def _optimizer_checkpoint_identity(self):
+        config = self.optimizer_config
+        return {
+            "run_protocol_version": self.hparams.run_protocol_version,
+            "optimizer_protocol": config.protocol,
+            "task_learning_rate": config.task_learning_rate,
+            "encoder_learning_rate": config.encoder_learning_rate,
+            "weight_decay": config.weight_decay,
+            "max_steps": config.max_steps,
+            "wsd_warmup_steps": config.warmup_steps,
+            "wsd_decay_steps": config.decay_steps,
+            "wsd_warmup_type": config.warmup_type,
+            "wsd_decay_type": config.decay_type,
+            "wsd_min_lr_ratio": config.min_lr_ratio,
+        }
+
+    def _validate_optimizer_checkpoint_identity(self, hyper_parameters):
+        expected = self._optimizer_checkpoint_identity()
+        missing = [key for key in expected if key not in hyper_parameters]
+        if missing:
+            raise ValueError(
+                f"checkpoint is missing optimizer protocol evidence: {missing}"
+            )
+        mismatches = {
+            key: (hyper_parameters[key], value)
+            for key, value in expected.items()
+            if hyper_parameters[key] != value
+        }
+        if mismatches:
+            raise ValueError(
+                f"checkpoint optimizer protocol mismatch: {mismatches}"
+            )
+
+    def _validate_optimizer_checkpoint_state(self, checkpoint):
+        optimizer_states = checkpoint.get("optimizer_states")
+        scheduler_states = checkpoint.get("lr_schedulers")
+        if not isinstance(optimizer_states, list) or len(optimizer_states) != 1:
+            raise ValueError("full resume requires exactly one AdamW optimizer state")
+        if not isinstance(scheduler_states, list) or len(scheduler_states) != 1:
+            raise ValueError("full resume requires exactly one WSD scheduler state")
+        optimizer_state = optimizer_states[0]
+        if not isinstance(optimizer_state, dict):
+            raise ValueError("full resume requires exactly one AdamW optimizer state")
+        if not isinstance(scheduler_states[0], dict):
+            raise ValueError("full resume requires exactly one WSD scheduler state")
+
+        saved_groups = optimizer_state.get("param_groups", [])
+        if not isinstance(saved_groups, list):
+            saved_groups = []
+        expected_groups = self.optimizer_protocol_metadata()["optimizer_groups"]
+        saved_schema = [
+            (group.get("name"), group.get("initial_lr"), group.get("weight_decay"))
+            for group in saved_groups
+            if isinstance(group, dict)
+        ]
+        expected_schema = [
+            (group["name"], group["learning_rate"], group["weight_decay"])
+            for group in expected_groups
+        ]
+        if saved_schema != expected_schema:
+            raise ValueError(
+                "checkpoint AdamW parameter-group mismatch: "
+                f"saved={saved_schema}, expected={expected_schema}"
+            )
     
     def forward(self, input, last_preds):
         return self.model(input, last_preds)
@@ -156,6 +221,11 @@ class SMTPP_Trainer(L.LightningModule):
             return
 
         hyper_parameters = checkpoint.get("hyper_parameters", {})
+        if not isinstance(hyper_parameters, dict):
+            raise ValueError("checkpoint hyper_parameters must be a dictionary")
+        self._validate_optimizer_checkpoint_identity(hyper_parameters)
+        self._validate_optimizer_checkpoint_state(checkpoint)
+
         checkpoint_mode = hyper_parameters.get("encoder_training_mode")
         if checkpoint_mode is None:
             if self.encoder_training_mode != "fine_tune":
@@ -205,6 +275,8 @@ class SMTPP_Trainer(L.LightningModule):
                 "Legacy checkpoint has no samples_seen counter; migration is only exact "
                 "with batch_size=1 and accumulate_grad_batches=1"
             )
+        if "global_step" not in checkpoint:
+            return
         self.samples_seen = _validate_non_negative_integer(
             checkpoint.get("global_step"),
             "legacy checkpoint global_step used for samples_seen",

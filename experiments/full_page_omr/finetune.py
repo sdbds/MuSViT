@@ -49,9 +49,23 @@ class CheckpointRunState:
     curriculum_step_offset: int
     curriculum_step_source: str
     sha256: str | None
+    optimizer_identity: dict | None
 
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+_OPTIMIZER_IDENTITY_KEYS = (
+    "run_protocol_version",
+    "optimizer_protocol",
+    "task_learning_rate",
+    "encoder_learning_rate",
+    "weight_decay",
+    "max_steps",
+    "wsd_warmup_steps",
+    "wsd_decay_steps",
+    "wsd_warmup_type",
+    "wsd_decay_type",
+    "wsd_min_lr_ratio",
+)
 
 
 def _validate_checkpoint_every_n_epochs(value: int) -> int:
@@ -143,14 +157,21 @@ def _read_checkpoint_run_state(checkpoint_path: str,
         payload.get("global_step"),
         "checkpoint global_step",
     )
+    hyper_parameters = payload.get("hyper_parameters", {})
+    if not isinstance(hyper_parameters, dict):
+        raise ValueError("checkpoint hyper_parameters must be a dictionary")
+    optimizer_identity = {
+        key: hyper_parameters[key]
+        for key in _OPTIMIZER_IDENTITY_KEYS
+        if key in hyper_parameters
+    }
+    if not optimizer_identity:
+        optimizer_identity = None
     if SAMPLES_SEEN_CHECKPOINT_KEY in payload:
         samples_seen = _validate_non_negative_integer(
             payload[SAMPLES_SEEN_CHECKPOINT_KEY],
             f"checkpoint {SAMPLES_SEEN_CHECKPOINT_KEY}",
         )
-        hyper_parameters = payload.get("hyper_parameters", {})
-        if not isinstance(hyper_parameters, dict):
-            raise ValueError("checkpoint hyper_parameters must be a dictionary")
         offset = _validate_non_negative_integer(
             hyper_parameters.get("curriculum_step_offset", 0),
             "checkpoint curriculum_step_offset",
@@ -170,13 +191,15 @@ def _read_checkpoint_run_state(checkpoint_path: str,
         curriculum_step_offset=offset,
         curriculum_step_source=curriculum_step_source,
         sha256=actual_sha256,
+        optimizer_identity=optimizer_identity,
     )
 
 
 def _validate_run_contract(*, config, from_checkpoint, starting_weights,
                            max_steps: int, train: bool, protocol_version: str,
                            source_curriculum_step: int | None,
-                           source_checkpoint_sha256: str | None = None):
+                           source_checkpoint_sha256: str | None = None,
+                           expected_optimizer_identity: dict | None = None):
     protocol_version = _validate_protocol_version(protocol_version)
     if from_checkpoint is not None:
         if source_curriculum_step is not None or source_checkpoint_sha256 is not None:
@@ -200,6 +223,43 @@ def _validate_run_contract(*, config, from_checkpoint, starting_weights,
             raise ValueError(
                 f"max_steps ({max_steps}) must exceed resumed checkpoint "
                 f"global_step ({state.global_step})"
+            )
+        if state.optimizer_identity is None:
+            raise ValueError(
+                "checkpoint is missing optimizer protocol evidence required for full resume"
+            )
+        missing = [
+            key for key in _OPTIMIZER_IDENTITY_KEYS
+            if key not in state.optimizer_identity
+        ]
+        if missing:
+            raise ValueError(
+                f"checkpoint is missing optimizer protocol evidence: {missing}"
+            )
+        checkpoint_max_steps = state.optimizer_identity["max_steps"]
+        if max_steps != checkpoint_max_steps:
+            raise ValueError(
+                f"resumed max_steps ({max_steps}) must equal checkpoint "
+                f"WSD total ({checkpoint_max_steps})"
+            )
+        if expected_optimizer_identity is not None:
+            if not isinstance(expected_optimizer_identity, dict):
+                raise TypeError("expected_optimizer_identity must be a dictionary")
+            mismatches = {
+                key: (state.optimizer_identity.get(key), expected_value)
+                for key, expected_value in expected_optimizer_identity.items()
+                if state.optimizer_identity.get(key) != expected_value
+            }
+            if mismatches:
+                raise ValueError(
+                    f"checkpoint optimizer protocol mismatch: {mismatches}"
+                )
+        elif state.optimizer_identity["run_protocol_version"] != protocol_version:
+            raise ValueError(
+                "checkpoint optimizer protocol mismatch: "
+                f"run_protocol_version="
+                f"{state.optimizer_identity['run_protocol_version']!r}, "
+                f"expected={protocol_version!r}"
             )
         return state
 
