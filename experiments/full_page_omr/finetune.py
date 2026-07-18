@@ -2,7 +2,7 @@ import json
 import hashlib
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 
 from fire import Fire
@@ -40,6 +40,8 @@ METRIC_VERSION = "canonical_v2"
 CHECKPOINT_MONITOR = "val_SER_v2"
 PRECISION = "16-mixed"
 ACCUMULATE_GRAD_BATCHES = 1
+MAX_EPOCHS = 100_000
+CANONICAL_VALIDATION_EVERY_N_EPOCHS = 2_000
 
 
 @dataclass(frozen=True)
@@ -107,6 +109,34 @@ def _expected_optimizer_identity(protocol_version: str,
         "wsd_decay_type": config.decay_type,
         "wsd_min_lr_ratio": config.min_lr_ratio,
     }
+
+
+def _validate_canonical_protocol_contract(
+        protocol_version: str,
+        optimizer_config: AdamWWSDConfig,
+        *,
+        validation_every_n_epochs: int) -> None:
+    if protocol_version != PROTOCOL_VERSION:
+        return
+    locked = AdamWWSDConfig()
+    mismatches = {
+        field.name: (
+            getattr(optimizer_config, field.name),
+            getattr(locked, field.name),
+        )
+        for field in fields(locked)
+        if getattr(optimizer_config, field.name) != getattr(locked, field.name)
+    }
+    if validation_every_n_epochs != CANONICAL_VALIDATION_EVERY_N_EPOCHS:
+        mismatches["validation_every_n_epochs"] = (
+            validation_every_n_epochs,
+            CANONICAL_VALIDATION_EVERY_N_EPOCHS,
+        )
+    if mismatches:
+        raise ValueError(
+            f"{PROTOCOL_VERSION} has locked optimizer, WSD, and validation values; "
+            f"use a new protocol_version for overrides: {mismatches}"
+        )
 
 
 def _validate_max_steps(value: int, *, train: bool) -> int:
@@ -400,7 +430,7 @@ def _build_metric_checkpointer(experiment_name: str,
 def _build_trainer_kwargs(*, max_steps: int, validation_every_n_epochs: int,
                           callbacks, logger):
     return {
-        "max_epochs": 100_000,
+        "max_epochs": MAX_EPOCHS,
         "max_steps": max_steps,
         "check_val_every_n_epoch": validation_every_n_epochs,
         "val_check_interval": 1.0,
@@ -427,7 +457,8 @@ def _build_protocol_metadata(*, max_steps, validation_every_n_epochs,
                              checkpoint_every_n_epochs=None,
                              expected_training_batches_per_epoch=None,
                              curriculum_steady_mixture_step=320_000,
-                             optimizer_metadata=None):
+                             optimizer_metadata=None,
+                             trainer_max_steps=None):
     if from_checkpoint is not None:
         checkpoint_source = from_checkpoint
         checkpoint_load_mode = "full"
@@ -451,6 +482,8 @@ def _build_protocol_metadata(*, max_steps, validation_every_n_epochs,
         "protocol_version": protocol_version,
         "metric_version": METRIC_VERSION,
         "max_steps": max_steps,
+        "trainer_max_steps": max_steps if trainer_max_steps is None else trainer_max_steps,
+        "max_epochs": MAX_EPOCHS,
         "validation_every_n_epochs": validation_every_n_epochs,
         "validation_first_epoch": validation_every_n_epochs,
         "validation_expected_count": validation_expected_count,
@@ -678,7 +711,12 @@ def main(config: ExperimentConfig, experiment_name,
     validation_every_n_epochs = _validate_validation_every_n_epochs(
         validation_every_n_epochs
     )
-    max_steps = _validate_max_steps(max_steps, train=train)
+    trainer_max_steps = _validate_max_steps(max_steps, train=train)
+    protocol_max_steps = (
+        AdamWWSDConfig().max_steps
+        if not train and trainer_max_steps == -1
+        else trainer_max_steps
+    )
     encoder_training_mode = _validate_encoder_training_mode(encoder_training_mode)
     protocol_version = _validate_protocol_version(protocol_version)
     task_learning_rate = _normalize_task_learning_rate(
@@ -689,12 +727,17 @@ def main(config: ExperimentConfig, experiment_name,
         task_learning_rate=task_learning_rate,
         encoder_learning_rate=encoder_learning_rate,
         weight_decay=weight_decay,
-        max_steps=max_steps,
+        max_steps=protocol_max_steps,
         warmup_steps=wsd_warmup_steps,
         decay_steps=wsd_decay_steps,
         warmup_type=wsd_warmup_type,
         decay_type=wsd_decay_type,
         min_lr_ratio=wsd_min_lr_ratio,
+    )
+    _validate_canonical_protocol_contract(
+        protocol_version,
+        optimizer_config,
+        validation_every_n_epochs=validation_every_n_epochs,
     )
     from_checkpoint, starting_weights = _validate_checkpoint_sources(
         from_checkpoint,
@@ -704,7 +747,7 @@ def main(config: ExperimentConfig, experiment_name,
         config=config,
         from_checkpoint=from_checkpoint,
         starting_weights=starting_weights,
-        max_steps=max_steps,
+        max_steps=protocol_max_steps,
         train=train,
         protocol_version=protocol_version,
         source_curriculum_step=source_curriculum_step,
@@ -818,7 +861,8 @@ def main(config: ExperimentConfig, experiment_name,
     )
 
     protocol_metadata = _build_protocol_metadata(
-        max_steps=max_steps,
+        max_steps=protocol_max_steps,
+        trainer_max_steps=trainer_max_steps,
         validation_every_n_epochs=validation_every_n_epochs,
         from_checkpoint=from_checkpoint,
         starting_weights=starting_weights,
@@ -882,7 +926,7 @@ def main(config: ExperimentConfig, experiment_name,
     wandb_logger.log_hyperparams(protocol_metadata)
 
     trainer = Trainer(**_build_trainer_kwargs(
-        max_steps=max_steps,
+        max_steps=trainer_max_steps,
         validation_every_n_epochs=validation_every_n_epochs,
         callbacks=trainer_callbacks,
         logger=wandb_logger,

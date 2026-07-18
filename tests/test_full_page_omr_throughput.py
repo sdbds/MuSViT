@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -194,8 +195,51 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, "positive"):
                 finetune._normalize_task_learning_rate(value, None)
 
+    def test_canonical_protocol_rejects_every_locked_override(self):
+        locked = finetune.AdamWWSDConfig()
+        mutations = {
+            "task_learning_rate": 2e-4,
+            "encoder_learning_rate": 2e-5,
+            "weight_decay": 0.02,
+            "betas": (0.8, 0.99),
+            "eps": 1e-7,
+            "max_steps": 4_000_001,
+            "warmup_steps": 10_001,
+            "decay_steps": 400_001,
+            "warmup_type": "cosine",
+            "decay_type": "linear",
+            "min_lr_ratio": 0.1,
+        }
+        for field_name, value in mutations.items():
+            with self.subTest(field_name=field_name):
+                with self.assertRaisesRegex(ValueError, "new protocol_version"):
+                    finetune._validate_canonical_protocol_contract(
+                        finetune.PROTOCOL_VERSION,
+                        replace(locked, **{field_name: value}),
+                        validation_every_n_epochs=2_000,
+                    )
+
+        with self.assertRaisesRegex(ValueError, "new protocol_version"):
+            finetune._validate_canonical_protocol_contract(
+                finetune.PROTOCOL_VERSION,
+                locked,
+                validation_every_n_epochs=2_001,
+            )
+
+    def test_noncanonical_protocol_allows_optimizer_and_cadence_overrides(self):
+        finetune._validate_canonical_protocol_contract(
+            "full_page_omr_experiment_v1",
+            replace(
+                finetune.AdamWWSDConfig(),
+                task_learning_rate=2e-4,
+                max_steps=4_000_001,
+            ),
+            validation_every_n_epochs=2_001,
+        )
+
     def test_main_passes_exact_optimizer_identity_to_full_resume_contract(self):
         config = SimpleNamespace(data=SimpleNamespace(skip_steps=0))
+        protocol_version = "full_page_omr_optimizer_override_v1"
         with patch.object(
             finetune,
             "_validate_run_contract",
@@ -212,12 +256,13 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                     weight_decay=0.02,
                     wsd_warmup_steps=20_000,
                     wsd_decay_steps=500_000,
+                    protocol_version=protocol_version,
                 )
 
         self.assertEqual(
             validate_contract.call_args.kwargs["expected_optimizer_identity"],
             {
-                "run_protocol_version": finetune.PROTOCOL_VERSION,
+                "run_protocol_version": protocol_version,
                 "optimizer_protocol": "adamw_wsd_v1",
                 "task_learning_rate": 2e-4,
                 "encoder_learning_rate": 2e-5,
@@ -245,8 +290,9 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
         model = SimpleNamespace(
             encoder=SimpleNamespace(config=SimpleNamespace(patch_size=16))
         )
+        protocol_version = "full_page_omr_optimizer_override_v1"
         optimizer_kwargs = {
-            "run_protocol_version": finetune.PROTOCOL_VERSION,
+            "run_protocol_version": protocol_version,
             "task_learning_rate": 2e-4,
             "encoder_learning_rate": 2e-5,
             "weight_decay": 0.02,
@@ -287,6 +333,7 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                             weight_decay=0.02,
                             wsd_warmup_steps=20_000,
                             wsd_decay_steps=500_000,
+                            protocol_version=protocol_version,
                         )
 
                 call = (
@@ -296,6 +343,75 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                 )
                 for key, value in optimizer_kwargs.items():
                     self.assertEqual(call.kwargs[key], value)
+
+    def test_eval_only_minus_one_uses_canonical_wsd_total_and_reaches_test_setup(self):
+        class SizedDataset(SimpleNamespace):
+            def __len__(self):
+                return 83
+
+        train_dataset = SizedDataset(w2i={"<pad>": 0}, i2w={0: "<pad>"})
+        data_module = SimpleNamespace(
+            train_dataset=train_dataset,
+            encoder_unfreeze_step=120_000,
+            curriculum_step_offset=0,
+            tokenization_mode="bekern",
+            batch_size=1,
+            num_workers=0,
+        )
+        config = SimpleNamespace(data=SimpleNamespace(skip_steps=0, reduce_ratio=0.5))
+        model = SimpleNamespace(
+            encoder=SimpleNamespace(config=SimpleNamespace(patch_size=16))
+        )
+        wrapper = Mock()
+        wrapper.optimizer_protocol_metadata.return_value = {
+            "optimizer": "AdamW",
+            "optimizer_implementation": "torch.optim.AdamW",
+            "torch_version": str(torch.__version__),
+            "wsd_max_steps": 4_000_000,
+        }
+        trainer = Mock()
+        protocol_path = Path("logs/protocol.json")
+
+        with (
+            patch.dict(finetune.DATASETS_TYPE, {"CL": lambda _: data_module}),
+            patch.object(finetune, "set_up_processor"),
+            patch.object(finetune, "SMTFoundationConfig", return_value=object()),
+            patch.object(
+                finetune,
+                "SMTFoundationModelForCausalLM",
+                return_value=model,
+            ),
+            patch.object(finetune, "SMTPP_Trainer", return_value=wrapper) as module,
+            patch.object(finetune, "_build_epoch_checkpointer", return_value=object()),
+            patch.object(
+                finetune,
+                "_build_metric_checkpointer",
+                return_value=SimpleNamespace(best_model_path=""),
+            ),
+            patch.object(finetune, "_write_resize_audit", return_value=None),
+            patch.object(
+                finetune,
+                "_write_protocol_metadata",
+                return_value=protocol_path,
+            ) as write_protocol,
+            patch.object(finetune, "WandbLogger") as wandb_logger,
+            patch.object(finetune, "Trainer", return_value=trainer) as trainer_class,
+            patch.object(finetune, "_run_test") as run_test,
+        ):
+            finetune.main(config, "eval-run", train=False, max_steps=-1)
+
+        self.assertEqual(module.call_args.kwargs["max_steps"], 4_000_000)
+        self.assertEqual(trainer_class.call_args.kwargs["max_steps"], -1)
+        metadata = write_protocol.call_args.args[1]
+        self.assertEqual(metadata["max_steps"], 4_000_000)
+        self.assertEqual(metadata["trainer_max_steps"], -1)
+        self.assertIs(
+            wandb_logger.return_value.log_hyperparams.call_args.args[0],
+            metadata,
+        )
+        self.assertEqual(metadata["optimizer_implementation"], "torch.optim.AdamW")
+        self.assertEqual(metadata["torch_version"], str(torch.__version__))
+        run_test.assert_called_once_with(trainer, wrapper, data_module, None)
 
     def test_encoder_training_mode_is_validated(self):
         self.assertEqual(finetune._validate_encoder_training_mode("fine_tune"), "fine_tune")
@@ -715,6 +831,8 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
     def test_protocol_metadata_records_metric_and_run_contract(self):
         optimizer_metadata = {
             "optimizer": "AdamW",
+            "optimizer_implementation": "torch.optim.AdamW",
+            "torch_version": str(torch.__version__),
             "optimizer_protocol": "adamw_wsd_v1",
             "task_learning_rate": 1e-4,
             "encoder_learning_rate": 1e-5,
@@ -751,8 +869,12 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
         self.assertEqual(metadata["validation_first_epoch"], 2_000)
         self.assertEqual(metadata["validation_expected_count"], 24)
         self.assertEqual(metadata["expected_training_batches_per_epoch"], 83)
+        self.assertEqual(metadata["max_epochs"], 100_000)
+        self.assertEqual(metadata["trainer_max_steps"], 4_000_000)
         self.assertEqual(metadata["curriculum_steady_mixture_step"], 320_000)
         self.assertEqual(metadata["optimizer"], "AdamW")
+        self.assertEqual(metadata["optimizer_implementation"], "torch.optim.AdamW")
+        self.assertEqual(metadata["torch_version"], str(torch.__version__))
         self.assertEqual(metadata["wsd_stable_steps"], 3_590_000)
         self.assertNotIn("learning_rate", metadata)
 

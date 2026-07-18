@@ -8,6 +8,7 @@ from experiments.full_page_omr.optimization import (
     build_adamw,
     build_adamw_parameter_groups,
     build_wsd_scheduler,
+    optimizer_protocol_metadata,
 )
 
 
@@ -80,6 +81,12 @@ class AdamWWSDParameterGroupTests(unittest.TestCase):
         self.assertEqual(optimizer.defaults["betas"], (0.9, 0.999))
         self.assertEqual(optimizer.defaults["eps"], 1e-8)
         self.assertFalse(optimizer.defaults["amsgrad"])
+
+    def test_optimizer_metadata_records_exact_implementation_identity(self):
+        metadata = optimizer_protocol_metadata(self.model, self.config)
+
+        self.assertEqual(metadata["optimizer_implementation"], "torch.optim.AdamW")
+        self.assertEqual(metadata["torch_version"], str(torch.__version__))
 
     def test_encoder_parameter_updates_after_it_is_unfrozen(self):
         optimizer = build_adamw(self.model, self.config)

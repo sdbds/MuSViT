@@ -149,6 +149,8 @@ def optimizer_protocol_metadata(model: nn.Module, config: AdamWWSDConfig) -> dic
     groups = build_adamw_parameter_groups(model, config)
     return {
         "optimizer": "AdamW",
+        "optimizer_implementation": "torch.optim.AdamW",
+        "torch_version": str(torch.__version__),
         "optimizer_protocol": config.protocol,
         "optimizer_betas": list(config.betas),
         "optimizer_eps": config.eps,
