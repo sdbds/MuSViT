@@ -48,20 +48,21 @@
 Run:
 
 ```powershell
-uv pip show --python .venv\Scripts\python.exe onnx onnxruntime-gpu
+uv pip show --python .venv\Scripts\python.exe pytest onnx onnxruntime-gpu
 ```
 
-Expected: both packages are reported as missing before installation.
+Expected: all three packages are reported as missing before installation.
 
 - [ ] **Step 2: Install ONNX from PyPI with uv**
 
 Run:
 
 ```powershell
-uv pip install --python .venv\Scripts\python.exe onnx
+uv pip install --python .venv\Scripts\python.exe onnx pytest
 ```
 
-Expected: `onnx` installs successfully without replacing the locked Torch build.
+Expected: `onnx` and `pytest` install successfully without replacing the locked
+Torch build.
 
 - [ ] **Step 3: Install the CUDA 13 ONNX Runtime build with uv**
 

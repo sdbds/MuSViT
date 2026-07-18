@@ -7,7 +7,7 @@ import numpy as np
 import warnings
 from loguru import logger
 from torch.nn.init import xavier_uniform_
-from transformers import PreTrainedModel, ViTModel
+from transformers import PreTrainedModel, ViTConfig, ViTModel
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 
 from .configuration_smt import SMTFoundationConfig
@@ -44,6 +44,22 @@ IMPL_DICT = {
     "ViTMAEModel": [ViTModel, 384],   # MuSViT-Small
     "ViTMAEBase": [ViTModel, 768],    # MuSViT-Base
 }
+
+
+def _build_foundation_encoder(config):
+    foundation_config = getattr(config, "foundation_config", None)
+    if foundation_config is not None:
+        if not isinstance(foundation_config, dict):
+            raise TypeError("foundation_config must be a dictionary")
+        return ViTModel(ViTConfig.from_dict(dict(foundation_config)))
+
+    encoder_class = IMPL_DICT[config.foundation_architecture][0]
+    if config.foundation_architecture == "ViTMAEBase":
+        return encoder_class.from_pretrained(
+            config.foundation_weights,
+            mask_ratio=0.0,
+        )
+    return encoder_class.from_pretrained(config.foundation_weights)
 
 
 def _normalize_i2w(i2w):
@@ -850,10 +866,7 @@ class SMTFoundationModelForCausalLM(PreTrainedModel):
     def __init__(self, config:SMTFoundationConfig):
         super().__init__(config)
         
-        if config.foundation_architecture == "ViTMAEBase":
-            self.encoder = IMPL_DICT[config.foundation_architecture][0].from_pretrained(config.foundation_weights, mask_ratio=0.0)
-        else:
-            self.encoder = IMPL_DICT[config.foundation_architecture][0].from_pretrained(config.foundation_weights)
+        self.encoder = _build_foundation_encoder(config)
 
         self.encoder_type = config.foundation_architecture
 

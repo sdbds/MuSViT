@@ -4,6 +4,7 @@ class SMTFoundationConfig(PretrainedConfig):
     model_type = "SMT"
 
     def __init__(self, foundation_architecture=None, foundation_weights=None,
+                 foundation_config=None,
                  maxh=512, maxw=512, maxlen=1512, out_categories=2512, padding_token=0, 
                  in_channels=1, w2i={}, i2w={}, out_dir="SMIR", 
                  d_model=256, dim_ff=256, num_dec_layers=8, attention_backend="auto",
@@ -24,4 +25,5 @@ class SMTFoundationConfig(PretrainedConfig):
         self.attention_backend = attention_backend
         self.foundation_architecture = foundation_architecture
         self.foundation_weights = foundation_weights
+        self.foundation_config = foundation_config
         self._attn_implementation_internal = _attn_implementation_internal
