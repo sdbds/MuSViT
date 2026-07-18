@@ -25,6 +25,16 @@ class AdamWWSDConfig:
     num_cycles: float = 0.5
 
     def __post_init__(self):
+        if self.protocol != OPTIMIZER_PROTOCOL:
+            raise ValueError(f"protocol must be {OPTIMIZER_PROTOCOL}")
+        if self.amsgrad is not False:
+            raise ValueError("amsgrad must be False for the locked protocol")
+        if (
+            isinstance(self.num_cycles, bool)
+            or not isinstance(self.num_cycles, (int, float))
+            or self.num_cycles != 0.5
+        ):
+            raise ValueError("num_cycles must be 0.5 for the locked protocol")
         for name in ("task_learning_rate", "encoder_learning_rate", "eps"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:

@@ -32,6 +32,19 @@ class AdamWWSDParameterGroupTests(unittest.TestCase):
         self.assertEqual(self.config.task_learning_rate, 1e-4)
         self.assertEqual(self.config.encoder_learning_rate, 1e-5)
 
+    def test_protocol_defining_fields_reject_non_protocol_values(self):
+        invalid_values = (
+            {"protocol": "another_protocol"},
+            {"amsgrad": True},
+            {"amsgrad": 0},
+            {"num_cycles": 1.0},
+            {"num_cycles": False},
+        )
+        for kwargs in invalid_values:
+            with self.subTest(**kwargs):
+                with self.assertRaises(ValueError):
+                    AdamWWSDConfig(**kwargs)
+
     def test_each_parameter_appears_once_and_frozen_encoder_is_included(self):
         groups = build_adamw_parameter_groups(self.model, self.config)
         grouped = [parameter for group in groups for parameter in group["params"]]
