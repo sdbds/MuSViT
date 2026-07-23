@@ -2,12 +2,30 @@ import unittest
 from types import SimpleNamespace
 
 import torch
+from transformers import PreTrainedModel
 
 from experiments.full_page_omr.smt_foundation import modeling_smt
+from experiments.full_page_omr.smt_foundation.configuration_smt import SMTFoundationConfig
 from experiments.full_page_omr.smt_foundation.modeling_smt import (
     PositionalEncoding2D,
     SMTFoundationModelForCausalLM,
 )
+
+
+class _SMTConfigContractProbe(PreTrainedModel):
+    config_class = SMTFoundationConfig
+
+    def __init__(self, config):
+        super().__init__(config)
+
+
+class SMTFoundationConfigTests(unittest.TestCase):
+    def test_config_satisfies_pretrained_model_initialization_contract(self):
+        config = SMTFoundationConfig()
+
+        model = _SMTConfigContractProbe(config)
+
+        self.assertIs(model.config, config)
 
 
 class PositionalEncodingTests(unittest.TestCase):

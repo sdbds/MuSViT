@@ -19,8 +19,7 @@ from .smt_foundation import SMTFoundationConfig, SMTFoundationModelForCausalLM
 from .optimization import (
     AdamWWSDConfig,
     optimizer_protocol_metadata,
-    same_typed_value,
-    validate_adamw_wsd_resume_state,
+    prepare_adamw_wsd_resume_state,
 )
 from .smt_trainer import (
     ENCODER_TRAINING_MODES,
@@ -99,6 +98,7 @@ def _validate_canonical_protocol_contract(
             getattr(locked, field.name),
         )
         for field in fields(locked)
+        if field.name not in {"max_steps", "decay_steps", "min_lr_ratio"}
         if getattr(optimizer_config, field.name) != getattr(locked, field.name)
     }
     if validation_every_n_epochs != CANONICAL_VALIDATION_EVERY_N_EPOCHS:
@@ -108,7 +108,7 @@ def _validate_canonical_protocol_contract(
         )
     if mismatches:
         raise ValueError(
-            f"{PROTOCOL_VERSION} has locked optimizer, WSD, and validation values; "
+            f"{PROTOCOL_VERSION} has locked non-schedule optimizer and validation values; "
             f"use a new protocol_version for overrides: {mismatches}"
         )
 
@@ -262,13 +262,28 @@ def _validate_run_contract(*, config, from_checkpoint, starting_weights,
                 "full resume requires the expected model and optimizer config "
                 "for state validation"
             )
+        if expected_protocol_snapshot is None or not isinstance(
+            expected_protocol_snapshot,
+            dict,
+        ):
+            raise ValueError(
+                "full resume requires a complete expected protocol_snapshot"
+            )
+        if expected_protocol_snapshot.get("protocol_version") != protocol_version:
+            raise ValueError(
+                "expected protocol snapshot mismatch: "
+                f"protocol_version={expected_protocol_snapshot.get('protocol_version')!r}, "
+                f"requested={protocol_version!r}"
+            )
         state = _read_checkpoint_run_state(
             from_checkpoint,
             require_samples_seen=True,
-            resume_state_validator=lambda payload: validate_adamw_wsd_resume_state(
+            resume_state_validator=lambda payload: prepare_adamw_wsd_resume_state(
                 payload,
                 expected_model,
                 optimizer_config,
+                expected_protocol_snapshot,
+                mutate=False,
             ),
         )
         requested_offset = config.data.skip_steps
@@ -287,33 +302,9 @@ def _validate_run_contract(*, config, from_checkpoint, starting_weights,
                 f"max_steps ({max_steps}) must exceed resumed checkpoint "
                 f"global_step ({state.global_step})"
             )
-        if expected_protocol_snapshot is None or not isinstance(
-            expected_protocol_snapshot,
-            dict,
-        ):
-            raise ValueError(
-                "full resume requires a complete expected protocol_snapshot"
-            )
         if state.protocol_snapshot is None:
             raise ValueError(
                 "checkpoint is missing protocol_snapshot evidence required for full resume"
-            )
-        if not same_typed_value(
-            state.protocol_snapshot,
-            expected_protocol_snapshot,
-        ):
-            raise ValueError(
-                "checkpoint protocol snapshot mismatch: "
-                f"saved={state.protocol_snapshot!r}, "
-                f"expected={expected_protocol_snapshot!r}"
-            )
-        checkpoint_max_steps = state.protocol_snapshot.get("trainer", {}).get(
-            "max_steps"
-        )
-        if max_steps != checkpoint_max_steps:
-            raise ValueError(
-                f"resumed max_steps ({max_steps}) must equal checkpoint "
-                f"WSD total ({checkpoint_max_steps})"
             )
         if state.protocol_snapshot.get("protocol_version") != protocol_version:
             raise ValueError(
@@ -695,13 +686,21 @@ def _write_protocol_metadata(experiment_name: str, metadata,
     return _write_json(directory / "protocol.json", metadata)
 
 
-def _save_hwc_image(path: Path, image) -> None:
+def _audit_image_layout(image) -> str:
     array = np.asarray(image)
-    if array.ndim != 3 or array.shape[2] not in (1, 3, 4):
-        raise ValueError(f"audit image must be HWC, got shape {array.shape}")
+    if array.ndim == 2:
+        return "HW"
+    if array.ndim == 3 and array.shape[2] in (1, 3, 4):
+        return "HWC"
+    raise ValueError(f"audit image must be HW or HWC, got shape {array.shape}")
+
+
+def _save_audit_image(path: Path, image) -> None:
+    array = np.asarray(image)
+    _audit_image_layout(array)
     if array.dtype != np.uint8:
         array = np.clip(array, 0, 255).astype(np.uint8)
-    if array.shape[2] == 1:
+    if array.ndim == 3 and array.shape[2] == 1:
         array = array[:, :, 0]
     Image.fromarray(array).save(path)
 
@@ -749,9 +748,9 @@ def _write_resize_audit(data, *, experiment_name: str, protocol_version: str,
         Path(output_root),
     ) / "input_audit"
     directory.mkdir(parents=True, exist_ok=True)
-    _save_hwc_image(directory / "raw.png", stages.raw)
-    _save_hwc_image(directory / "intermediate.png", stages.intermediate)
-    _save_hwc_image(directory / "final.png", _final_tensor_as_hwc(stages.final))
+    _save_audit_image(directory / "raw.png", stages.raw)
+    _save_audit_image(directory / "intermediate.png", stages.intermediate)
+    _save_audit_image(directory / "final.png", _final_tensor_as_hwc(stages.final))
     return _write_json(
         directory / "resize.json",
         {
@@ -761,6 +760,8 @@ def _write_resize_audit(data, *, experiment_name: str, protocol_version: str,
             "reduce_ratio": reduce_ratio,
             "raw_shape_hwc": list(stages.raw.shape),
             "intermediate_shape_hwc": list(stages.intermediate.shape),
+            "raw_layout": _audit_image_layout(stages.raw),
+            "intermediate_layout": _audit_image_layout(stages.intermediate),
             "final_shape_nchw": final_shape,
             "images": {
                 "raw": "raw.png",

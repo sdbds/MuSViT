@@ -246,7 +246,7 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, "positive"):
                 finetune._normalize_task_learning_rate(value, None)
 
-    def test_canonical_protocol_rejects_every_locked_override(self):
+    def test_canonical_protocol_still_rejects_non_schedule_overrides(self):
         locked = finetune.AdamWWSDConfig()
         mutations = {
             "task_learning_rate": 2e-4,
@@ -254,12 +254,9 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
             "weight_decay": 0.02,
             "betas": (0.8, 0.99),
             "eps": 1e-7,
-            "max_steps": 4_000_001,
             "warmup_steps": 10_001,
-            "decay_steps": 400_001,
             "warmup_type": "cosine",
             "decay_type": "linear",
-            "min_lr_ratio": 0.1,
         }
         for field_name, value in mutations.items():
             with self.subTest(field_name=field_name):
@@ -286,6 +283,18 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                 max_steps=4_000_001,
             ),
             validation_every_n_epochs=2_001,
+        )
+
+    def test_canonical_protocol_allows_wsd_endpoint_and_decay_overrides(self):
+        finetune._validate_canonical_protocol_contract(
+            finetune.PROTOCOL_VERSION,
+            replace(
+                finetune.AdamWWSDConfig(),
+                max_steps=2_000_000,
+                decay_steps=340_000,
+                min_lr_ratio=0.1,
+            ),
+            validation_every_n_epochs=2_000,
         )
 
     def test_main_passes_complete_protocol_snapshot_to_full_resume_contract(self):
@@ -671,32 +680,42 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                     optimizer_config=finetune.AdamWWSDConfig(),
                 )
 
-    def test_full_resume_requires_requested_max_steps_to_match_wsd_total(self):
+    def test_full_resume_accepts_retargeted_wsd_endpoint_and_decay(self):
         model = _TinyModel()
         saved_snapshot = _protocol_snapshot(model)
-        expected_snapshot = copy.deepcopy(saved_snapshot)
-        expected_snapshot["trainer"]["max_steps"] = 4_000_001
+        expected_snapshot = _protocol_snapshot(
+            model,
+            scheduler__max_steps=2_000_000,
+            scheduler__stable_steps=1_650_000,
+            scheduler__decay_steps=340_000,
+            scheduler__min_lr_ratio=0.1,
+            trainer__max_steps=2_000_000,
+            validation__expected_count=12,
+        )
         with tempfile.TemporaryDirectory() as tmpdir:
             checkpoint = Path(tmpdir) / "resume.ckpt"
             torch.save(_full_resume_payload(model, snapshot=saved_snapshot), checkpoint)
 
-            with self.assertRaisesRegex(ValueError, "protocol snapshot mismatch"):
-                finetune._validate_run_contract(
-                    config=SimpleNamespace(data=SimpleNamespace(skip_steps=0)),
-                    from_checkpoint=str(checkpoint),
-                    starting_weights=None,
-                    max_steps=4_000_001,
-                    train=True,
-                    protocol_version="full_page_omr_adamw_wsd_4m_v1",
-                    source_curriculum_step=None,
-                    source_checkpoint_sha256=None,
-                    expected_protocol_snapshot=expected_snapshot,
-                    expected_model=model,
-                    optimizer_config=replace(
-                        finetune.AdamWWSDConfig(),
-                        max_steps=4_000_001,
-                    ),
-                )
+            state = finetune._validate_run_contract(
+                config=SimpleNamespace(data=SimpleNamespace(skip_steps=0)),
+                from_checkpoint=str(checkpoint),
+                starting_weights=None,
+                max_steps=2_000_000,
+                train=True,
+                protocol_version="full_page_omr_adamw_wsd_4m_v1",
+                source_curriculum_step=None,
+                source_checkpoint_sha256=None,
+                expected_protocol_snapshot=expected_snapshot,
+                expected_model=model,
+                optimizer_config=replace(
+                    finetune.AdamWWSDConfig(),
+                    max_steps=2_000_000,
+                    decay_steps=340_000,
+                    min_lr_ratio=0.1,
+                ),
+            )
+
+        self.assertEqual(state.global_step, 40)
 
     def test_full_resume_requires_complete_expected_protocol_snapshot(self):
         model = _TinyModel()
@@ -1110,6 +1129,37 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
             for filename in ("raw.png", "intermediate.png", "final.png"):
                 self.assertTrue((path.parent / filename).is_file())
 
+    def test_resize_audit_archives_grayscale_source_images(self):
+        stages = data.ResizeAuditStages(
+            raw=torch.zeros(4, 6, dtype=torch.uint8).numpy(),
+            intermediate=torch.zeros(2, 3, dtype=torch.uint8).numpy(),
+            final=torch.zeros(1, 3, 8, 8),
+        )
+        source = Mock()
+        source.resize_audit.return_value = stages
+        module = SimpleNamespace(
+            train_dataset=SimpleNamespace(real_source=source),
+            batch_size=1,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = finetune._write_resize_audit(
+                module,
+                experiment_name="polish-grayscale",
+                protocol_version="full_page_omr_resize_v1",
+                reduce_ratio=0.5,
+                resolution=8,
+                output_root=Path(tmpdir),
+            )
+            report = json.loads(path.read_text(encoding="utf-8"))
+
+            self.assertEqual(report["raw_shape_hwc"], [4, 6])
+            self.assertEqual(report["intermediate_shape_hwc"], [2, 3])
+            self.assertEqual(report["raw_layout"], "HW")
+            self.assertEqual(report["intermediate_layout"], "HW")
+            for filename in ("raw.png", "intermediate.png", "final.png"):
+                self.assertTrue((path.parent / filename).is_file())
+
     def test_resize_audit_is_not_applicable_to_synthetic_only_data(self):
         module = SimpleNamespace(
             train_dataset=object(),
@@ -1401,6 +1451,77 @@ class SMTPPTrainerThroughputTests(unittest.TestCase):
         checkpoint = self._full_checkpoint(module)
 
         module.on_load_checkpoint(checkpoint)
+
+    def test_full_resume_retargets_changed_wsd_schedule_and_keeps_adam_state(self):
+        model = _TinyModel()
+        source_snapshot = _protocol_snapshot(model)
+        source = SMTPP_Trainer(
+            SimpleNamespace(padding_token=0),
+            model,
+            encoder_unfreeze_step=120000,
+            protocol_snapshot=source_snapshot,
+        )
+        checkpoint = self._full_checkpoint(source)
+        global_step = 1_660_001
+        checkpoint["global_step"] = global_step
+        checkpoint["full_page_omr_samples_seen"] = global_step
+        checkpoint["optimizer_states"][0]["state"][0] = {
+            "step": torch.tensor(123.0),
+        }
+        source_scheduler = source.configure_optimizers()["lr_scheduler"]["scheduler"]
+        source_lrs = [
+            base_lr * source_scheduler.lr_lambdas[0](global_step)
+            for base_lr in source_scheduler.base_lrs
+        ]
+        for group, current_lr in zip(
+            checkpoint["optimizer_states"][0]["param_groups"],
+            source_lrs,
+        ):
+            group["lr"] = current_lr
+        source_scheduler_state = checkpoint["lr_schedulers"][0]
+        source_scheduler_state["last_epoch"] = global_step
+        source_scheduler_state["_step_count"] = global_step + 1
+        source_scheduler_state["_last_lr"] = source_lrs
+
+        target_snapshot = _protocol_snapshot(
+            model,
+            scheduler__max_steps=2_000_000,
+            scheduler__stable_steps=1_650_000,
+            scheduler__decay_steps=340_000,
+            scheduler__min_lr_ratio=0.1,
+            trainer__max_steps=2_000_000,
+            validation__expected_count=12,
+        )
+        target = SMTPP_Trainer(
+            SimpleNamespace(padding_token=0),
+            model,
+            encoder_unfreeze_step=120000,
+            max_steps=2_000_000,
+            wsd_decay_steps=340_000,
+            wsd_min_lr_ratio=0.1,
+            protocol_snapshot=target_snapshot,
+        )
+
+        target.on_load_checkpoint(checkpoint)
+
+        target_scheduler = target.configure_optimizers()["lr_scheduler"]["scheduler"]
+        target_lrs = [
+            base_lr * target_scheduler.lr_lambdas[0](global_step)
+            for base_lr in target_scheduler.base_lrs
+        ]
+        self.assertEqual(
+            checkpoint["optimizer_states"][0]["state"][0]["step"],
+            torch.tensor(123.0),
+        )
+        self.assertEqual(
+            [
+                group["lr"]
+                for group in checkpoint["optimizer_states"][0]["param_groups"]
+            ],
+            target_lrs,
+        )
+        self.assertEqual(checkpoint["lr_schedulers"][0]["last_epoch"], global_step)
+        self.assertEqual(checkpoint["lr_schedulers"][0]["_last_lr"], target_lrs)
 
     def test_full_resume_uses_snapshot_instead_of_flat_compatibility_fields(self):
         module = SMTPP_Trainer(

@@ -18,8 +18,7 @@ from .optimization import (
     build_adamw,
     build_wsd_scheduler,
     optimizer_protocol_metadata,
-    same_typed_value,
-    validate_adamw_wsd_resume_state,
+    prepare_adamw_wsd_resume_state,
 )
 
 
@@ -141,27 +140,17 @@ class SMTPP_Trainer(L.LightningModule):
     def optimizer_protocol_metadata(self):
         return optimizer_protocol_metadata(self.model, self.optimizer_config)
 
-    def _validate_optimizer_checkpoint_identity(self, hyper_parameters):
+    def _prepare_optimizer_checkpoint_state(self, checkpoint):
         if self.protocol_snapshot is None:
             raise ValueError(
                 "full resume requires a complete expected protocol_snapshot"
             )
-        saved_snapshot = hyper_parameters.get("protocol_snapshot")
-        if saved_snapshot is None:
-            raise ValueError(
-                "checkpoint is missing protocol_snapshot evidence required for full resume"
-            )
-        if not same_typed_value(saved_snapshot, self.protocol_snapshot):
-            raise ValueError(
-                "checkpoint protocol snapshot mismatch: "
-                f"saved={saved_snapshot!r}, expected={self.protocol_snapshot!r}"
-            )
-
-    def _validate_optimizer_checkpoint_state(self, checkpoint):
-        validate_adamw_wsd_resume_state(
+        prepare_adamw_wsd_resume_state(
             checkpoint,
             self.model,
             self.optimizer_config,
+            self.protocol_snapshot,
+            mutate=True,
         )
 
     def _is_evaluation_checkpoint_load(self):
@@ -210,8 +199,7 @@ class SMTPP_Trainer(L.LightningModule):
         hyper_parameters = checkpoint.get("hyper_parameters", {})
         if not isinstance(hyper_parameters, dict):
             raise ValueError("checkpoint hyper_parameters must be a dictionary")
-        self._validate_optimizer_checkpoint_identity(hyper_parameters)
-        self._validate_optimizer_checkpoint_state(checkpoint)
+        self._prepare_optimizer_checkpoint_state(checkpoint)
 
         checkpoint_mode = hyper_parameters.get("encoder_training_mode")
         if checkpoint_mode is None:

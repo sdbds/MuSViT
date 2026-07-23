@@ -1,4 +1,5 @@
-from dataclasses import asdict, dataclass
+import copy
+from dataclasses import asdict, dataclass, replace
 
 import torch
 from torch import nn
@@ -199,9 +200,123 @@ def same_typed_value(actual, expected) -> bool:
     return actual == expected
 
 
+_RETARGETABLE_WSD_SNAPSHOT_FIELDS = (
+    ("scheduler", "max_steps"),
+    ("scheduler", "stable_steps"),
+    ("scheduler", "decay_steps"),
+    ("scheduler", "min_lr_ratio"),
+    ("trainer", "max_steps"),
+    ("validation", "expected_count"),
+)
+
+
+def _without_retargetable_wsd_fields(snapshot: dict) -> dict:
+    if not isinstance(snapshot, dict):
+        raise ValueError("protocol_snapshot must be a dictionary")
+    normalized = copy.deepcopy(snapshot)
+    for section_name, field_name in _RETARGETABLE_WSD_SNAPSHOT_FIELDS:
+        section = normalized.get(section_name)
+        if not isinstance(section, dict) or field_name not in section:
+            raise ValueError(
+                "checkpoint protocol snapshot is missing "
+                f"{section_name}.{field_name}"
+            )
+        del section[field_name]
+    return normalized
+
+
+def validate_wsd_retarget_protocol_snapshots(saved_snapshot: dict,
+                                             expected_snapshot: dict) -> None:
+    """Allow only endpoint-derived WSD fields to differ on full resume."""
+    saved_invariants = _without_retargetable_wsd_fields(saved_snapshot)
+    expected_invariants = _without_retargetable_wsd_fields(expected_snapshot)
+    if not same_typed_value(saved_invariants, expected_invariants):
+        raise ValueError(
+            "checkpoint protocol snapshot mismatch outside retargetable WSD fields: "
+            f"saved={saved_snapshot!r}, expected={expected_snapshot!r}"
+        )
+
+
+def _source_wsd_config(saved_snapshot: dict,
+                       target_config: AdamWWSDConfig) -> AdamWWSDConfig:
+    scheduler = saved_snapshot.get("scheduler")
+    if not isinstance(scheduler, dict):
+        raise ValueError("checkpoint protocol snapshot is missing scheduler metadata")
+    try:
+        return replace(
+            target_config,
+            max_steps=scheduler["max_steps"],
+            warmup_steps=scheduler["warmup_steps"],
+            decay_steps=scheduler["decay_steps"],
+            warmup_type=scheduler["warmup_type"],
+            decay_type=scheduler["decay_type"],
+            min_lr_ratio=scheduler["min_lr_ratio"],
+            num_cycles=scheduler["num_cycles"],
+        )
+    except KeyError as exc:
+        raise ValueError(
+            f"checkpoint protocol snapshot is missing scheduler.{exc.args[0]}"
+        ) from exc
+
+
+def prepare_adamw_wsd_resume_state(checkpoint: dict, model: nn.Module,
+                                   target_config: AdamWWSDConfig,
+                                   expected_protocol_snapshot: dict,
+                                   *, mutate: bool) -> None:
+    """Validate the saved schedule, then optionally retarget it in place."""
+    if not isinstance(checkpoint, dict):
+        raise ValueError("full resume checkpoint must be a dictionary")
+    hyper_parameters = checkpoint.get("hyper_parameters", {})
+    if not isinstance(hyper_parameters, dict):
+        raise ValueError("checkpoint hyper_parameters must be a dictionary")
+    saved_snapshot = hyper_parameters.get("protocol_snapshot")
+    if saved_snapshot is None:
+        raise ValueError(
+            "checkpoint is missing protocol_snapshot evidence required for full resume"
+        )
+    validate_wsd_retarget_protocol_snapshots(
+        saved_snapshot,
+        expected_protocol_snapshot,
+    )
+
+    source_config = _source_wsd_config(saved_snapshot, target_config)
+    validate_adamw_wsd_resume_state(checkpoint, model, source_config)
+    if not mutate:
+        return
+
+    global_step = checkpoint["global_step"]
+    if global_step >= target_config.max_steps:
+        raise ValueError(
+            f"max_steps ({target_config.max_steps}) must exceed resumed checkpoint "
+            f"global_step ({global_step})"
+        )
+
+    target_optimizer = build_adamw(model, target_config)
+    target_scheduler = build_wsd_scheduler(target_optimizer, target_config)
+    target_base_lrs = target_scheduler.state_dict()["base_lrs"]
+    target_multiplier = target_scheduler.lr_lambdas[0](global_step)
+    target_current_lrs = [
+        base_lr * target_multiplier for base_lr in target_base_lrs
+    ]
+    saved_groups = checkpoint["optimizer_states"][0]["param_groups"]
+    for saved_group, current_lr in zip(saved_groups, target_current_lrs):
+        saved_group["lr"] = current_lr
+
+    target_scheduler_state = target_scheduler.state_dict()
+    target_scheduler_state.update({
+        "base_lrs": target_base_lrs,
+        "last_epoch": global_step,
+        "_step_count": global_step + 1,
+        "_last_lr": target_current_lrs,
+    })
+    saved_scheduler_state = checkpoint["lr_schedulers"][0]
+    saved_scheduler_state.clear()
+    saved_scheduler_state.update(target_scheduler_state)
+
+
 def validate_adamw_wsd_resume_state(checkpoint: dict, model: nn.Module,
                                     config: AdamWWSDConfig) -> None:
-    """Fail before Lightning can restore state that changes the locked protocol."""
+    """Fail before Lightning can restore inconsistent AdamW/WSD state."""
     if not isinstance(checkpoint, dict):
         raise ValueError("full resume checkpoint must be a dictionary")
     global_step = checkpoint.get("global_step")

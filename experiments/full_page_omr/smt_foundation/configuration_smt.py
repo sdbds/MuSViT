@@ -9,6 +9,7 @@ class SMTFoundationConfig(PretrainedConfig):
                  in_channels=1, w2i={}, i2w={}, out_dir="SMIR", 
                  d_model=256, dim_ff=256, num_dec_layers=8, attention_backend="auto",
                  _attn_implementation_internal=None, **kwargs):
+        super().__init__(**kwargs)
         self.architectures = ["SMT"]
         self.maxh = maxh
         self.maxw = maxw
