@@ -17,12 +17,8 @@ from sklearn.metrics import classification_report, precision_recall_fscore_suppo
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.svm import SVC
 from transformers import (
-    AutoImageProcessor,
     AutoModel,
     BeitImageProcessor,
-    Kosmos2_5Model,
-    PaliGemmaForConditionalGeneration,
-    Qwen3VLForConditionalGeneration,
 )
 
 from . import data_generator
@@ -131,7 +127,7 @@ def menu():
     parser.add_argument("-dev", "--device", default=0, type=int, help="GPU device index. Uses CPU if CUDA is unavailable.")
     parser.add_argument("--dataset", default="PRAIG/polish-scores", help="Hugging Face dataset name.")
     parser.add_argument("--split", default="train", help="Dataset split to process.")
-    parser.add_argument("--model", default="Qwen/Qwen3-VL-8B-Instruct", dest="weights_encoder", help="Vision encoder model ID.")
+    parser.add_argument("--model", default="carlospm12/LSMT-MAE-Base-1024-16", dest="weights_encoder", help="MuSViT (LSMT-MAE) encoder model ID.")
     parser.add_argument("--batch-size", default=1, type=int, help="Batch size used for embedding extraction.")
     parser.add_argument("--n-neighbors", default=1, type=int, help="Number of neighbors for the KNN classifier wrapper.")
     parser.add_argument("--embeddings-dir", default="embeddings", help="Directory used to cache embeddings.")
@@ -183,10 +179,7 @@ def get_path_and_class(row):
 
 
 def get_embeddings(processor, encoder, decoder, train_generator, preprocess_mode=None, target_size=1024):
-    """
-    - Qwen: one embedding per image = mean of all tokens (tamaño fijo D)
-    - Other models: one embedding per image = flattened tokens/patches (legacy mode, no average pooling)
-    """
+    """One embedding per image = flattened tokens/patches (legacy mode, no average pooling)."""
     TARGET_LAYER_MODEL = "carlospm12/LSMT-MAE-Large-1024-16"
     TARGET_HIDDEN_LAYER_IDX = 15
 
@@ -197,7 +190,6 @@ def get_embeddings(processor, encoder, decoder, train_generator, preprocess_mode
     list_labels = []
     idx = 0
     idx_batch = 1
-    is_qwen = hasattr(encoder, "get_image_features")
 
     # ------------------------------------------------------------
     # Manual preprocessing (the pil_resize_1024)
@@ -217,15 +209,6 @@ def get_embeddings(processor, encoder, decoder, train_generator, preprocess_mode
                 pil = img
             pil = pil.convert("RGB").resize((target_size, target_size), resample=Image.BILINEAR)
 
-            # Qwen: use AutoImageProcessor to obtain image_grid_thw
-            if is_qwen and (processor is not None):
-                try:
-                    # avoid resizing again when supported by the installed version
-                    return processor(images=pil, return_tensors="pt", do_resize=False, do_center_crop=False)
-                except TypeError:
-                    return processor(images=pil, return_tensors="pt")
-
-            # other manually preprocessed models
             x = T.ToTensor()(pil).unsqueeze(0)
             return {"pixel_values": x}
 
@@ -315,80 +298,19 @@ def get_embeddings(processor, encoder, decoder, train_generator, preprocess_mode
             print("Processing batch", idx_batch)
             processed = [process_img(img) for img in images]
 
-            # -----------------------------
-            # Qwen3-VL case (AutoImageProcessor + get_image_features)
-            # -----------------------------
-            if hasattr(encoder, "get_image_features") and ("image_grid_thw" in processed[0]):
-                pixel_values = torch.cat([p["pixel_values"] for p in processed], dim=0).to(config.device)
-                image_grid_thw = torch.cat([p["image_grid_thw"] for p in processed], dim=0).to(config.device)
-                B = image_grid_thw.size(0)
+            pixel_values = torch.cat([p["pixel_values"] for p in processed], dim=0).to(config.device)
+            B = pixel_values.size(0)
 
-                out_feats = encoder.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw)
-
-                # 1) extract image embeddings robustly
-                if isinstance(out_feats, (tuple, list)):
-                    image_embeds = out_feats[0]
-                elif isinstance(out_feats, dict):
-                    image_embeds = out_feats.get("image_embeds", None)
-                    if image_embeds is None:
-                        image_embeds = out_feats.get("last_hidden_state", None)
-                    if image_embeds is None:
-                        image_embeds = out_feats.get("image_features", None)
-                    if image_embeds is None:
-                        raise RuntimeError(f"Qwen: dict without expected keys. keys={list(out_feats.keys())}")
-                else:
-                    image_embeds = out_feats
-
-                if isinstance(image_embeds, (tuple, list)):
-                    image_embeds = image_embeds[0]
-
-                # 2) pooling -> (B, D)
-                if torch.is_tensor(image_embeds):
-                    if image_embeds.dim() == 3:                 # (B, T, D)
-                        feats = image_embeds.mean(dim=1)        # (B, D)
-                    elif image_embeds.dim() == 2:
-                        if image_embeds.size(0) == B:           # (B, D)
-                            feats = image_embeds
-                        elif B == 1:                            # (T, D)
-                            feats = image_embeds.mean(dim=0, keepdim=True)
-                        else:
-                            raise RuntimeError(f"Qwen: unexpected 2D tensor {tuple(image_embeds.shape)} con B={B}")
-                    elif image_embeds.dim() == 4:               # (B, H, W, D)
-                        feats = image_embeds.mean(dim=(1, 2))   # (B, D)
-                    else:
-                        raise RuntimeError(f"Qwen: tensor with unexpected shape {tuple(image_embeds.shape)}")
-                else:
-                    # list of tensors (Ti, D)
-                    feats = torch.stack([t.mean(dim=0) for t in image_embeds], dim=0)  # (B, D) 
-
-            # -----------------------------
-            # Kosmos-2.5 case (processor devuelve flattened_patches/height/width)
-            elif "flattened_patches" in processed[0]:
-                flattened = torch.cat([p["flattened_patches"] for p in processed], dim=0).to(config.device)
-                height    = torch.cat([p["height"] for p in processed], dim=0).to(config.device)
-                width     = torch.cat([p["width"] for p in processed], dim=0).to(config.device)
-                B = flattened.size(0)
-
-                out = encoder(flattened_patches=flattened, height=height, width=width)
-                x = _extract_last_hidden(out)
-                feats = _flatten_tokens_per_image(x, B=B)  # (B, D') modo antiguo
-
-            # -----------------------------
-            # General case (BEiT/DiT/DINO/SigLIP/PaliGemma tower/etc.)
+            # ------------------------------------------------------------
+            # Special case: LSMT-MAE-Large-1024-16 -> extract embeddings from layer 15.
+            if getattr(config, "weights_encoder", None) == TARGET_LAYER_MODEL:
+                out = encoder(pixel_values=pixel_values, output_hidden_states=True, return_dict=True)
+                x = _extract_last_hidden(out, prefer_hidden_layer_idx=TARGET_HIDDEN_LAYER_IDX)
             else:
-                pixel_values = torch.cat([p["pixel_values"] for p in processed], dim=0).to(config.device)
-                B = pixel_values.size(0)
+                out = encoder(pixel_values=pixel_values)
+                x = _extract_last_hidden(out)
 
-                # ------------------------------------------------------------
-                # Special case: LSMT-MAE-Large-1024-16 -> extract embeddings from layer 15.
-                if getattr(config, "weights_encoder", None) == TARGET_LAYER_MODEL:
-                    out = encoder(pixel_values=pixel_values, output_hidden_states=True, return_dict=True)
-                    x = _extract_last_hidden(out, prefer_hidden_layer_idx=TARGET_HIDDEN_LAYER_IDX)
-                else:
-                    out = encoder(pixel_values=pixel_values)
-                    x = _extract_last_hidden(out)
-
-                feats = _flatten_tokens_per_image(x, B=B)  # (B, D') modo antiguo
+            feats = _flatten_tokens_per_image(x, B=B)  # (B, D') modo antiguo
 
             # Store one embedding per image
             feats = feats.detach().to(torch.float32).cpu()
@@ -461,33 +383,6 @@ class PixelValuesFlopsWrapper(nn.Module):
         return _extract_tensor_output(out)
 
 
-class KosmosFlopsWrapper(nn.Module):
-    def __init__(self, encoder):
-        super().__init__()
-        self.encoder = encoder
-
-    def forward(self, flattened_patches, height, width):
-        out = self.encoder(
-            flattened_patches=flattened_patches,
-            height=height,
-            width=width
-        )
-        return _extract_tensor_output(out)
-
-
-class QwenFlopsWrapper(nn.Module):
-    def __init__(self, encoder):
-        super().__init__()
-        self.encoder = encoder
-
-    def forward(self, pixel_values, image_grid_thw):
-        out = self.encoder.get_image_features(
-            pixel_values=pixel_values,
-            image_grid_thw=image_grid_thw
-        )
-        return _extract_tensor_output(out)
-
-
 def load_image_for_flops(image_ref):
     """
     image_ref can be:
@@ -508,22 +403,9 @@ def load_image_for_flops(image_ref):
 
 
 def process_one_image_for_flops(img, processor, encoder, preprocess_mode=None, target_size=1024):
-    is_qwen = hasattr(encoder, "get_image_features")
-
     if preprocess_mode == "pil_resize_1024":
         pil = load_image_for_flops(img)
         pil = pil.resize((target_size, target_size), resample=Image.BILINEAR)
-
-        if is_qwen and processor is not None:
-            try:
-                return processor(
-                    images=pil,
-                    return_tensors="pt",
-                    do_resize=False,
-                    do_center_crop=False
-                )
-            except TypeError:
-                return processor(images=pil, return_tensors="pt")
 
         x = T.ToTensor()(pil).unsqueeze(0)
         return {"pixel_values": x}
@@ -566,29 +448,11 @@ def estimate_encoder_gflops(
 
     try:
         with torch.no_grad():
-            if hasattr(encoder, "get_image_features") and "image_grid_thw" in processed:
-                wrapper = QwenFlopsWrapper(encoder).to(device).eval()
+            wrapper = PixelValuesFlopsWrapper(encoder).to(device).eval()
 
-                inputs = (
-                    processed["pixel_values"],
-                    processed["image_grid_thw"]
-                )
-
-            elif "flattened_patches" in processed:
-                wrapper = KosmosFlopsWrapper(encoder).to(device).eval()
-
-                inputs = (
-                    processed["flattened_patches"],
-                    processed["height"],
-                    processed["width"]
-                )
-
-            else:
-                wrapper = PixelValuesFlopsWrapper(encoder).to(device).eval()
-
-                inputs = (
-                    processed["pixel_values"],
-                )
+            inputs = (
+                processed["pixel_values"],
+            )
 
             flops = FlopCountAnalysis(wrapper, inputs)
             total_flops = flops.total()
@@ -617,8 +481,8 @@ def get_model_for_cost_stats(model):
     """
     Returns el submodelo sobre el que tiene más sentido contar parámetros.
 
-    For most models, 'model' ya es el encoder visual.
-    For Qwen this can be the full model, so we try to extract the visual component.
+    For MuSViT (LSMT-MAE) encoders, 'model' ya es el encoder visual; the
+    fallbacks below only matter for wrapped models that nest a vision tower.
     """
     for attr in ["visual", "vision_model", "vision_tower"]:
         if hasattr(model, attr):
@@ -710,112 +574,11 @@ def run_analysis(config):
     
     
     dict_models = {
-        "microsoft/beit-base-patch16-224-pt22k": 
-        {
-            "size":224, 
-            "image_processor": lambda model_weights: BeitImageProcessor.from_pretrained(model_weights),
-            "model": lambda model_weights: AutoModel.from_pretrained(model_weights)
-        },
-        "microsoft/beit-large-patch16-512": 
-        {
-            "size":224,
-            "image_processor": lambda model_weights: BeitImageProcessor.from_pretrained(model_weights),
-            "model": lambda model_weights: AutoModel.from_pretrained(model_weights)
-        },
-        "microsoft/dit-base": 
-        {
-            "size":224, 
-            "image_processor": lambda model_weights: BeitImageProcessor.from_pretrained(model_weights),
-            "model": lambda model_weights: AutoModel.from_pretrained(model_weights)
-        },
-        "models/MAE-8X8-Small": 
+        "models/MAE-8X8-Small":
         {
             "size":512, 
             "processor_class": BeitImageProcessor,
             "model": lambda model_weights: AutoModel.from_pretrained(model_weights)
-        },
-        "google/siglip2-so400m-patch14-384":
-        {
-            "size":384, 
-            "image_processor": lambda model_weights: AutoImageProcessor.from_pretrained(model_weights),
-            "model": lambda model_weights: AutoModel.from_pretrained(model_weights).vision_model
-        },
-        "google/siglip-so400m-patch14-384":
-        {
-            "size":384, 
-            "image_processor": lambda model_weights: AutoImageProcessor.from_pretrained(model_weights),
-            "model": lambda model_weights: AutoModel.from_pretrained(model_weights).vision_model
-        },
-        "google/siglip2-so400m-patch14-224":
-        {
-            "size":224, 
-            "image_processor": lambda model_weights: AutoImageProcessor.from_pretrained(model_weights),
-            "model": lambda model_weights: AutoModel.from_pretrained(model_weights).vision_model
-        },
-        "google/siglip-so400m-patch14-224":
-        {
-            "size":224, 
-            "image_processor": lambda model_weights: AutoImageProcessor.from_pretrained(model_weights),
-            "model": lambda model_weights: AutoModel.from_pretrained(model_weights).vision_model
-        },
-        "facebook/dinov2-base": 
-        {
-            "size":224, 
-            "image_processor": lambda model_weights: AutoImageProcessor.from_pretrained(model_weights),
-            "model": lambda model_weights: AutoModel.from_pretrained(model_weights)
-        },
-        "facebook/dinov2-large": 
-        {
-            "size":224, 
-            "image_processor": lambda model_weights: AutoImageProcessor.from_pretrained(model_weights),
-            "model": lambda model_weights: AutoModel.from_pretrained(model_weights)
-        },
-        "facebook/dinov2-giant": 
-        {
-            "size":224, 
-            "image_processor": lambda model_weights: AutoImageProcessor.from_pretrained(model_weights),
-            "model": lambda model_weights: AutoModel.from_pretrained(model_weights)
-        },
-        "google/paligemma2-3b-pt-224": 
-        {
-            "size": 224, 
-            "image_processor": lambda model_weights: AutoImageProcessor.from_pretrained(model_weights),
-            "model": lambda model_weights: PaliGemmaForConditionalGeneration.from_pretrained(model_weights).model.vision_tower
-        },
-        "google/paligemma2-3b-pt-448": 
-        {
-            "size": 448, 
-            "image_processor": lambda model_weights: AutoImageProcessor.from_pretrained(model_weights),
-            "model": lambda model_weights: PaliGemmaForConditionalGeneration.from_pretrained(model_weights).model.vision_tower
-        },
-        "google/paligemma2-3b-pt-896": 
-        {
-            "size": 896, 
-            "image_processor": lambda model_weights: AutoImageProcessor.from_pretrained(model_weights),
-            "model": lambda model_weights: PaliGemmaForConditionalGeneration.from_pretrained(model_weights).model.vision_tower
-        },
-        "Qwen/Qwen3-VL-8B-Instruct": {
-            "size": 1024,
-            "preprocess": "pil_resize_1024",
-            "image_processor": lambda w: AutoImageProcessor.from_pretrained(w),
-            "model": lambda w: Qwen3VLForConditionalGeneration.from_pretrained(w),
-        },
-
-        "facebook/dinov3-vit7b16-pretrain-lvd1689m": {
-            "size": 1024,
-            "preprocess": "pil_resize_1024",
-            "image_processor": lambda model_weights: AutoImageProcessor.from_pretrained(model_weights),
-            "model": lambda model_weights: AutoModel.from_pretrained(model_weights),
-        },
-        "facebook/dinov3-vitb16-pretrain-lvd1689m": {
-            "size": None,
-            "image_processor": lambda model_weights: AutoImageProcessor.from_pretrained(model_weights),
-            "model": lambda model_weights: AutoModel.from_pretrained(model_weights),
-        },
-        "microsoft/kosmos-2.5" : {
-            "size": None,
-            "image_processor": lambda model_weights: AutoImageProcessor.from_pretrained(model_weights),
-            "model": lambda model_weights: Kosmos2_5Model.from_pretrained(model_weights).vision_model,
         },
         "carlospm12/LSMT-MAE-Small-1024-16": {
             "size": 1024,

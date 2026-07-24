@@ -8,7 +8,7 @@ Groups three small utilities used across the project:
 
 import editdistance
 from transformers import ViTModel
-from config import data_models
+from ..config import data_models
 
 
 

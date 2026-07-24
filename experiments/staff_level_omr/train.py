@@ -16,20 +16,20 @@ Run individual experiments via executions.sh.
 import torch
 import random
 import numpy as np
-from utils.data_utils import encode_sequences, pad_sequences, filter_max_len, load_image_gt_pairs
-from datasets import CTC_ds
+from .utils.data_utils import encode_sequences, pad_sequences, filter_max_len, load_image_gt_pairs
+from .datasets import CTC_ds
 from torch.utils.data import DataLoader
-from config import data_paths, data_models
+from .config import data_paths, data_models
 from peft import LoraConfig, LoraModel
-from model import ViTRNN
+from .model import ViTRNN
 from torch.optim import Adam
-from utils.utils import engine_test
+from .utils.utils import engine_test
 import torch.nn.functional as F
 from sklearn.model_selection import train_test_split
 import time
 from torchvision import transforms as T
-from augments import get_ssl_transform
-from arguments import parser_train
+from .augments import get_ssl_transform
+from .arguments import parser_train
 import os
 
 # CTC blank symbol id. Kept at 0 throughout; the label encoder shifts real
@@ -54,7 +54,14 @@ def _worker_init_fn(worker_id):
     if augment is not None and hasattr(augment, 'set_random_seed'):
         augment.set_random_seed(seed)
 
-if __name__ == '__main__':
+def train(args):
+    """Run the full staff-level OMR training/eval loop for one configuration.
+
+    ``args`` is an argparse-style namespace with the fields defined in
+    ``arguments.py`` (ds_name, model_name, method, shape_patches, batch_size,
+    start_eval, lr). Called by ``entrypoint.run`` (the ``musvit`` CLI) and by
+    the ``__main__`` guard below. Requires a CUDA device.
+    """
 
     # --- Reproducibility ----------------------------------------------------
     # Seed the main process RNGs. Worker RNGs are seeded separately above.
@@ -64,7 +71,6 @@ if __name__ == '__main__':
     np.random.seed(seed)
 
     # --- Arguments ----------------------------------------------------------
-    args = parser_train.parse_args()
     print(args)
 
     ds_name = args.ds_name
@@ -211,4 +217,8 @@ if __name__ == '__main__':
         print('Results for', ds_name)
         cer = engine_test(model, test_dl, interpolate_pos_encoding=args.method=='lora', blank= BLANK)
         print('Test CER', cer)
+
+
+if __name__ == '__main__':
+    train(parser_train.parse_args())
 

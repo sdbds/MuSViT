@@ -1,57 +1,26 @@
-"""Preset vision-encoder lists for the embeddings sweep.
+"""Preset MuSViT-variant lists for the embeddings sweep.
 
-Migrated verbatim from the former ``script_run_experiments.sh`` so the sweep is
-available cross-platform from the ``musvit`` CLI.
+Only MuSViT (LSMT-MAE) encoders are shipped in this repository; the former
+non-MuSViT baselines have been removed. ``full`` also includes the local
+``models/MAE-8X8-Small`` checkpoint, which must be provided by the user at
+``experiments/embeddings_test/models/MAE-8X8-Small`` (it is not downloaded).
 """
 
-LIGHT_MODELS = [
-    "microsoft/beit-base-patch16-224-pt22k",
-    "microsoft/dit-base",
-    "facebook/dinov2-base",
-    "google/siglip-so400m-patch14-224",
-    "google/siglip2-so400m-patch14-224",
-]
-
-DEFAULT_MODELS = [
-    "microsoft/beit-base-patch16-224-pt22k",
-    "microsoft/beit-large-patch16-512",
-    "microsoft/dit-base",
-    "google/siglip-so400m-patch14-224",
-    "google/siglip2-so400m-patch14-224",
-    "google/siglip-so400m-patch14-384",
-    "google/siglip2-so400m-patch14-384",
-    "facebook/dinov2-base",
-    "facebook/dinov2-large",
-    "facebook/dinov3-vitb16-pretrain-lvd1689m",
-    "microsoft/kosmos-2.5",
+# The three published MuSViT (LSMT-MAE) variants.
+MUSVIT_MODELS = [
     "carlospm12/LSMT-MAE-Small-1024-16",
     "carlospm12/LSMT-MAE-Base-1024-16",
     "carlospm12/LSMT-MAE-Large-1024-16",
 ]
 
-FULL_MODELS = [
-    "microsoft/beit-base-patch16-224-pt22k",
-    "microsoft/beit-large-patch16-512",
-    "microsoft/dit-base",
-    "models/MAE-8X8-Small",
-    "google/siglip-so400m-patch14-224",
-    "google/siglip2-so400m-patch14-224",
-    "google/siglip-so400m-patch14-384",
-    "google/siglip2-so400m-patch14-384",
-    "facebook/dinov2-base",
-    "facebook/dinov2-large",
-    "facebook/dinov2-giant",
-    "google/paligemma2-3b-pt-224",
-    "google/paligemma2-3b-pt-448",
-    "google/paligemma2-3b-pt-896",
-    "Qwen/Qwen3-VL-8B-Instruct",
-    "facebook/dinov3-vit7b16-pretrain-lvd1689m",
-    "facebook/dinov3-vitb16-pretrain-lvd1689m",
-    "microsoft/kosmos-2.5",
-    "carlospm12/LSMT-MAE-Small-1024-16",
-    "carlospm12/LSMT-MAE-Base-1024-16",
-    "carlospm12/LSMT-MAE-Large-1024-16",
-]
+# One quick variant, handy for smoke tests.
+LIGHT_MODELS = ["carlospm12/LSMT-MAE-Small-1024-16"]
+
+# The three published MuSViT variants.
+DEFAULT_MODELS = list(MUSVIT_MODELS)
+
+# Everything, including the local MAE checkpoint (must exist on disk).
+FULL_MODELS = [*MUSVIT_MODELS, "models/MAE-8X8-Small"]
 
 MODEL_SETS = {
     "light": LIGHT_MODELS,

@@ -238,6 +238,12 @@ models/
 *.npz
 *.csv
 
+# Score-difficulty outputs (difficulty)
+PDFdifficulty/
+difficulty_embeddings/
+output/
+slurm_log/
+
 # OS files
 .DS_Store
 
