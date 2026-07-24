@@ -21,8 +21,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import itertools
-from config import data_models
-from utils.utils import get_pretrained_model
+from .config import data_models
+from .utils.utils import get_pretrained_model
 
 
 

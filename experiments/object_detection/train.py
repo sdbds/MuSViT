@@ -1,135 +1,225 @@
-# models/musvit_frcnn.py
-from collections import OrderedDict
-from typing import Dict, Optional
+"""Training driver for MuSViT-backbone Faster R-CNN object detection.
+
+Builds a Faster R-CNN whose backbone is a MuSViT ViT (fully fine-tuned, frozen,
+or LoRA-adapted) and trains it on a COCO-format detection dataset. The public
+entry point is :func:`train`; the ``__main__`` guard lets the module be run
+directly, but the canonical way is ``musvit object-detection``.
+
+Requires a CUDA device for anything beyond a smoke test.
+"""
+
+import argparse
+import time
+from pathlib import Path
 
 import torch
-from torch import nn
-from torchvision.models.detection import FasterRCNN
-from torchvision.models.detection.rpn import AnchorGenerator
-from torchvision.ops import FeaturePyramidNetwork, MultiScaleRoIAlign
-from torchvision.models.detection.transform import GeneralizedRCNNTransform
+from torch.utils.data import DataLoader
 
-from models.musvit_backbone import SharedMuSViTBackbone
+from .data import CocoDetectionDataset, collate_fn
+from .models.detector_factory import build_detector
+from .models.token_grid import set_model_fixed_size_and_resize_pe
 
 
-class MuSViTBackboneFPN(nn.Module):
+def _apply_finetuning(model, mode):
+    """Configure which backbone parameters train (mutates ``model`` in place).
+
+    - ``full``   : train the whole MuSViT backbone.
+    - ``frozen`` : freeze the ViT; train only FPN + detection heads.
+    - ``lora``   : freeze the ViT and inject LoRA adapters on the attention
+                   query/key/value projections (adapters + heads train).
     """
-    Tiny FPN-like wrapper around ViT.
-    - core.forward_features(x) returns B x D x h x w at stride~patch (e.g., 64x64 for 1024 input, patch=16).
-    - Projects to out_channels (P3), then creates coarser maps (P4, P5) via strided convs.
-    - Finally passes through torchvision's FPN for smoothing/alignment.
-    """
-    def __init__(self, vit_core: SharedMuSViTBackbone, out_channels: int = 256):
-        super().__init__()
-        self.core = vit_core
-        d = vit_core.hidden_size
+    vit = model.backbone.core.vit
+    if mode == "full":
+        return
+    if mode not in ("frozen", "lora"):
+        raise ValueError(f"Unknown finetuning mode: {mode!r} (expected full|frozen|lora)")
 
-        # 1x1 projection to detector's channel width
-        self.proj = nn.Conv2d(d, out_channels, 1)
+    for p in vit.parameters():
+        p.requires_grad = False
 
-        # Downsample blocks to synthesize P4 (/2) and P5 (/4) from P3
-        self.down2 = nn.Conv2d(out_channels, out_channels, 3, stride=2, padding=1)
-        self.down4 = nn.Conv2d(out_channels, out_channels, 3, stride=2, padding=1)
+    if mode == "lora":
+        from peft import LoraConfig, LoraModel
 
-        # FPN: merges/smooths the three inputs
-        self.fpn = FeaturePyramidNetwork(
-            in_channels_list=[out_channels, out_channels, out_channels],
-            out_channels=out_channels,
-            extra_blocks=None,
+        cfg = LoraConfig(
+            r=8, lora_alpha=16, lora_dropout=0.1, bias="none",
+            target_modules=["query", "key", "value"], use_rslora=True,
         )
-        self.out_channels = out_channels
-        self.feat_names = ['p3', 'p4', 'p5']
-
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        # base: B x D x h x w (e.g., h=w=64 for 1024 input w/ patch=16)
-        base = self.core.forward_features(x)
-
-        # Create three pyramid inputs:
-        p3_in = self.proj(base)       # stride ~16 (finest)
-        p4_in = self.down2(p3_in)     # stride ~32 (medium)
-        p5_in = self.down4(p4_in)     # stride ~64 (coarsest)
-
-        inputs = OrderedDict(zip(self.feat_names, (p3_in, p4_in, p5_in)))
-        return self.fpn(inputs)
+        # Wrapping keeps the module path under ``backbone.core.vit`` so the
+        # optimizer's backbone param-group still captures the LoRA adapters.
+        model.backbone.core.vit = LoraModel(vit, cfg, adapter_name="default")
 
 
-def _make_stride_scaled_anchors(patch: int, fixed_size: int = 1024) -> AnchorGenerator:
+def _build_optimizer(model, defaults, lr_backbone, lr_head, weight_decay):
+    """AdamW with two param groups: MuSViT backbone (low LR) and everything else."""
+    prefix = defaults["backbone_prefix"]  # "backbone.core.vit"
+    backbone_params, head_params = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        (backbone_params if name.startswith(prefix) else head_params).append(p)
+
+    groups = [{"params": head_params, "lr": lr_head}]
+    if backbone_params:
+        groups.append({"params": backbone_params, "lr": lr_backbone})
+    return torch.optim.AdamW(groups, weight_decay=weight_decay)
+
+
+@torch.no_grad()
+def _validation_loss(model, loader, device):
+    """Mean total loss over the val set.
+
+    Faster R-CNN only returns the loss dict in ``train`` mode, so we switch the
+    model to train mode (under ``no_grad``) purely to read the losses; this is a
+    cheap proxy for validation quality (full mAP would need ``pycocotools``).
     """
-    Build anchor sizes scaled to the backbone's patch stride AND image size.
-
-    For high-resolution images (1024+), we need smaller anchors to detect
-    small objects that become relatively smaller in the image.
-
-    Args:
-        patch: Patch size (e.g., 16)
-        fixed_size: Input image size
-
-    Returns:
-        AnchorGenerator with appropriate anchor sizes
-    """
-    s = int(patch)
-
-    if fixed_size >= 1024:
-        sizes = (
-            (s, 2*s, 4*s),        # (16, 32, 64) - P3: stride ~16
-            (2*s, 4*s, 8*s),      # (32, 64, 128) - P4: stride ~32
-            (4*s, 8*s, 16*s),     # (64, 128, 256) - P5: stride ~64
-        )
-        print(f"[anchors] Using SMALL anchors for {fixed_size}x{fixed_size}: {sizes}")
-    else:
-        sizes = (
-            (2*s, 4*s, 8*s),      # (32, 64, 128) - P3: stride ~patch
-            (4*s, 8*s, 16*s),     # (64, 128, 256) - P4: stride ~2*patch
-            (8*s, 16*s, 32*s),    # (128, 256, 512) - P5: stride ~4*patch
-        )
-        print(f"[anchors] Using STANDARD anchors for {fixed_size}x{fixed_size}: {sizes}")
-
-    aspects = (0.1, 0.25, 0.5, 1.0, 2.0, 4.0)  # Music-notation-friendly aspect ratios
-    return AnchorGenerator(sizes=sizes, aspect_ratios=(aspects, aspects, aspects))
+    model.train()
+    total, n = 0.0, 0
+    for images, targets in loader:
+        images = [img.to(device) for img in images]
+        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        losses = model(images, targets)
+        total += float(sum(losses.values()))
+        n += 1
+    return total / max(n, 1)
 
 
-def build_model_musvit_frcnn(
-    vit_model_path: str,
-    hf_token: Optional[str],
-    num_classes: int,
-    out_channels: int = 256,
-    fixed_size: int = 1024
-):
-    """
-    Build a Faster R-CNN with MuSViT+FPN backbone.
+def train(args):
+    """Fine-tune a MuSViT-backbone Faster R-CNN. ``args`` mirrors the CLI flags."""
+    device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
 
-    Notes:
-    - fixed_size: Enforces square inputs because MuSViT expects fixed size
-    - Normalization: Dataset handles normalization; transform uses neutral stats
-    - Anchors: Scaled to patch size AND image size for proper coverage
-    """
-    vit_core = SharedMuSViTBackbone(vit_model_path, token=hf_token)
-
-    backbone = MuSViTBackboneFPN(vit_core, out_channels=out_channels)
-
-    anchor_generator = _make_stride_scaled_anchors(vit_core.patch_size, fixed_size=fixed_size)
-
-    roi_pooler = MultiScaleRoIAlign(
-        featmap_names=['p3', 'p4', 'p5'],
-        output_size=7,
-        sampling_ratio=2
+    train_ds = CocoDetectionDataset(args.train_images, args.train_ann)
+    num_classes = train_ds.num_classes
+    train_dl = DataLoader(
+        train_ds, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, collate_fn=collate_fn,
     )
 
-    model = FasterRCNN(
-        backbone=backbone,
-        num_classes=num_classes,
-        rpn_anchor_generator=anchor_generator,
-        box_roi_pool=roi_pooler,
+    val_dl = None
+    if args.val_ann:
+        val_ds = CocoDetectionDataset(args.val_images or args.train_images, args.val_ann)
+        val_dl = DataLoader(
+            val_ds, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, collate_fn=collate_fn,
+        )
+
+    print(f"[object-detection] {num_classes - 1} foreground classes (+background), "
+          f"{len(train_ds)} training images, finetuning={args.finetuning}")
+
+    model, defaults = build_detector(
+        args.model, num_classes=num_classes,
+        vit_small_model_path=args.vit_small_model_path,
+        vit_base_model_path=args.vit_base_model_path,
+        hf_token=args.hf_token, out_channels=args.out_channels,
+        fixed_size=args.fixed_size,
+    )
+    # Keep the detector's input size aligned with MuSViT's fixed token grid.
+    set_model_fixed_size_and_resize_pe(model, args.model, target_tokens=args.target_tokens)
+    _apply_finetuning(model, args.finetuning)
+    model.to(device)
+
+    optimizer = _build_optimizer(
+        model, defaults, args.lr_backbone, args.lr_head, args.weight_decay,
     )
 
-    # I/O policy: fixed size; neutral stats (dataset already normalized)
-    model.transform = GeneralizedRCNNTransform(
-        min_size=fixed_size,
-        max_size=fixed_size,
-        image_mean=[0., 0., 0.],
-        image_std=[1., 1., 1.],
-        size_divisible=32,
-        fixed_size=(fixed_size, fixed_size),
-    )
+    start_epoch = 0
+    if args.from_checkpoint:
+        ckpt = torch.load(args.from_checkpoint, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        start_epoch = ckpt.get("epoch", 0)
+        print(f"[object-detection] resumed from {args.from_checkpoint} @ epoch {start_epoch}")
 
-    return model
+    run = None
+    if args.use_wandb:
+        import wandb
+
+        run = wandb.init(
+            project="musvit-object-detection",
+            name=args.experiment_name or None,
+            config=vars(args),
+        )
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    best_val = float("inf")
+    for epoch in range(start_epoch + 1, args.epochs + 1):
+        model.train()
+        running, n, t0 = 0.0, 0, time.time()
+        for images, targets in train_dl:
+            images = [img.to(device) for img in images]
+            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+            losses = model(images, targets)
+            loss = sum(losses.values())
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            running += float(loss)
+            n += 1
+
+        train_loss = running / max(n, 1)
+        log = {"epoch": epoch, "train_loss": train_loss}
+        msg = (f"Epoch [{epoch}/{args.epochs}] train_loss {train_loss:.4f} "
+               f"({(time.time() - t0) / 60:.1f} min)")
+
+        if val_dl is not None:
+            val_loss = _validation_loss(model, val_dl, device)
+            log["val_loss"] = val_loss
+            msg += f" | val_loss {val_loss:.4f}"
+            if val_loss < best_val:
+                best_val = val_loss
+                torch.save(
+                    {"model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                     "epoch": epoch, "args": vars(args)},
+                    out_dir / "ckpt-best.pt",
+                )
+
+        print(msg)
+        if run is not None:
+            run.log(log)
+
+        torch.save(
+            {"model": model.state_dict(), "optimizer": optimizer.state_dict(),
+             "epoch": epoch, "args": vars(args)},
+            out_dir / "ckpt-latest.pt",
+        )
+
+    if run is not None:
+        run.finish()
+
+
+def _build_arg_parser():
+    p = argparse.ArgumentParser(
+        description="Train a MuSViT-backbone Faster R-CNN for object detection.")
+    p.add_argument("--model", default="musvit_base", choices=["musvit_small", "musvit_base"])
+    p.add_argument("--train_images", required=True, help="Directory with training images.")
+    p.add_argument("--train_ann", required=True, help="COCO-format training annotations JSON.")
+    p.add_argument("--val_images", default=None)
+    p.add_argument("--val_ann", default=None, help="COCO-format validation annotations JSON.")
+    p.add_argument("--vit_base_model_path", default="PRAIG/musvit")
+    p.add_argument("--vit_small_model_path", default="PRAIG/musvit-light")
+    p.add_argument("--hf_token", default=None)
+    p.add_argument("--finetuning", default="lora", choices=["full", "frozen", "lora"])
+    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument("--batch_size", type=int, default=2)
+    p.add_argument("--lr_backbone", type=float, default=5e-5)
+    p.add_argument("--lr_head", type=float, default=2.5e-4)
+    p.add_argument("--weight_decay", type=float, default=1e-2)
+    p.add_argument("--fixed_size", type=int, default=1024)
+    p.add_argument("--target_tokens", type=int, default=4096)
+    p.add_argument("--out_channels", type=int, default=256)
+    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--out_dir", default="weights")
+    p.add_argument("--from_checkpoint", default=None)
+    p.add_argument("--use_wandb", action="store_true")
+    p.add_argument("--experiment_name", default=None)
+    p.add_argument("--device", type=int, default=0)
+    return p
+
+
+if __name__ == "__main__":
+    train(_build_arg_parser().parse_args())

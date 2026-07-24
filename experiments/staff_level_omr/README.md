@@ -80,8 +80,8 @@ embeddings to the exact `rows × cols` grid, so wider inputs are supported.
 
 ## Requirements
 
-The code targets Python 3.10+ and a CUDA-capable GPU (training calls `.cuda()`
-directly). Core dependencies:
+The code runs inside the shared MuSViT monorepo environment (Python 3.11+) and
+needs a CUDA-capable GPU (training calls `.cuda()` directly). Core dependencies:
 
 - `torch`, `torchvision`
 - `transformers`  (loads the MusViT checkpoint; requires `trust_remote_code`)
@@ -91,15 +91,12 @@ directly). Core dependencies:
 - `editdistance`  (CER metric)
 - `Pillow`, `numpy`
 
-Example install:
+Install the shared monorepo environment once from the repository root (this pulls
+in `torch`, `transformers`, `peft`, `albumentations`, … and the `musvit` command):
 
 ```bash
-pip install torch torchvision transformers peft albumentations opencv-python \
-            scikit-learn editdistance pillow numpy
+uv sync
 ```
-
-> **Note on `numpy`:** `data_utils.py` uses `np.concat`, which requires a recent
-> NumPy (2.0+). On older versions replace it with `np.concatenate`.
 
 ---
 
@@ -149,13 +146,13 @@ No manual download is needed; `transformers` fetches and caches the weights.
 ### Single training run
 
 ```bash
-python train.py \
+uv run musvit staff-level-omr \
     --model_name=musvit \
     --ds_name=catedrales \
     --method=lora \
     --batch_size=8 \
     --start_eval 20 \
-    --shape_patches 8 128 \
+    --shape_patches '[8,128]' \
     --lr=0.0003
 ```
 
@@ -164,23 +161,23 @@ python train.py \
 `executions.sh` runs every dataset for both methods (linear probing then LoRA):
 
 ```bash
-bash executions.sh
+bash experiments/staff_level_omr/executions.sh
 ```
 
 ### Arguments
 
 | Argument          | Default        | Description                                                            |
 |-------------------|----------------|------------------------------------------------------------------------|
-| `--ds_name`       | `smb`          | Dataset key from `config.data_paths`.                                  |
-| `--model_name`    | `dinov3_base`  | Backbone key from `config.data_models` (use `musvit` / `musvit_light`).|
+| `--ds_name`       | `catedrales`   | Dataset key from `config.data_paths`.                                  |
+| `--model_name`    | `musvit`       | Backbone key from `config.data_models` (`musvit` or `musvit_light`).   |
 | `--method`        | `lora`         | `linear_prob` or `lora`.                                               |
 | `--shape_patches` | `8 64`         | Patch grid `rows cols`; `cols` is the CTC time-axis length.           |
 | `--batch_size`    | `8`            | Mini-batch size for all dataloaders.                                   |
 | `--start_eval`    | `20`           | First epoch at which validation / checkpointing begins.               |
 | `--lr`            | `0.0003`       | Adam learning rate.                                                    |
 
-> The defaults for `--ds_name` and `--model_name` are placeholders; always pass
-> a valid dataset key and a real backbone (`musvit` or `musvit_light`).
+> Make sure the `--ds_name` you pass exists in `config.data_paths` and points at
+> local data; `--model_name` must be `musvit` or `musvit_light`.
 
 ---
 
