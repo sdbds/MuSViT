@@ -454,6 +454,21 @@ class DataLoaderPipelineTests(unittest.TestCase):
         )
         self.assertEqual(single_resize["data"]["skip_steps"], 282200)
 
+    def test_powershell_launcher_defaults_to_single_resize_config(self):
+        script = (
+            Path(__file__).resolve().parents[1] / "2.full_page_omr.ps1"
+        ).read_text(encoding="utf-8")
+        config_line = next(
+            line for line in script.splitlines()
+            if line.strip().startswith("config_path")
+        )
+
+        self.assertIn(
+            "experiments/full_page_omr/config/Polish_Scores/"
+            "finetuning_single_resize.json",
+            config_line,
+        )
+
     def test_vocabulary_iteration_reads_only_arrow_transcriptions(self):
         rows = _FakeArrowRows()
         with (

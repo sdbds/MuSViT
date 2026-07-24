@@ -6,6 +6,6 @@
         "num_workers": 24,
         "tokenization_mode": "bekern",
         "reduce_ratio": 1.0,
-        "skip_steps": 282200
+        "skip_steps": 0
     }
 }
