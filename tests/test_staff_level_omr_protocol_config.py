@@ -7,6 +7,7 @@ from experiments.staff_level_omr.protocol import (
     StaffOMRConfig,
     canonical_json_bytes,
     canonical_sha256,
+    read_json,
 )
 
 
@@ -53,6 +54,14 @@ def test_canonical_json_is_compact_utf8_and_order_independent():
 def test_canonical_json_rejects_non_finite_numbers(value):
     with pytest.raises(ProtocolError, match="finite"):
         canonical_json_bytes({"learning_rate": value})
+
+
+def test_json_reader_wraps_invalid_utf8_as_protocol_error(tmp_path):
+    path = tmp_path / "invalid.json"
+    path.write_bytes(b'{"value":"\xff"}')
+
+    with pytest.raises(ProtocolError, match="invalid UTF-8 JSON"):
+        read_json(path)
 
 
 def test_config_normalizes_legacy_method_and_derives_geometry(config_paths):

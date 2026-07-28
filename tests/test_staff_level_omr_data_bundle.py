@@ -230,6 +230,20 @@ def test_prepare_data_never_overwrites_existing_output(tmp_path):
         )
 
 
+def test_prepare_data_rejects_scalar_split_ratios_without_type_leak(tmp_path):
+    data_path = _make_dataset(tmp_path)
+
+    with pytest.raises(ProtocolError, match="split_ratios"):
+        prepare_dataset_bundle(
+            data_path=data_path,
+            dataset_id="fixture",
+            group_regex=GROUP_REGEX,
+            split_ratios=0.8,
+            seed=7,
+            out=tmp_path / "bundle",
+        )
+
+
 def test_bundle_rejects_duplicate_sample_and_cross_split_group(tmp_path):
     data_path, bundle_path, _ = _prepare(tmp_path)
     manifest = read_json(bundle_path / "split_manifest.json")

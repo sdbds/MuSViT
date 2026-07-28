@@ -52,6 +52,8 @@ def read_json(path: str | Path) -> Any:
     source = Path(path)
     try:
         raw = source.read_text(encoding="utf-8")
+    except UnicodeError as exc:
+        raise ProtocolError(f"invalid UTF-8 JSON in {source}: {exc}") from exc
     except OSError as exc:
         raise ProtocolError(f"cannot read JSON file {source}: {exc}") from exc
 
@@ -59,7 +61,7 @@ def read_json(path: str | Path) -> Any:
         return json.loads(raw, object_pairs_hook=_unique_object)
     except ProtocolError:
         raise
-    except (json.JSONDecodeError, UnicodeError) as exc:
+    except json.JSONDecodeError as exc:
         raise ProtocolError(f"invalid UTF-8 JSON in {source}: {exc}") from exc
 
 

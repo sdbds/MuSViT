@@ -63,32 +63,16 @@ class LayeredMetrics:
         result: dict[str, Any] = {
             f"{prefix}_CER_all": self.cer_all,
             f"{prefix}_CER_feasible": self.cer_feasible,
-            f"{prefix}_feasible_samples": self.feasible_samples,
-            f"{prefix}_infeasible_samples": self.infeasible_samples,
-            f"{prefix}_infeasible_ratio": self.infeasible_ratio,
         }
         if prefix == "val" or self.ctc_loss_feasible is not None:
             result[f"{prefix}_CTC_loss_feasible"] = self.ctc_loss_feasible
-            if prefix == "val":
-                ordered = {
-                    f"{prefix}_CER_all": result[f"{prefix}_CER_all"],
-                    f"{prefix}_CER_feasible": result[
-                        f"{prefix}_CER_feasible"
-                    ],
-                    f"{prefix}_CTC_loss_feasible": result[
-                        f"{prefix}_CTC_loss_feasible"
-                    ],
-                    f"{prefix}_feasible_samples": result[
-                        f"{prefix}_feasible_samples"
-                    ],
-                    f"{prefix}_infeasible_samples": result[
-                        f"{prefix}_infeasible_samples"
-                    ],
-                    f"{prefix}_infeasible_ratio": result[
-                        f"{prefix}_infeasible_ratio"
-                    ],
-                }
-                return ordered
+        result.update(
+            {
+                f"{prefix}_feasible_samples": self.feasible_samples,
+                f"{prefix}_infeasible_samples": self.infeasible_samples,
+                f"{prefix}_infeasible_ratio": self.infeasible_ratio,
+            }
+        )
         return result
 
 

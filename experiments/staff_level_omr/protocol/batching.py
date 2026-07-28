@@ -45,6 +45,16 @@ def ctc_collate(
             raise ProtocolError(
                 f"batch item {index} target must be a 1-D tensor"
             )
+        if target.dtype not in {
+            torch.uint8,
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+        }:
+            raise ProtocolError(
+                f"batch item {index} target must use an integer dtype"
+            )
         if (
             isinstance(target_length, bool)
             or not isinstance(target_length, int)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
@@ -97,11 +98,11 @@ class Vocabulary:
             raise ProtocolError("vocabulary token values must be non-empty strings")
         if len(set(raw_tokens)) != len(raw_tokens):
             duplicates = sorted(
-                {
+                (
                     token
-                    for token in raw_tokens
-                    if raw_tokens.count(token) > 1
-                },
+                    for token, count in Counter(raw_tokens).items()
+                    if count > 1
+                ),
                 key=lambda token: token.encode("utf-8"),
             )
             raise ProtocolError(

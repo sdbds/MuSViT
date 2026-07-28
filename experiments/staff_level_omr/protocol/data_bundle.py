@@ -269,7 +269,11 @@ def _discover_pairs(data_path: Path) -> list[tuple[str, str]]:
 
 
 def _normalize_split_weights(values: Sequence[Any]) -> tuple[int, int, int]:
-    if isinstance(values, (str, bytes)) or len(values) != 3:
+    if (
+        isinstance(values, (str, bytes))
+        or not isinstance(values, Sequence)
+        or len(values) != 3
+    ):
         raise ProtocolError("split_ratios must contain exactly three values")
     fractions: list[Fraction] = []
     for index, value in enumerate(values):

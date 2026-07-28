@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .protocol import prepare_dataset_bundle
+from .protocol.data_bundle import prepare_dataset_bundle
 
 
 def prepare_data(

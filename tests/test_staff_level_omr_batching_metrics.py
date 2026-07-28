@@ -94,6 +94,21 @@ def test_ctc_collate_rejects_invalid_batches(items, message):
         ctc_collate(items)
 
 
+def test_ctc_collate_rejects_float_targets_instead_of_truncating():
+    with pytest.raises(ProtocolError, match="integer dtype"):
+        ctc_collate(
+            [
+                (
+                    torch.zeros(3, 4, 5),
+                    torch.tensor([1.5, 2.0]),
+                    2,
+                    "float-target",
+                    True,
+                )
+            ]
+        )
+
+
 def test_split_targets_rejects_inconsistent_total_length():
     with pytest.raises(ProtocolError, match="sum"):
         split_concatenated_targets(torch.tensor([1, 2]), [1, 2])
