@@ -2,7 +2,9 @@
 
 日期：2026-07-25
 
-状态：已审批，待实现
+状态：已复审，待实现
+
+最后复审：2026-07-29
 
 目标协议：`staff_omr_v2`
 
@@ -23,8 +25,10 @@ checkpoint 和恢复契约，部分错误会在训练过程中被静默掩盖。
 1. manifest 中每个 train 样本要么参与训练并产生合法 CTC 梯度，要么被配置
    显式排除并留下审计记录，否则在加载模型前触发明确错误。
 2. 数据划分、词表、增强、输入几何和基础模型具有稳定身份。
-3. run artifact bundle 配合同内容的 `data_path` 和 approved base revision
-   能恢复训练；checkpoint 单文件包含把预测 id 解码为符号所需的信息。
+3. run artifact bundle 配合同内容的 `data_path` 和 approved base
+   revision/weight identity
+   能恢复训练；checkpoint 单文件包含既有预测 id 到符号的映射，但不伪装成
+   包含冻结 base 权重的自包含推理模型。
 4. 同一配置的重复运行不会覆盖彼此的产物。
 5. 评估结果能够说明多少样本受输出长度上限影响。
 6. 关键契约由不依赖私有数据、网络和 GPU 的测试覆盖。
@@ -55,17 +59,25 @@ checkpoint 和恢复契约，部分错误会在训练过程中被静默掩盖。
 - PowerShell launcher 的实现或改造。
 - 自动猜测文件名中的 `group_id` 语义。
 - 通用数据迁移框架；本期准备命令只支持当前成对的 staff image/target 目录。
-- 多 worker 且启用随机增强时的 bitwise resume 保证。
+- GPU、跨依赖版本或跨设备的完整训练 bitwise resume 保证。
 - 把 metadata 不完整的 legacy checkpoint 转换为 v2。
 
 `num_workers`、`max_epochs`、`start_eval` 和 `patience` 会进入统一配置，
 目的是消除硬编码并支持校验，不在本期宣称性能收益。
 
 这不是几处“低风险优化”，而是跨数据、模型、训练和产物边界的协议升级。
-实现应分两次可审查提交：第一片先交付 dataset bundle、配置预检、CTC policy、
-词表/变长 collate、独立 run 目录和分层 CER；第二片再交付显式输入/增强契约、
-epoch resume、完整 checkpoint schema、README 和集成测试。任一片都不能在
-§18 全部通过前自称 `staff_omr_v2` 完成。
+实现应分两次可审查提交，但不能制造一个短命的中间 checkpoint 协议：
+
+1. 第一片只交付内部 foundation primitives 及其单元测试：dataset bundle、
+   配置规范化、CTC policy/排除文件、词表、变长 collate 和分层指标函数。
+   `prepare-data` 可以作为独立工具公开；训练入口仍保持 legacy，不得写
+   `staff_omr_v2` run、指标或 checkpoint。
+2. 第二片原子切换训练 runtime：接入派生输入几何、确定性样本顺序与增强、
+   run 目录、完整 checkpoint/resume/finalization、CLI、README 和集成测试，
+   同时删除可执行的 v1 训练路径。
+
+因此不存在 `staff_omr_v2_slice1`、临时 checkpoint schema 或一次性迁移器。
+第二片在 §18 全部通过前不能自称 `staff_omr_v2` 完成。
 
 ## 4. 审查裁决
 
@@ -85,6 +97,10 @@ epoch resume、完整 checkpoint schema、README 和集成测试。任一片都�
 | epoch、patience、workers 硬编码 | 配置不可审计 | 纳入单一配置并验证 |
 | manifest 和词表没有生产入口 | 协议无法用于真实数据 | 提供一次性、确定性的 `prepare-data` 命令 |
 | 增强未进入配置 hash | 训练身份不完整 | 有序增强契约进入 training contract |
+| 增强 RNG 绑定 worker seed | worker 数会改变训练样本 | 样本/epoch 派生增强 seed，worker 不参与语义 |
+| 输入几何自由字段却被 method 唯一决定 | 默认 linear probe 会撞组合校验 | v2 由 method 派生并拒绝显式覆盖 |
+| 大型排除列表内联配置 | 配置膨胀且难操作 | 使用绑定 manifest/宽度的规范化排除文件 |
+| base 权重未进入 registry identity | trainable-only checkpoint 依赖不完整 | 固定权重文件 size、LFS SHA-256 和 pointer oid |
 | 每个 checkpoint 嵌入 manifest | 重复 I/O 且无恢复价值 | run 目录保存副本；checkpoint 只保存路径和 hash |
 
 ### 4.2 接受问题，调整处理方式
@@ -94,14 +110,15 @@ manifest 只描述数据集成员和 group-disjoint split，不描述某个模�
 否则同一数据集在不同宽度下会获得不同身份。
 
 训练样本不再由 `filter_max_len` 隐式丢弃。默认
-`train_infeasible_policy = fail`；只有显式使用 `exclude_listed` 并在配置中
-列出全部不可行训练样本 id 时，才允许排除。排除列表进入 training contract
-hash，预检输出数量、比例和 target/required-frames 分布。manifest、词表和
-评估集合保持不变。
+`train_infeasible_policy = fail`；只有显式使用 `exclude_listed` 并提供
+规范化排除文件时，才允许排除。排除文件的 canonical hash 和样本数进入
+training contract，预检输出数量、比例和 target/required-frames 分布。
+manifest、词表和评估集合保持不变。
 
 验证和测试 split 中的不可行样本保留。它们反映模型时间轴容量的真实限制，
 但必须同时报告全量 CER、可行子集 CER、不可行样本数量和比例。跨 patch
-宽度比较时，以全量 CER 为主指标，并同时展示容量统计。
+宽度比较只适用于 v2 的 LoRA/exact-grid；以全量 CER 为主指标，并同时展示
+容量统计。
 
 词表不应在每次训练时从 test split 临时 fit。对于 closed-vocabulary OMR，
 词表可以来自完整语料，但必须由准备命令生成独立、版本化的词表文件，并在
@@ -109,8 +126,9 @@ hash，预检输出数量、比例和 target/required-frames 分布。manifest�
 
 linear probe 不强行切换到 exact-grid。冻结 backbone 时，原生输入网格和
 原生位置编码更接近 MuSViT 发布的 zero-shot 用法；位置编码插值可能带来无法
-由冻结 backbone 吸收的分布变化。v2 将输入几何设为显式字段，并为每种方法
-只开放一个保守的首版组合；跨几何比较留作一次性受控实验。
+由冻结 backbone 吸收的分布变化。v2 为每种 method 固定一个保守几何并把
+派生结果显式写入 contract，但不把一个已被 method 唯一决定的值伪装成用户
+配置。跨几何比较留作一次性受控实验和后续协议。
 
 ### 4.3 延后并要求证据
 
@@ -145,6 +163,10 @@ linear probe 不强行切换到 exact-grid。冻结 backbone 时，原生输入�
   loss；是否裁剪梯度必须在后续实验中单独验证。
 - 不把 metadata cache 设为可信基线默认。size/mtime 可在内容变化时保持不变，
   与“稳定内容身份”目标冲突；v2 默认全量 image hash，cache 只能显式降级。
+- 不因“同一 run 已经校验过”就在 resume 时沿用
+  `data_verification=content_verified`。数据文件可在两次进程之间被替换且
+  保持 size/mtime；除非数据存储本身不可变或按内容寻址，每次 resume 仍需按
+  所选验证模式重新验证。
 
 ## 5. 版本和兼容边界
 
@@ -214,7 +236,8 @@ training contract hash 和 input contract。旧结果可作为历史参考，但
 
 引入一个不可变、经过验证的 `StaffOMRConfig`。CLI、直接 Python 调用和
 checkpoint 恢复都使用这一结构。配置分为训练语义和运行环境两层，避免把
-`num_workers`、输出路径之类的运维字段误当成模型身份。
+`num_workers`、输出路径之类的运维字段误当成模型身份。此前 worker seed 会
+改变增强内容的问题由 §12.2 从根上解除，而不是把 worker 数塞进训练身份。
 
 配置至少包含：
 
@@ -226,12 +249,11 @@ checkpoint 恢复都使用这一结构。配置分为训练语义和运行环境
 | `model_name` | 受支持的 MuSViT alias |
 | `model_revision` | Hugging Face 不可变 commit SHA |
 | `method` | `linear_probe` 或 `lora` |
-| `input_geometry` | `native_pad` 或 `exact_grid`；组合约束见 11.1 |
 | `patch_rows` | 正整数 |
 | `patch_cols` | 正整数 |
 | `augmentation_profile` | `staff_omr_train_v1` 或 `none` |
 | `train_infeasible_policy` | `fail` 或 `exclude_listed` |
-| `train_excluded_sample_ids` | 去重、排序后的 sample id 数组 |
+| `train_exclusions_path` | `exclude_listed` 时必填的规范 JSON 路径；其他 policy 时必须为空 |
 | `batch_size` | 正整数 |
 | `num_workers` | 非负整数 |
 | `learning_rate` | 有限正数 |
@@ -265,12 +287,11 @@ registry 中时才接受，否则要求先审核并更新 alias，绝不自动�
 model_name = musvit
 model_revision = alias.default_approved_revision
 method = lora
-input_geometry = exact_grid
 patch_rows = 8
 patch_cols = 64
 augmentation_profile = staff_omr_train_v1
 train_infeasible_policy = fail
-train_excluded_sample_ids = []
+train_exclusions_path = null
 batch_size = 8
 num_workers = 6
 learning_rate = 3e-4
@@ -283,14 +304,28 @@ device = cuda
 verify_image_hashes = always
 ```
 
+规范化配置由 `method` 唯一派生：
+
+```text
+linear_probe -> input_geometry = native_pad
+lora         -> input_geometry = exact_grid
+```
+
+`input_geometry` 写入规范化配置、`training_contract` 和 `input_contract`，
+但 v2 CLI 和公开 Python 构造器都不接受该输入；显式传
+`--input_geometry` 必须报错并说明跨几何实验属于 §19.2。这样最自然的
+`--method linear_probe` 调用会得到合法的 `native_pad`，不要求用户补一个
+由 method 已经决定的参数。
+
 准备好 bundle 后，最小新运行入口必须可直接执行：
 
 ```text
 uv run musvit staff-level-omr train --experiment_name catedrales-lora --data_path <directory> --dataset_bundle_path <dataset-bundle-directory>
 ```
 
-除 revision 解析和随后才能执行的 backbone metadata 校验外，配置校验必须在
-下载或加载 backbone、创建 CUDA context、启动 DataLoader workers 之前完成。
+除 revision 解析、registry 中小型 config/evidence 的读取以及由此派生的
+backbone metadata 校验外，配置和数据预检必须在下载/加载实际 base 权重、
+创建 CUDA context、启动 DataLoader workers 之前完成。
 
 配置还固定记录当前优化协议：
 
@@ -310,13 +345,16 @@ backbone 参数不得进入 optimizer param group。
 配置解析后生成两个 canonical JSON：
 
 1. `training_contract`：包含 protocol、manifest/vocabulary hash、基础模型
-   id/revision、method、输入几何、patch grid、预处理、完整增强契约、CTC
-   排除策略和列表、task-head schema、CTC loss、batch size、seed、优化器、
-   learning rate、LoRA 参数、`start_eval` 和 `patience`。其 SHA-256 是实验
-   语义身份。
+   id/revision/weight SHA-256、method、输入几何、patch grid、预处理、完整
+   增强契约、CTC
+   排除策略、排除文件 canonical hash/数量、task-head schema、CTC loss、
+   batch size、seed、`staff_omr_sample_epoch_sha256_v1` 播种协议、样本顺序协议、
+   优化器、learning rate、LoRA 参数、`start_eval` 和 `patience`。其
+   SHA-256 是实验语义身份。
 2. `launch_config`：包含完整用户配置和实际运行字段，包括 `max_epochs`、
-   `num_workers`、device、路径及 image hash 验证模式。每次新建或恢复调用均
-   保存一份及其 SHA-256，用于审计，不作为一刀切的 resume 拒绝条件。
+   `num_workers`、device、输入文件路径及 image hash 验证模式。每次新建或
+   恢复调用均保存一份及其 SHA-256，用于审计，不作为一刀切的 resume
+   拒绝条件。
 
 `max_epochs` 是预算上限而不是每步训练语义，故不进入 `training_contract`；
 只允许在 resume 时增大。`experiment_name`、路径和 worker 数也不进入
@@ -494,10 +532,12 @@ hash 绑定的只读 verification index。训练默认
   hash、相对路径、size 和 mtime 均匹配的 image 才跳过重算；缺失或任一字段
   变化时重新计算该文件 hash。
 
-每次运行记录 index 命中数、重算数和验证模式。`always` 的 run 标记为
+每次进程启动（包括 resume）都重新执行上述验证并记录 index 命中数、重算数
+和验证模式。`always` 的 run 标记为
 `data_verification=content_verified`；`cached` 是显式的性能与检测强度降级，
 标记为 `data_verification=cached_metadata`，不得把它描述为对保持 size/mtime
-修改的内容证明，也不得用作发布 v2 可信基线的验收 run。
+修改的内容证明，也不得用作发布 v2 可信基线的验收 run。先前进程的成功记录
+只能证明当时读取的内容，不能替代 resume 时的验证。
 
 ## 8. 词表契约
 
@@ -559,10 +599,35 @@ minimum_frames(target) > patch_cols
 
 处置由配置决定：
 
-- `fail`：集合非空即在加载 backbone 前终止。
-- `exclude_listed`：`train_excluded_sample_ids` 必须与预检得到的不可行训练
-  sample id 集合完全相等。漏列、重复、列入可行样本或列入 val/test 样本均
-  失败。通过后只从本次训练 DataLoader 排除这些 id，不修改 manifest。
+- `fail`：集合非空即在加载 backbone 前终止。失败 run 写出可直接复用的
+  `train_exclusions.candidate.json`，错误信息展示其路径。
+- `exclude_listed`：`train_exclusions_path` 的 canonical sample id 集合必须
+  与预检得到的不可行训练集合完全相等。漏列、重复、列入可行样本或列入
+  val/test 样本均失败。通过后只从本次训练 DataLoader 排除这些 id，不修改
+  manifest。
+
+排除文件是唯一受支持的列表输入，不再同时维护 inline/file 两种形态：
+
+```json
+{
+  "schema_version": "staff_omr_train_exclusions_v1",
+  "source_manifest_sha256": "<64 lowercase hex chars>",
+  "patch_cols": 64,
+  "required_frames_algorithm": "ctc_minimum_frames_v1",
+  "sample_ids": [
+    "score01-page03-staff02"
+  ]
+}
+```
+
+`sample_ids` 按 UTF-8 字节序排序且不得重复；manifest hash、`patch_cols` 和算法
+必须与本次运行完全相等。文件按 §6 的 canonical JSON 规则计算 SHA-256。
+`exclude_listed` 时 training contract 保存 policy、canonical hash 和 count，
+launch config 另存源路径；run 内复制为 `train_exclusions.json`，resume 只读
+该副本。`fail` policy 的 contract 固定保存 exclusion hash 为 JSON `null`、
+count 为 0；生成的 candidate 不会反向改变本次失败 run 的身份。candidate
+使用相同 schema，因此用户审阅后可以直接作为下一次运行的
+`train_exclusions_path`，不需要复制上万条 CLI 参数。
 
 应用 policy 后必须满足 `retained_train_samples > 0`；全量 train 都不可行时
 在创建 DataLoader 前失败，不能把空集合留给 shuffle sampler 或 loss 聚合。
@@ -614,9 +679,13 @@ target length 后对可行样本取算术平均，避免最后一个 batch 改�
 split 没有可行样本，其 `CER_feasible` 以及 validation 的 feasible loss 写为
 JSON `null`，同时记录 feasible sample count 为 0。
 
-跨 `patch_cols` 报告可以共享 manifest、词表和全量评估集合，但若训练排除
-列表不同，就不是只改变宽度的纯因果比较。报告必须并列展示各自排除列表 hash
-和分布，不得隐藏这一训练分布差异。
+v2 中只有 `lora + exact_grid` 能改变 `patch_cols`。`linear_probe +
+native_pad` 要求 `patch_cols == native_cols`，对当前两个 approved MuSViT
+alias 均由配置推导为 64；runtime 仍不得写死 `64`。LoRA 跨宽度报告可以共享
+manifest、词表和全量评估集合，但若训练排除文件不同，就不是只改变宽度的
+纯因果比较。报告必须并列展示各自排除文件 hash 和分布，不得隐藏这一训练
+分布差异。linear probe 与 LoRA 的比较同时改变 method 和几何，不能伪装成
+单变量宽度消融。
 
 ## 10. Target 数据管线
 
@@ -637,26 +706,36 @@ Dataset 不执行全局 padding。训练 collate 将一个 batch 的 target 拼�
 `input_lengths` 按当前输出 tensor 的 batch size 和时间维生成。实现可以使用
 CPU long tensor或按 batch size 缓存，但必须正确处理最后一个较小 batch。
 
-DataLoader 语义固定为 train `shuffle=true`、val/test `shuffle=false`、
-所有 split `drop_last=false`、`persistent_workers=false`。最后一项保证每个
-epoch 重新创建 worker 并执行 12.2 的播种函数；未来启用 persistent workers
-属于性能协议变更。以上语义字段进入 `training_contract`，`num_workers` 本身
-只进入 launch config。
+DataLoader 语义固定为：
+
+```text
+train sampler = sha256_epoch_order_v1 (§12.2)
+train shuffle = false  # sampler 已给出完整顺序
+val/test order = manifest sample_id order
+in_order = true
+drop_last = false
+persistent_workers = false
+```
+
+显式 sampler 与 `shuffle=true` 不得并用。`in_order=true` 保证 worker 完成顺序
+不改变 batch 交付顺序；每个 epoch 重新创建 worker，但增强 seed 不再来自
+worker。以上语义字段进入 `training_contract`，`num_workers` 本身只进入
+launch config，并由跨 worker 的逐字节输入测试证明它不是训练语义。
 
 ## 11. 输入和模型契约
 
 ### 11.1 输入几何
 
-`input_geometry` 是显式配置，而不是由 `method` 在模型内部偷偷分支。v2 首版
-只接受两个经过命名的组合：
+`input_geometry` 是协议派生字段，而不是用户自由配置，也不能散落在模型内部
+偷偷分支。配置规范化只生成两个经过命名的组合：
 
 | method | input_geometry | v2 行为 |
 |---|---|---|
 | `linear_probe` | `native_pad` | 冻结 backbone，保持预训练原生位置网格 |
 | `lora` | `exact_grid` | adapter 可训练，按目标网格插值位置编码 |
 
-其他组合在配置预检时报错。字段仍分开保存，是为了让未来受控实验能够开放新
-组合而不改变名称含义。
+公开入口显式提供 `input_geometry` 一律报错。字段仍分开保存到 contract，
+是为了让产物自描述，并让未来新协议能开放受控组合而不改变名称含义。
 
 `native_pad`：
 
@@ -680,14 +759,19 @@ height = patch_rows * backbone_patch_height
 width  = patch_cols * backbone_patch_width
 ```
 
-image 直接 resize 到该尺寸，不 crop 或 pad，并显式启用 backbone 的位置编码
-插值。移除 prefix token 后按 `patch_rows x patch_cols` reshape。
+image 直接 resize 到该尺寸，不 crop 或 pad，并在 `ViTModel` 调用中显式传
+`interpolate_pos_encoding=true`。位置编码插值契约固定为
+`mode=bicubic, align_corners=false, antialias=false`，对应审核过的 Transformers
+`ViTEmbeddings.interpolate_pos_encoding`；移除 prefix token 后按
+`patch_rows x patch_cols` reshape。
 
 两种几何都不保持原宽高比，resize 使用 bilinear interpolation 并明确启用
-antialias。所有尺寸、插值、padding、位置编码和切片字段写入
+antialias。所有尺寸、图像插值、padding、位置编码插值和切片字段写入
 `input_contract`，不能依赖 TorchVision 的隐式默认值。bilinear 与 antialias
 是 v2 为确定性作出的项目协议选择；官方示例没有显式固定这两个参数，不能把
-它们描述成上游保证。
+它们描述成上游保证。preflight 还要把实际 position embedding 输入送入
+审核过的 bicubic reference，并与已安装 Transformers 的插值结果比较；结果
+不一致即拒绝运行，不能只靠 source string 或版本号猜行为。
 
 ### 11.2 增强与 tensor 预处理
 
@@ -731,10 +815,10 @@ Compose(p=1.0)
 `Resize([1024, 1024])` 后直接 `ToTensor()`，并对 staff/non-page zero-shot
 建议 padding 到原生 1024，同时提示位置编码插值可能降低 zero-shot embedding
 质量但适用于 fine-tuning：
-<https://huggingface.co/PRAIG/musvit/blob/main/README.md>。
+<https://huggingface.co/PRAIG/musvit/blob/0e91c7b223b4da30f259198c92045d0cb90e3f2e/README.md>。
 
 上段只解释人工决策，runtime 不解析 README 自然语言。v2 alias registry 固定
-以下截至 2026-07-25 已审核 evidence：
+以下截至 2026-07-29 已复核 evidence：
 
 ```text
 musvit:
@@ -744,6 +828,10 @@ musvit:
               size: 6105}
   config.json: {git_blob_oid: dc2f7bc9bf1aab858aaeefaf1db7858c427f79f2,
                 size: 665}
+  model.safetensors:
+    {git_lfs_pointer_blob_oid: e935a37bc0a6ca051a091a2ba5b5425547f16af9,
+     lfs_content_sha256: 109bbaf31d9f2184df1b841579e06d25bc58ed6a42a10dd5f4a5d27d01889db2,
+     size: 467638680}
   preprocessor_config.json: absent
   reviewed_input_contract: staff_omr_input_v2
 
@@ -754,6 +842,10 @@ musvit_light:
               size: 6144}
   config.json: {git_blob_oid: b9f746f5b2ecdd858c7dfbf4c724ae1de258b1a7,
                 size: 663}
+  model.safetensors:
+    {git_lfs_pointer_blob_oid: 5c03c2357110e0060f3687d8d79dc5230c43019e,
+     lfs_content_sha256: f2c278f2762a88bfcc7ee4cf846d8eef2f31c04a73e7775124db69e7afd0528f,
+     size: 157546736}
   preprocessor_config.json: absent
   reviewed_input_contract: staff_omr_input_v2
 ```
@@ -763,12 +855,23 @@ registry evidence 来自对应不可变 revision 的官方 Hugging Face tree met
 和
 <https://huggingface.co/PRAIG/musvit-light/tree/adf40fd3eaf157e20aaa8603ffea06517e467c7f>。
 
-Git blob oid 按 `SHA1("blob " + decimal(byte_length) + NUL + content_bytes)`
-验证。启动只做可机器判定的 revision、文件存在性、size、blob oid 和 config
-字段检查，并把匹配的 evidence record 写入 run metadata。不在 registry 的
-revision、预期 absent 的 processor 文件出现、blob 不匹配或 config 字段不兼容
-都立即失败；接受新上游 revision 必须先人工复核并版本化更新 registry 和
-protocol/input contract。
+复核方式不是从文件名或页面文本推断：使用官方 Hub API
+`model_info(revision=<commit>, files_metadata=True)` 确认 resolved SHA、size、
+Git blob oid 和 LFS metadata；再下载 README/config 原始 bytes，独立按
+`SHA1("blob " + decimal(byte_length) + NUL + content_bytes)` 重算普通 Git
+blob oid。权重不为复核 pointer 而下载数百 MB；其标准 Git LFS pointer 由
+官方 `sha256`/size 重建并用同一 Git blob 公式复算 pointer oid。上述两组
+resolved revision、四个普通 blob oid、两个 LFS pointer oid 均于
+2026-07-29 匹配。
+
+运行时在把 base 权重交给 Transformers 前，还必须对实际
+`model.safetensors` bytes 计算 size 和 SHA-256，并匹配 registry 中的
+`lfs_content_sha256`；pointer oid 不能替代内容校验。启动只做可机器判定的
+revision、文件存在性、size/hash、processor absence 和 config 字段检查，并把
+匹配的完整 evidence record 写入 run metadata 和 checkpoint。不在 registry
+的 revision、预期 absent 的 processor 文件出现、权重内容不匹配或 config
+字段不兼容都立即失败；接受新上游 revision 必须先人工复核并版本化更新
+registry 和 protocol/input contract。
 
 ### 11.3 Backbone metadata
 
@@ -784,8 +887,9 @@ trust_remote_code=False, add_pooling_layer=False, output_loading_info=True)`，
 验证总 token 数严格等于 `1 + expected_spatial_tokens`，再移除第一个 token；
 不是从 config 猜 prefix 数。
 
-patch size、hidden size 和原始 image size 从加载后的 backbone config 读取并
-校验。alias 配置只额外保存模型 id、固定 revision、loader class 和
+patch size、hidden size 和原始 image size 先从 registry 已验证的
+`config.json` 读取以完成无权重 preflight，再与加载后的 backbone config
+逐字段校验。alias 配置只额外保存模型 id、固定 revision、loader class 和
 `prefix_tokens=1`，不复制可能漂移的维度常量。backbone image height/width
 必须分别被 patch height/width 整除，否则所选 v2 几何不受支持并立即失败。
 approved raw config 要求 `model_type=vit_mae` 且 architectures 包含
@@ -877,13 +981,19 @@ use_rslora = true
 训练按以下顺序执行：
 
 1. 解析并校验配置。
-2. 必要时解析 model revision，并冻结为 commit SHA。
+2. 必要时解析 model revision，冻结为 commit SHA；读取并校验 registry 中的
+   小型 config/evidence，派生 method 对应的输入几何，但不加载权重或创建
+   CUDA context。
 3. 加载并校验 manifest、词表和 image verification index。
-4. 读取 target，完成 OOV、split、增强契约和 CTC 预检。
-5. 创建 run 目录，复制规范化 bundle/manifest/vocabulary，写入含 preflight
-   的初始 `run.json`。
-6. 设置 `init_seed`，加载固定 revision 的 backbone。
-7. 校验官方预处理依据、输入和 token geometry。
+4. 创建 run 目录，复制规范化 bundle/manifest/vocabulary/verification index，
+   写入 `status=preflighting` 的初始 `run.json`。
+5. 读取 target，完成 OOV、split、增强契约和 CTC 预检；写入 preflight
+   结果，并在需要时写出 candidate 或规范化排除文件。预检失败时把 run
+   标为 `failed`，但仍不得加载 backbone。
+6. 设置 `init_seed`，校验实际 base weight 内容 SHA-256 并加载固定 revision
+   的 backbone。
+7. 复核已加载 config、官方预处理依据、位置编码 reference、输入和 token
+   geometry。
 8. 构建 Dataset、DataLoader、模型和优化器。
 9. 训练并按配置执行验证。
 10. 每个完整 epoch 结束后原子更新 `last`；验证严格改善时原子更新 `best`。
@@ -913,7 +1023,8 @@ patience >= 1
 4. 构造包含上述更新后状态及完整 `epoch_record` 的 `last.pt` 临时文件，原子
    replace 正式 `last.pt`；这是该 epoch 唯一 commit point。
 5. 若 `best_updated=true`，用同一模型和更新后状态原子更新 `best.pt`。
-6. 从已提交的 `epoch_record` 原子重写 `metrics.jsonl` 和 `run.json` sidecar。
+6. 把已提交的 `epoch_record` 追加到 `metrics.jsonl`，再原子更新
+   `run.json` sidecar。
 7. 若 stop decision 为真，结束循环；否则进入下一 epoch。
 
 `stop_reason` 的优先级固定为：patience 达阈值时
@@ -927,16 +1038,36 @@ patience >= 1
 `stop_reason` 决定是否允许进入 `next_epoch`，不能
 把 sidecar repair 当作继续训练许可。
 
+`metrics.jsonl` 修复规则固定为：只承认以换行结束且能解析的 canonical JSON
+记录；先截断崩溃留下的尾部半行，再要求已有 epoch 从 1 连续递增且不超过
+`last.pt.epoch`。正常可修复状态只允许缺少 last 对应的最后一条：若缺失则
+追加，若同 epoch 记录逐字段相等则不重复写；更早的 gap、同 epoch 内容冲突
+或文件领先于 last 均按损坏失败。这样 checkpoint 仍是 commit point，同时
+JSONL 保持 O(n) 总写入而不是每个 epoch 重写历史。
+
 验证指标为 NaN 或 infinity 时立即失败，不能把既有旧 checkpoint 当作本次
 训练结果。每个新运行使用空的新 run 目录；resume 只更新原 run。
 
 ### 12.2 初始化和 epoch 随机性
 
-模型初始化使用与 epoch 独立的：
+`seed_schedule_version` 固定为
+`staff_omr_sample_epoch_sha256_v1`。所有 seed 派生先定义同一个无歧义原语：
 
 ```text
-init_seed =
-  low32(SHA256("staff_omr_v2\0" + decimal(seed) + "\0init"))
+seed32(label, parts...) =
+  int.from_bytes(
+    SHA256(UTF8("staff_omr_v2") + NUL
+           + UTF8(label) + NUL
+           + NUL.join(UTF8(part) for part in parts)).digest()[0:4],
+    byteorder="big",
+    signed=false)
+```
+
+整数 part 使用无前导零的十进制 ASCII；`sample_id` 使用 manifest 中的原始
+Unicode 字符串，且路径规则已禁止 NUL。模型初始化使用与 epoch 独立的：
+
+```text
+init_seed = seed32("init", decimal(seed))
 ```
 
 在加载 backbone、创建 LoRA adapter、task head 和 optimizer 之前，用
@@ -948,13 +1079,36 @@ task head，linear probe 只建 task head。初始化因此不依赖 backbone �
 消耗了多少随机数，同环境、同 contract 的两个新运行在第一个 batch 前具有
 相同的全部可训练 state dict。
 
-每个 epoch 开始前，由
-`low32(SHA256("staff_omr_v2\0" + decimal(seed) + "\0" + decimal(epoch)))`
-导出 `epoch_seed`，并重置 Python、NumPy、Torch CPU/CUDA 和 DataLoader
-shuffle generator。worker 初始化再把 PyTorch 提供的 worker seed 显式传给
-Python、NumPy 和 Albumentations `set_random_seed`；`num_workers=0` 时直接把
-`epoch_seed` 传给增强 pipeline。这样 epoch 边界恢复不依赖上个进程的隐藏 RNG
-状态，同时明确改变了 legacy 的播种协议。
+每个 epoch 开始前：
+
+```text
+epoch_seed = seed32("epoch", decimal(seed), decimal(epoch))
+worker_base_seed = seed32("worker", decimal(seed), decimal(epoch))
+sample_augment_seed =
+  seed32("augment", decimal(seed), decimal(epoch), sample_id)
+
+sample_order_key =
+  SHA256(UTF8("staff_omr_v2") + NUL + UTF8("order") + NUL
+         + UTF8(decimal(seed)) + NUL + UTF8(decimal(epoch)) + NUL
+         + UTF8(sample_id))
+```
+
+train 保留样本按 `(sample_order_key bytes, UTF8(sample_id))` 升序构成该 epoch
+的完整 sampler；sampler item 固定为 `(epoch, manifest_sample_index)`，让
+Dataset 不依赖进程本地的可变 `current_epoch`。这就是
+`sha256_epoch_order_v1`，不调用 DataLoader `shuffle`。用 `epoch_seed` 重置
+Python、NumPy 和 Torch CPU/CUDA RNG，使 dropout 等训练随机性从 epoch 边界
+可重建。DataLoader 使用单独、以 `worker_base_seed` 初始化的 generator，
+避免 worker base-seed 分配消耗模型训练 RNG。
+
+worker init 可以把 PyTorch worker seed 传给 Python/NumPy 作为非语义卫生措施，
+但禁止用它设置增强 pipeline。Dataset 的 `__getitem__` 必须在每次应用
+Albumentations 前调用
+`Compose.set_random_seed(sample_augment_seed)`；增强之后不得再读取 worker
+全局随机流来改变样本。于是同一 `(seed, epoch, sample_id)` 的增强图像和同一
+epoch 的 batch 顺序与 shuffle 落位、预取时序及 `num_workers` 无关。
+`num_workers=0` 使用完全相同路径，没有单独播种特例。这样 epoch 边界恢复
+不依赖上个进程的隐藏 RNG 状态，同时明确改变了 legacy 的播种协议。
 
 ### 12.3 Resume 边界
 
@@ -967,14 +1121,15 @@ resume 从 `run.json` 和 `last.pt` 重建原配置；CLI 只开放 `max_epochs`
 
 v2 只承诺完整 epoch 边界的 resume，不承诺 batch 中间恢复。checkpoint 保存
 模型、优化器、early-stopping、global step、base seed、seed schedule version
-和 `next_epoch`，不序列化各库任意形态的内部 RNG object。
+和 `next_epoch`；epoch 顺序、训练 RNG 和逐样本增强 seed 均由这些稳定字段
+重建，不序列化各库任意形态的内部 RNG object。
 
 resume 校验分三级。
 
 **硬拒绝，不能 override：**
 
 - protocol/schema version、training contract SHA-256。
-- manifest、vocabulary、基础模型 revision。
+- manifest、vocabulary、排除文件、基础模型 revision/weight SHA-256。
 - method、input geometry、patch grid、seed、优化器和增强契约。
 - checkpoint tensor/schema 与待构建模型不兼容。
 - 在调用 `optimizer.load_state_dict()` 前，checkpoint 的有序
@@ -998,18 +1153,24 @@ resume 校验分三级。
 **环境漂移：**
 
 上述关键库的 patch 版本、其他非关键 package 的任意版本、OS/driver、device
-type、`num_workers`、deterministic flags 或 cuDNN flags 不同，默认拒绝；
+type、deterministic flags 或 cuDNN flags 不同，默认拒绝；
 调用者可用 `--allow_env_drift` 显式接受。
 接受后保存逐字段差异并将 run 标记为
 `reproducibility_status=environment_drift`。该开关不能绕过训练语义或
 major.minor 版本不匹配。
 
+`num_workers`、输出路径和日志详细度是可自由改变的 launch 字段，每次调用
+仍记录新旧值，但不需要 `--allow_env_drift`。这项豁免建立在 §12.2 的样本
+顺序/增强去 worker 化和 §17 的跨 worker 等价测试上；测试失效时应修复数据
+管线，而不是把 worker 数重新塞回 training contract。
+
 `data_path` 只允许作为位置迁移字段改变；新路径下所有 manifest target/image
 校验必须重新通过，并记录迁移 event。run 内 dataset bundle 路径不可替换。
 
-同环境的精确 resume 测试只覆盖 CPU、`num_workers=0`、增强关闭的最小路径。
-启用增强或 worker 时，协议验证播种和状态恢复规则，但不宣称跨进程调度、
-硬件或依赖版本的 tensor bitwise 等价。
+同环境的精确 resume 测试覆盖 CPU、`num_workers=0` 且启用增强的最小路径；
+另用 workers `0/2/4` 验证同一 epoch 的 sample id、batch 顺序和增强后 tensor
+逐字节相等。协议不宣称不同硬件、依赖版本或 GPU kernel 的训练 tensor
+bitwise 等价。
 
 ### 12.4 幂等 finalization
 
@@ -1043,6 +1204,8 @@ test/summary，历史记录不得丢失。early-stopping run 不能重新打开�
       split_manifest.json
       vocabulary.json
       image_verification_index.json
+      train_exclusions.json              # 仅 exclude_listed 成功 run
+      train_exclusions.candidate.json    # 仅 fail policy 检出不可行样本
       metrics.jsonl
       checkpoints/
         last.pt
@@ -1055,14 +1218,22 @@ timestamp 固定为 UTC `YYYYMMDDTHHMMSSZ`，`contract_hash_prefix` 是
 training contract SHA-256 的前 12 个 hex。`run_id` 使用 `uuid4().hex` 的前
 12 个 hex 字符，避免在 Windows 路径下浪费长度。这三者已足够消歧，最终仍以
 `mkdir(exist_ok=False)` 防覆盖；碰撞即失败，由调用者重新启动。所有文件先
-落到同目录临时文件，再用原子 replace 发布。`metrics.jsonl` 每个 epoch
-重写包含全部既有行的新临时文件后 replace，不依赖可截断的原地 append。
+落到同目录临时文件，再用原子 replace 发布，只有 `metrics.jsonl` 采用可修复
+append：每条 canonical JSON 加单个 `\n`，以 binary append 完整写入后
+`flush + fsync`。它不宣称单次 append 原子；§12.1 用权威 `last.pt` 截断尾部
+半行、补缺和拒绝冲突。
 
 `dataset_bundle.json`、`split_manifest.json`、`vocabulary.json` 和
 `image_verification_index.json` 是输入 bundle 的一次 run 级副本。preflight
 结果合并进 `run.json`，不额外维护内容重复的
 `preflight.json`。resume event 追加到 `run.json.resume_history` 数组，更新时
 仍使用临时文件加原子 replace，历史项不得删除或改写。
+
+成功的 `exclude_listed` run 还保存经过 canonical 校验的
+`train_exclusions.json`；source path 只留在 launch audit 中。默认 `fail`
+发现不可行样本时写出的 `train_exclusions.candidate.json` 不是自动授权排除，
+只是让操作者能审阅并在下一次调用中显式选择。两者都不回写 dataset bundle
+或 manifest。
 
 新运行记录 source `dataset_bundle_path` 仅供审计；复制成功后，checkpoint 和
 resume 一律解析 run 内相对路径，不回读原始 bundle。`data_path` 可以在 resume
@@ -1109,9 +1280,15 @@ vocabulary
 vocabulary_sha256
 base_model_id
 base_model_revision
+base_model_weights_filename
+base_model_weights_sha256
+base_model_registry_evidence
 backbone_config
 input_contract
 augmentation_contract_sha256
+train_exclusions_relpath
+train_exclusions_sha256
+train_exclusions_count
 base_seed
 init_seed
 seed_schedule_version
@@ -1123,8 +1300,10 @@ package_versions
 再把 tensor state 应用到已构建模型。checkpoint 不重复嵌入完整 manifest；
 resume 只接受 role 为 `last` 的文件，并通过 dataset bundle/manifest 相对路径
 找到 run 副本、校验全部交叉 hash。完整 vocabulary 仍嵌入 checkpoint，因此
-移动单个 checkpoint 后无需扫描原始 target 就能解码预测 id，但要继续训练仍需
-完整 run artifact bundle 和同内容 `data_path`。
+移动单个 checkpoint 后可以在不扫描原始 target 的情况下把“已经产生的 id”
+映射为 token；它不包含冻结 base 权重，不能单独产生预测。推理至少还需要
+checkpoint 固定并校验过的 base revision/weight SHA、输入契约和 trainable
+state；继续训练则还需要完整 run artifact bundle 和同内容 `data_path`。
 
 `summary.json` 保存 `best.pt` 和 `last.pt` 的文件 SHA-256，使 checkpoint 离开
 原路径后仍可核对内容身份。
@@ -1164,7 +1343,8 @@ run metadata 记录：
   vocabulary 和 augmentation hashes
 - train/val/test 样本数
 - 各 split 的 target 长度和 required frames 分布摘要
-- train 排除列表 hash、数量、比例和长度分布
+- train 排除文件 hash、数量、比例和长度分布
+- approved base weight 文件名、size、内容 SHA-256 和 registry evidence
 - image verification index 命中数、重算数、验证模式和 data verification status
 - input geometry、完整 input contract 和官方预处理依据
 - 可训练参数数量和名称前缀摘要
@@ -1178,7 +1358,7 @@ run metadata 记录：
 - `start_eval > max_epochs`。
 - manifest schema、路径、split 或 group 隔离无效。
 - 词表无效或出现 OOV。
-- train 不可行集合不满足所选 policy 和显式排除列表。
+- train 不可行集合不满足所选 policy 和显式排除文件。
 - backbone revision 未固定或显式解析失败。
 - augmentation profile 展开结果与契约不一致。
 - patch grid 与 backbone config 不兼容。
@@ -1215,7 +1395,13 @@ README 必须与 v2 行为一致：
 - 从平铺目录开始展示完整 `prepare-data` 和训练命令，不要求用户手写生成器。
 - 说明显式 group regex、model revision 解析和 image hash 验证模式。
 - 说明全量 CER 与可行子集 CER 的区别。
-- 说明不同宽度导致的训练排除差异及比较限制。
+- 说明只有 LoRA/exact-grid 在 v2 可改变 `patch_cols`；linear probe 的时间轴
+  固定为 backbone 原生列数。
+- 展示默认 `fail` 的完整恢复路径：阅读 failed run 的 preflight 和
+  `train_exclusions.candidate.json`；然后选择 LoRA 并增大 `patch_cols`，
+  或审阅 candidate 后显式使用 `exclude_listed`。linear probe 不能靠增大宽度
+  恢复，只能排除或改用 LoRA。
+- 说明不同 LoRA 宽度导致的训练排除差异及比较限制。
 - 说明 v2 使用 closed-corpus 词表及其 manifest 身份。
 - 说明 linear probe/native-pad 与 LoRA/exact-grid 的首版风险边界。
 - 说明 legacy checkpoint 不能直接 resume 到 v2。
@@ -1235,9 +1421,11 @@ backbone，公开与真实 backbone 相同的最小 config 和输出接口。
 - 非法 method、patch grid、batch size、workers、learning rate 和 patience 失败。
 - `linear_prob` 被规范化为 `linear_probe`。
 - 新旧 patch 参数同时出现时失败。
-- method/input-geometry 的未开放组合失败。
-- training contract 的 Adam、增强和排除字段 hash 稳定。
-- 只修改 worker/path 不改变 training contract hash，但改变 launch config hash。
+- `linear_probe`/`lora` 分别派生 `native_pad`/`exact_grid`；任何显式
+  `input_geometry` 输入都失败。
+- training contract 的 Adam、增强和排除文件 hash/count 稳定。
+- 只修改 worker、output/data location 或同内容排除文件的 source path，不改变
+  training contract hash，但改变 launch config hash。
 
 ### 17.2 Manifest 和词表测试
 
@@ -1253,6 +1441,8 @@ backbone，公开与真实 backbone 相同的最小 config 和输出接口。
 - manifest 不因 `patch_cols` 改变。
 - cached/always image 验证模式产生正确的命中和重算统计。
 - `always` 是默认；`cached` run 被标记为降级且不能作为可信基线验收。
+- 同一 run resume 的 `always` 仍重算 image hash；替换为同 size/mtime 的不同
+  内容会失败，不能沿用上次的 `content_verified`。
 - vocabulary hash 稳定。
 - 重复 token、blank 冲突、manifest hash 不匹配和 OOV 失败。
 - `num_classes == len(tokens) + 1`，id 0 只属于 blank。
@@ -1263,7 +1453,9 @@ backbone，公开与真实 backbone 相同的最小 config 和输出接口。
 - `[1, 1]` 需要 3 帧。
 - `[1, 1, 2, 2]` 需要 6 帧。
 - `fail` 对 train 不可行样本在模型加载前失败。
-- `exclude_listed` 要求配置列表与实际不可行 id 集合完全相等。
+- `fail` run 产生符合 schema、可直接作为下一次输入的 candidate 排除文件。
+- `exclude_listed` 要求排除文件与 manifest/`patch_cols` 绑定，且 id 集合与
+  实际不可行集合完全相等；path 变化但 canonical 内容相同不改变 contract。
 - all-infeasible train fixture 即使全部显式列出也因保留样本为 0 而失败。
 - val/test 不可行样本保留并进入分层统计。
 - 构造 `minimum_frames(y) == patch_cols` 的边界样本，断言
@@ -1276,12 +1468,23 @@ backbone，公开与真实 backbone 相同的最小 config 和输出接口。
 - 最后一个小 batch 生成正确 input lengths。
 - 评估按 target lengths 切片，不依赖 blank 哨兵。
 - 超长 target 不导致其他样本被全局 padding。
+- `sha256_epoch_order_v1` 对相同 seed/epoch/sample ids 产生稳定全排列，不受
+  manifest 输入顺序影响。
+- 启用 `staff_omr_train_v1` 后，workers `0/2/4` 产生逐字节相同的 sample id
+  顺序、batch 边界和增强 tensor。
+- 改变 epoch 或 sample id 会改变对应 sample seed；worker seed 不传给
+  Albumentations。
 
 ### 17.5 模型契约测试
 
 - linear probe 和 LoRA 对相同 patch grid 产生相同时间维。
 - linear probe 使用 `native_pad` 且不插值位置编码；LoRA 使用 `exact_grid`
   且插值位置编码。
+- linear probe 的 `patch_cols != native_cols` 失败；LoRA 可在兼容的多个
+  `patch_cols` 上通过。
+- exact-grid 的 position embedding 结果与
+  `bicubic, align_corners=false, antialias=false` reference 一致；其他隐式
+  行为在 preflight 失败。
 - linear probe 只冻结 backbone。
 - LoRA 只有 adapter 和 task head 可训练。
 - 两种几何的非匹配 token count 均产生描述性错误。
@@ -1290,8 +1493,9 @@ backbone，公开与真实 backbone 相同的最小 config 和输出接口。
 - 本地 tiny `ViTMAEForPreTraining(ViTMAEConfig(...))` checkpoint 能按 approved
   loading-info allowlist 被显式 `ViTModel` encoder 加载，产生一个 CLS token
   加完整 spatial tokens；loader 固定移除一个 prefix，拒绝 AutoModel 路径。
-- alias approved revision 的 README/config blob oid 或 processor absence
-  不匹配时失败，不对自然语言做 runtime 判断。
+- alias approved revision 的 README/config blob oid、权重 size/LFS SHA-256、
+  LFS pointer oid 或 processor absence 不匹配时失败，不对自然语言做 runtime
+  判断。
 - task-head 参数名、shape、bias、执行顺序和 state-dict schema 与
   `staff_omr_task_head_v1` 完全一致。
 - 同环境、同 contract 的两个新模型在首 batch 前具有完全相同的 trainable
@@ -1304,7 +1508,8 @@ backbone，公开与真实 backbone 相同的最小 config 和输出接口。
   backbone；optimizer param group 也不含冻结参数。
 - 打乱两个同 shape 参数的 checkpoint optimizer 名称顺序时，必须在
   `optimizer.load_state_dict()` 前拒绝。
-- 不读取原数据目录也能恢复 id 到 token 的映射。
+- 不读取原数据目录也能把既有 id 映射到 token；缺少 approved base 权重时
+  明确不能执行模型推理。
 - checkpoint 不嵌入完整 manifest，run 副本 hash 不匹配时拒绝 resume。
 - 删除原始 dataset bundle、保留 run 副本和同内容 `data_path` 后仍能 resume。
 - `best` 和 `last` 不互相覆盖。
@@ -1312,16 +1517,20 @@ backbone，公开与真实 backbone 相同的最小 config 和输出接口。
 - `last.pt` 包含 validation 后更新的 best/patience/stop state 和 epoch record。
 - 模拟 `last.pt` commit 后、best/metrics 更新前崩溃，resume 能从 last 修复
   sidecar 和滞后的 best，再进入下一 epoch。
+- 在 `metrics.jsonl` 尾部注入半行时，resume 截断并补 last record；更早 epoch
+  gap、重复 epoch 内容冲突或 metrics 领先于 last 时拒绝。
 - 模拟终态 last commit 后、test/summary 前崩溃，resume 不训练新 epoch，
   幂等补齐 test、summary 并把 status 置为 completed。
-- CPU、`num_workers=0`、增强关闭时，epoch 边界 resume 与不中断运行的下一
+- CPU、`num_workers=0`、增强开启时，epoch 边界 resume 与不中断运行的下一
   epoch tensor 完全一致。
-- worker/增强测试验证 worker seed 被传给 Python、NumPy 和 Albumentations，
-  不做跨进程 bitwise 断言。
-- protocol、vocabulary、manifest、revision 或 patch grid 不匹配时拒绝 resume。
+- resume 把 `num_workers` 从 0 改为 2 无需 `--allow_env_drift`，下一 epoch
+  的样本顺序和增强 batch 仍逐字节一致，并记录 launch 变化。
+- protocol、vocabulary、manifest、排除文件、revision、base weight SHA 或
+  patch grid 不匹配时拒绝 resume。
 - `checkpoint_role=best` 明确拒绝 resume；只有同一 run 的 last 可恢复。
-- `max_epochs` 只能增大；package patch/worker/device 漂移必须显式
-  `--allow_env_drift` 并留下审计记录；major.minor 漂移仍失败。
+- `max_epochs` 只能增大；package patch/device 漂移必须显式
+  `--allow_env_drift` 并留下审计记录；worker 数只记录，major.minor 漂移
+  仍失败。
 - v2 loader 无条件拒绝 legacy state dict。
 - summary 中的 checkpoint 文件 hash 与实际文件一致。
 
@@ -1343,15 +1552,19 @@ backbone，公开与真实 backbone 相同的最小 config 和输出接口。
 
 1. train 中不存在被静默忽略的 CTC 不可行样本；显式排除可审计。
 2. 相同 manifest、词表和 training contract 产生相同的三个 identity hash；
-   修改增强或输入几何必然改变 training contract hash。
+   修改增强、method/派生输入几何或排除文件内容必然改变 training contract
+   hash，而只修改 `num_workers` 不改变任何训练输入。
 3. train/val/test 的 group 集合两两不相交。
-4. checkpoint 在不扫描原始 target 文件的情况下能够解码预测 id。
+4. checkpoint 在不扫描原始 target 文件的情况下能够把既有预测 id 映射为
+   token，并明确记录产生预测所依赖的 base weight SHA-256。
 5. `start_eval > max_epochs` 在加载模型前失败。
 6. 相同配置的两次运行不覆盖任何文件。
-7. linear probe/native-pad 和 LoRA/exact-grid 都由显式 input contract 驱动，
-   runtime geometry 逻辑不含 `64` 或 `1024` 字面量。
-8. 完整 run artifact bundle 配合同内容数据和 approved base revision，能在
-   epoch 边界从 last 恢复训练，并允许只增大 `max_epochs`。
+7. method 唯一派生 linear probe/native-pad 或 LoRA/exact-grid，二者都由
+   显式 input contract 驱动；runtime geometry 逻辑不含 `64` 或 `1024`
+   字面量，位置编码插值经过 reference 校验。
+8. 完整 run artifact bundle 配合同内容数据和 approved base
+   revision/weight SHA，能在 epoch 边界从 last 恢复训练，并允许只增大
+   `max_epochs`。
 9. v2 loader 明确拒绝 legacy checkpoint。
 10. 全量 CER、可行子集 CER、可行 validation loss 和容量统计同时落盘。
 11. README、CLI help 和实际参数语义一致。
@@ -1360,6 +1573,7 @@ backbone，公开与真实 backbone 相同的最小 config 和输出接口。
 14. task-head schema、optimizer 名称映射、epoch commit 和 finalization state
     machine 有机器可执行的契约测试。
 15. 所有新增测试在 CPU、无网络环境通过。
+16. 相同 seed/epoch 下 workers `0/2/4` 的样本顺序和增强后 batch 逐字节相同。
 
 ## 19. 后续阶段
 
@@ -1369,7 +1583,7 @@ backbone，公开与真实 backbone 相同的最小 config 和输出接口。
 
 - batch 中间恢复。
 - 序列化第三方库内部 RNG 状态。
-- 多 worker、随机增强和 GPU 的跨进程 bitwise resume 保证。
+- GPU、跨设备和跨依赖版本的完整训练 bitwise resume 保证。
 - image verification index 的签名、共享索引或远程数据存储适配。
 - legacy checkpoint 转换。
 
@@ -1381,7 +1595,8 @@ seed schedule 和完整 epoch checkpoint 已覆盖常见的“增加训练轮数
 首次真实 linear probe 基线完成后，使用相同 manifest、词表、训练排除、
 初始化和优化协议，一次性比较 `native_pad` 与 `exact_grid`。报告全量 CER、
 可行 CER、训练 loss 和 input contract。只有证据显示插值没有造成不可接受
-回归，后续协议才可开放 `linear_probe + exact_grid`；不能在 v2 内静默换默认。
+回归，后续协议版本才可开放 `linear_probe + exact_grid` 用户配置；v2 公开
+入口继续拒绝 `input_geometry` 覆盖，不能静默换默认。
 
 ### 19.3 性能阶段
 
