@@ -1,4 +1,3 @@
-import re
 import cv2
 import torch
 import random
@@ -8,7 +7,11 @@ from dataclasses import dataclass
 from .config.ExperimentConfigWrapper import ExperimentConfig
 from .Generator.SynthGenerator import VerovioGenerator, SyntheticScoreGenerationError
 from .data_augmentation.data_augmentation import augment, convert_img_to_tensor
-from .tokenization import validate_tokenization_mode
+from .tokenization import (
+    clean_kern,
+    parse_kern_file,
+    validate_tokenization_mode,
+)
 from .utils.vocab_utils import check_and_retrieveVocabulary
 
 from datasets import load_dataset
@@ -103,44 +106,6 @@ def _retry_synthetic_sample(generate, max_attempts: int = 5):
         except SyntheticScoreGenerationError:
             if attempt == max_attempts - 1:
                 raise
-
-def clean_kern(krn, avoid_tokens=['*tremolo','*staff2', '*staff1','*Xped', '*tremolo', '*ped', '*Xtuplet', '*tuplet', "*Xtremolo", '*cue', '*Xcue', '*rscale:1/2', '*rscale:1', '*kcancel', '*below']):
-    krn = krn.split('\n')
-    newkrn = []
-    # Remove the lines that contain the avoid tokens
-    for idx, line in enumerate(krn):
-        if not any([token in line.split('\t') for token in avoid_tokens]):
-            #If all the tokens of the line are not '*'
-            if not all([token == '*' for token in line.split('\t')]):
-                newkrn.append(line.replace("\n", ""))
-                
-    return "\n".join(newkrn)
-
-def parse_kern_file(krn: str, tokenization_mode='bekern') -> str:
-    tokenization_mode = validate_tokenization_mode(tokenization_mode)
-    krn = clean_kern(krn)
-    krn = krn.replace(" ", " <s> ")
-    krn = krn.replace("\t", " <t> ")
-    krn = krn.replace("\n", " <b> ")
-    krn = krn.replace(" /", "")
-    krn = krn.replace(" \\", "")
-    krn = krn.replace("·/", "")
-    krn = krn.replace("·\\", "")
-    
-    if tokenization_mode == "kern":
-        krn = krn.replace("·", "").replace('@', '')
-    
-    if tokenization_mode == "ekern":
-        krn = krn.replace("·", " ").replace('@', '')
-    
-    if tokenization_mode == "bekern":
-        krn = krn.replace("·", " ").replace("@", " ")
-        
-    krn = krn.split(" ")[4:-1]
-    krn = [re.sub(r'(?<=\=)\d+', '', token) for token in krn]
-    
-    return krn
-
 
 class _ArrowOMRSource:
     def __init__(self, dataset_ref: str, split: str, tokenization_mode: str,
