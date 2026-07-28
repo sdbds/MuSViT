@@ -30,15 +30,16 @@ def _make_cli_fixture(root: Path) -> Path:
 def test_staff_loader_exposes_canonical_subcommands():
     target = cli._load_staff_level_omr()
 
-    assert set(target) == {"train", "prepare-data"}
+    assert set(target) == {"train", "prepare-data", "resume"}
     assert callable(target["train"])
     assert callable(target["prepare-data"])
+    assert callable(target["resume"])
 
 
 def test_default_subcommand_routes_only_legacy_option_form():
     train = object()
     prepare = object()
-    target = {"train": train, "prepare-data": prepare}
+    target = {"train": train, "prepare-data": prepare, "resume": object()}
     experiment = cli.Experiment(
         command="staff-level-omr",
         location="experiments/staff_level_omr",
@@ -128,3 +129,4 @@ def test_cli_discovery_lists_prepare_and_explicit_train():
     assert result.returncode == 0, result.stderr
     assert "staff-level-omr prepare-data" in result.stdout
     assert "staff-level-omr train" in result.stdout
+    assert "staff-level-omr resume" in result.stdout

@@ -46,10 +46,14 @@ def _load_embeddings():
 
 
 def _load_staff_level_omr():
-    from experiments.staff_level_omr.entrypoint import run
+    from experiments.staff_level_omr.entrypoint import resume, train
     from experiments.staff_level_omr.prepare_data import prepare_data
 
-    return {"train": run, "prepare-data": prepare_data}
+    return {
+        "train": train,
+        "prepare-data": prepare_data,
+        "resume": resume,
+    }
 
 
 def _load_object_detection():
@@ -79,8 +83,11 @@ EXPERIMENTS: tuple[Experiment, ...] = (
         "staff-level-omr", "experiments/staff_level_omr", _load_staff_level_omr,
         (("staff-level-omr prepare-data --data_path <dir> --dataset_id <id>",
           "Build a deterministic staff-level dataset bundle."),
-         ("staff-level-omr train --ds_name <name> --model_name <musvit|musvit_light>",
-          "Run the current staff-level trainer (explicit train form).")),
+         ("staff-level-omr train --experiment_name <name> --data_path <dir> "
+          "--dataset_bundle_path <dir>",
+          "Start a trusted staff-level OMR v2 run."),
+         ("staff-level-omr resume <run_dir> [--max_epochs <n>]",
+          "Resume one v2 run from its committed epoch boundary.")),
         default_subcommand="train",
     ),
     Experiment(

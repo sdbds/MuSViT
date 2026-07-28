@@ -1,5 +1,10 @@
 # Staff-level OMR PowerShell 启动器设计
 
+> **状态：已被 v2 取代。** 当前实现以
+> `2026-07-25-staff-level-omr-trusted-training-protocol-v2-design.md`
+> 为唯一规范；本文记录的 `config.py` 回退、隐式数据路径和 legacy 训练入口
+> 均已删除，不能再作为实现或验收依据。
+
 ## 目标
 
 在仓库根目录新增 `4.staff_level_omr.ps1`，为 Windows 提供一次只运行一个

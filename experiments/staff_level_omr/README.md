@@ -1,227 +1,227 @@
-# Staff-level Optical Music Recognition with MusViT
+# Staff-level OMR trusted training protocol v2
 
-Fine-tune a pre-trained **MusViT** Vision Transformer for **staff-level Optical
-Music Recognition (OMR)**: given the image of a single staff (a cropped score
-region), the model transcribes it into a left-to-right sequence of music
-symbols.
+This experiment trains a MuSViT encoder, a two-layer bidirectional LSTM, and a
+CTC head on cropped staff images. Version 2 is an auditable baseline: it fixes
+the identities of the data, vocabulary, augmentation, input geometry, base
+weights, optimizer, and checkpoints. It does **not** claim better CER or higher
+throughput than the legacy trainer.
 
-The backbone is a self-supervised ViT for music-score images published by the
-[PRAIG](https://huggingface.co/PRAIG) group on the Hugging Face Hub. On top of
-it we add a lightweight recurrent + CTC head and adapt the whole thing to each
-target collection with either **linear probing** or **LoRA**.
+The executable v1 path has been removed. Legacy state-dict-only checkpoints
+cannot be resumed by v2.
 
----
+## 1. Prepare a dataset bundle
 
-## How it works
+The source directory may be nested, but every image must have a sibling target:
 
-```
-staff image
-   │
-   ▼
-MusViT backbone (frozen, or LoRA-adapted)     ← pre-trained ViT patch encoder
-   │   patch tokens
-   ▼
-reshape to a (rows × cols) grid, drop [CLS]
-   │
-   ▼
-linear projection  →  256-d per patch
-   │
-   ▼
-mean-pool over rows (collapse staff height)   ← one feature vector per column
-   │   sequence of length = cols
-   ▼
-2-layer bidirectional LSTM
-   │
-   ▼
-linear classifier  →  per-column class logits
-   │
-   ▼
-CTC loss (training)  /  greedy CTC decode (inference)
-   │
-   ▼
-symbol id sequence  →  Character/Symbol Error Rate (CER)
+```text
+score-001/page-01_staff-01_region.png
+score-001/page-01_staff-01_gt.txt
 ```
 
-The key idea: the ViT turns the staff image into a grid of patch features; the
-vertical (staff-height) axis is averaged away so each **column** becomes one
-frame of a sequence, and **CTC** aligns that column sequence to the shorter
-symbol sequence without needing explicit symbol positions.
-
-### Two fine-tuning strategies
-
-| Method         | Backbone        | What trains                          | Typical grid | Batch |
-|----------------|-----------------|--------------------------------------|--------------|-------|
-| `linear_prob`  | frozen          | projection + LSTM + classifier only  | `8 64`       | 16    |
-| `lora`         | frozen + LoRA   | LoRA adapters (q/k/v) + head         | `8 128`      | 8     |
-
-With `linear_prob`, inputs are padded to a fixed 64×64 patch grid and the model
-slices out the real rows. With `lora`, the ViT interpolates its positional
-embeddings to the exact `rows × cols` grid, so wider inputs are supported.
-
----
-
-## Repository layout
-
-```
-.
-├── arguments.py            # CLI argument definitions (hyper-parameters, switches)
-├── augments.py             # albumentations augmentation pipeline
-├── config.py               # dataset paths and pre-trained backbone definitions
-├── datasets.py             # CTC_ds: PyTorch Dataset yielding (image, target, length)
-├── model.py                # ViTRNN: ViT backbone + BiLSTM + CTC head
-├── train.py                # training entry point (data → train → evaluate)
-├── executions.sh           # ready-to-run experiment commands for every dataset
-└── utils/
-    ├── data_utils.py       # load pairs, encode/pad sequences, length filtering
-    └── utils.py            # CER metric, test loop, backbone loader
-```
-
----
-
-## Requirements
-
-The code runs inside the shared MuSViT monorepo environment (Python 3.11+) and
-needs a CUDA-capable GPU (training calls `.cuda()` directly). Core dependencies:
-
-- `torch`, `torchvision`
-- `transformers`  (loads the MusViT checkpoint; requires `trust_remote_code`)
-- `peft`          (LoRA adapters)
-- `albumentations`, `opencv-python`  (augmentation)
-- `scikit-learn`  (label encoding, train/test split)
-- `editdistance`  (CER metric)
-- `Pillow`, `numpy`
-
-Install the shared monorepo environment once from the repository root (this pulls
-in `torch`, `transformers`, `peft`, `albumentations`, … and the `musvit` command):
+Targets are UTF-8 text split with Python `str.split()`. First generate the
+manifest, group-disjoint train/validation/test split, closed-corpus vocabulary,
+and image verification index:
 
 ```bash
-uv sync
+uv run --frozen musvit staff-level-omr prepare-data \
+  --data_path D:/datasets/staff-omr \
+  --dataset_id catedrales-v1 \
+  --group_regex '(?P<group_id>score-[^/]+)/.*_region[.]png' \
+  --split_ratios 0.8 0.1 0.1 \
+  --seed 7 \
+  --out D:/datasets/staff-omr-bundle
 ```
 
----
+`group_regex` is a full match against each POSIX-style relative image path and
+must contain a named `group_id` capture. Choose a group that must never cross
+splits, normally the work or page identity. The command refuses unmatched files,
+fewer than three groups, an existing output directory, broken pairs, or empty
+targets. It publishes these files atomically:
 
-## Data
-
-Each dataset is a single folder of paired files:
-
-```
-<id>_region.png   # the cropped staff-region image
-<id>_gt.txt       # ground truth: whitespace-separated music symbols
-```
-
-`load_image_gt_pairs` discovers these pairs automatically and warns about any
-image missing its ground truth.
-
-The datasets referenced here (`capitan`, `catedrales`, `fmt`, `guatemala`,
-`seils`) are distributed **on request or are private** — obtain them from their
-respective authors. Once you have them, edit `config.py` and point each entry in
-`data_paths` at your local folder:
-
-```python
-data_paths = {
-    'capitan':    '/your/path/capitan/data',
-    'catedrales': '/your/path/catedrales/data',
-    ...
-}
+```text
+bundle.json
+split_manifest.json
+vocabulary.json
+image_verification_index.json
 ```
 
----
+The vocabulary intentionally covers the complete closed corpus, including
+validation and test tokens. This avoids undefined output ids; it is not an
+open-vocabulary evaluation protocol.
 
-## Pre-trained models
+## 2. Start training
 
-`config.py` defines the available backbones (pulled from the Hugging Face Hub on
-first use):
-
-| key            | Hub repo             | patch size | hidden dim |
-|----------------|----------------------|------------|------------|
-| `musvit`       | `PRAIG/musvit`       | 16         | 768        |
-| `musvit_light` | `PRAIG/musvit-light` | 16         | 384        |
-
-No manual download is needed; `transformers` fetches and caches the weights.
-
----
-
-## Usage
-
-### Single training run
+The three user-owned identity/location fields are required:
 
 ```bash
-uv run musvit staff-level-omr \
-    --model_name=musvit \
-    --ds_name=catedrales \
-    --method=lora \
-    --batch_size=8 \
-    --start_eval 20 \
-    --shape_patches '[8,128]' \
-    --lr=0.0003
+uv run --frozen musvit staff-level-omr train \
+  --experiment_name catedrales \
+  --data_path D:/datasets/staff-omr \
+  --dataset_bundle_path D:/datasets/staff-omr-bundle \
+  --model_name musvit \
+  --method lora \
+  --patch_rows 8 \
+  --patch_cols 128 \
+  --batch_size 8 \
+  --num_workers 6 \
+  --learning_rate 0.0003 \
+  --max_epochs 1000 \
+  --start_eval 20 \
+  --patience 30 \
+  --device cuda \
+  --verify_image_hashes always
 ```
 
-### All experiments
+Omitting the `train` word remains a one-release compatibility alias. The
+deprecated spelling `--method linear_prob` normalizes to `linear_probe`, and
+`--shape_patches='[8,128]'` normalizes to
+`--patch_rows 8 --patch_cols 128`.
+Canonical commands and recorded configs use only `linear_probe`, `patch_rows`,
+and `patch_cols`. Old and new patch arguments cannot be mixed.
 
-`executions.sh` runs every dataset for both methods (linear probing then LoRA):
+Important options:
+
+| Option | Default | Contract |
+|---|---:|---|
+| `model_name` | `musvit` | `musvit` or `musvit_light` |
+| `model_revision` | registry default | Approved immutable 40-character commit SHA |
+| `resolve_model_revision` | false | Resolve the Hub head once and accept it only if already approved |
+| `method` | `lora` | `linear_probe` or `lora` |
+| `patch_rows`, `patch_cols` | `8`, `64` | Positive patch-grid dimensions |
+| `augmentation_profile` | `staff_omr_train_v1` | Exact declared profile, or `none` |
+| `train_infeasible_policy` | `fail` | `fail` or `exclude_listed` |
+| `batch_size` | `8` | Positive integer |
+| `num_workers` | `6` | Non-negative; does not change sample order or augmentation |
+| `learning_rate` | `0.0003` | Adam learning rate |
+| `max_epochs` | `1000` | Positive epoch budget |
+| `start_eval` | `20` | Must be between 1 and `max_epochs` |
+| `patience` | `30` | Validation evaluations without strict improvement |
+| `seed` | `7` | Non-negative base seed |
+| `device` | `cuda` | `cpu`, `cuda`, or `auto` |
+| `verify_image_hashes` | `always` | `always` or explicitly degraded `cached` |
+
+The approved revisions and weight SHA-256 values live in
+`protocol/backbone.py`. Model inspection validates Hub tree metadata and the
+downloaded weight contents before training.
+
+## 3. Input geometry and CTC capacity
+
+The method uniquely determines geometry:
+
+| Method | Geometry | Width rule |
+|---|---|---|
+| `linear_probe` | `native_pad` | `patch_cols` must equal the backbone's native columns |
+| `lora` | `exact_grid` | compatible `patch_cols` values are allowed |
+
+`linear_probe` keeps the frozen encoder on its pretrained positional grid and
+bottom-pads white pixels. `lora` resizes to the requested grid and verifies
+position-embedding interpolation against the explicit bicubic reference. These
+geometries are not directly configurable. Their v2 results must not be mixed
+with legacy CER series.
+
+For a target `y`, CTC needs:
+
+```text
+minimum_frames(y) = len(y) + adjacent_equal_pairs(y)
+```
+
+The default `fail` policy rejects any infeasible training sample before model
+weights are loaded. The failed run contains
+`train_exclusions.candidate.json`. Recovery is explicit:
+
+1. Prefer LoRA with a larger `patch_cols` when the time axis is genuinely too
+   short.
+2. Otherwise review the candidate file.
+3. Start a **new** run with
+   `--train_infeasible_policy exclude_listed` and
+   `--train_exclusions_path <reviewed-candidate>`.
+
+Linear probing cannot gain time steps by increasing `patch_cols`; switch to
+LoRA or explicitly exclude the exact infeasible set. Different widths or
+exclusion sets define different training contracts, so compare them with the
+reported capacity statistics rather than treating their CER values as the same
+population.
+
+Validation and test retain infeasible samples. Every evaluation records:
+
+- `*_CER_all`: micro CER over every sample; this selects `best.pt` for validation.
+- `*_CER_feasible`: micro CER over samples that fit the time axis.
+- `val_CTC_loss_feasible`: CTC loss over only feasible validation samples.
+- `*_capacity`: feasible/infeasible counts plus target-length and required-frame
+  distributions.
+
+CTC uses blank id `0`, real tokens start at id `1`, and
+`num_classes = len(vocabulary.tokens) + 1`. Loss uses
+`zero_infinity=False`; non-finite loss or gradients terminate the current epoch
+instead of silently discarding data.
+
+## 4. Resume
+
+Resume uses only the same run's committed `checkpoints/last.pt`:
 
 ```bash
-bash experiments/staff_level_omr/executions.sh
+uv run --frozen musvit staff-level-omr resume \
+  D:/runs/catedrales/<run-directory> \
+  --max_epochs 1200 \
+  --num_workers 2
 ```
 
-### Arguments
+Allowed operational overrides are `max_epochs` (increase only), `num_workers`,
+`data_path`, `device`, and `verify_image_hashes`. Package patch/build or runtime
+environment drift requires `--allow_env_drift` and is recorded. Core package
+major/minor drift, protocol/data/model/geometry changes, optimizer-name
+mismatches, cross-run checkpoints, and legacy checkpoints are rejected.
 
-| Argument          | Default        | Description                                                            |
-|-------------------|----------------|------------------------------------------------------------------------|
-| `--ds_name`       | `catedrales`   | Dataset key from `config.data_paths`.                                  |
-| `--model_name`    | `musvit`       | Backbone key from `config.data_models` (`musvit` or `musvit_light`).   |
-| `--method`        | `lora`         | `linear_prob` or `lora`.                                               |
-| `--shape_patches` | `8 64`         | Patch grid `rows cols`; `cols` is the CTC time-axis length.           |
-| `--batch_size`    | `8`            | Mini-batch size for all dataloaders.                                   |
-| `--start_eval`    | `20`           | First epoch at which validation / checkpointing begins.               |
-| `--lr`            | `0.0003`       | Adam learning rate.                                                    |
+Resume is exact at complete epoch boundaries in the supported CPU protocol
+test. It does not promise mid-batch, cross-device, GPU-bitwise, or
+cross-dependency-version replay. `verify_image_hashes=always` re-reads every
+image on every new process, including resume; `cached` is faster but marks the
+run as a degraded, non-baseline verification mode.
 
-> Make sure the `--ds_name` you pass exists in `config.data_paths` and points at
-> local data; `--model_name` must be `musvit` or `musvit_light`.
+## 5. Run artifacts
 
----
+New runs never reuse a directory:
 
-## Training details
-
-- **Splits.** 80% train / 10% validation / 10% test, with a fixed seed for
-  reproducibility.
-- **Vocabulary.** Symbols are integer-encoded with a `LabelEncoder`; all ids are
-  shifted up by 1 so that id `0` is reserved for the **CTC blank**.
-- **Length filtering.** CTC needs input length ≥ target length, so training
-  samples whose symbol sequence is longer than `cols` are dropped.
-- **Loss.** `F.ctc_loss` with `zero_infinity=True`.
-- **Checkpointing & early stopping.** Validation CER is tracked from
-  `--start_eval` onward; the best model is saved, and training stops after 30
-  evaluations without improvement.
-- **Reproducibility.** Main-process RNGs are seeded, and each DataLoader worker
-  is re-seeded per epoch (including the albumentations RNG) via
-  `_worker_init_fn`.
-
-### Output checkpoint
-
-The best model is written to the working directory as:
-
-```
-<model_name>_<ds_name>_<method>_<cols>_ctc.pt
-# e.g.  musvit_catedrales_lora_128_ctc.pt
+```text
+<output_root>/<experiment_name>/<UTC>-<contract-hash>-<run-id>/
+  run.json
+  dataset_bundle.json
+  split_manifest.json
+  vocabulary.json
+  image_verification_index.json
+  train_exclusions.json
+  metrics.jsonl
+  checkpoints/
+    last.pt
+    best.pt
+  test.json
+  summary.json
 ```
 
-After training, the script reloads this checkpoint and prints **train** and
-**test** CER.
+Only applicable exclusion files are present. `last.pt` is the epoch transaction
+commit point; sidecars are repaired from it after an interrupted write.
+`best.pt` is selected by strictly lower `val_CER_all`. Final test runs from
+`best.pt`, and finalization is idempotent.
 
----
+Checkpoints save trainable state, optimizer state, exact parameter-name mapping,
+the full vocabulary, input/training contracts, manifest identity, and approved
+base-weight identity. They omit the large immutable backbone and complete
+manifest. A standalone checkpoint can decode already-produced ids without
+scanning target files, but inference still needs the recorded base revision and
+matching weight SHA-256.
 
-## Evaluation metric
+Structured JSON artifacts are authoritative; terminal output is only a
+convenience view.
 
-Quality is measured with **CER (Character/Symbol Error Rate)** — the total edit
-distance between predicted and reference symbol sequences, normalised by total
-reference length. Lower is better (`0.0` = perfect). `engine_test` also prints
-one ground-truth / prediction pair per evaluation as a quick sanity check.
+## 6. Windows launcher
 
----
+The repository launcher requires both the raw data and prepared bundle:
 
-```bash
-python augments.py   # writes aux0.png ... aux9.png
+```powershell
+.\4.staff_level_omr.ps1 `
+  -DataPath D:\datasets\staff-omr `
+  -DatasetBundlePath D:\datasets\staff-omr-bundle
 ```
 
----
+Add `-DryRun` to validate inputs and print the exact canonical v2 command
+without loading a model.

@@ -128,15 +128,42 @@ Checkpoints and W&B logs are written inside `experiments/full_page_omr/` (`weigh
 
 ### Staff-level OMR (fine-tuning)
 
+Prepare a deterministic, group-disjoint dataset bundle first:
+
 ```bash
-uv run musvit staff-level-omr \
-  --ds_name catedrales \
-  --model_name musvit \
-  --method lora \
-  --shape_patches '[8,128]'
+uv run --frozen musvit staff-level-omr prepare-data \
+  --data_path /path/to/catedrales/data \
+  --dataset_id catedrales-v1 \
+  --group_regex '(?P<group_id>score-[^/]+)/.*_region[.]png' \
+  --out /path/to/catedrales/bundle
 ```
 
-Fine-tunes a MuSViT backbone with a BiLSTM/CTC head on cropped staves, by either linear probing (`--method linear_prob`, frozen backbone) or LoRA (`--method lora`). Checkpoints (`<model>_<ds>_<method>_<cols>_ctc.pt`) are written inside `experiments/staff_level_omr/`. Requires a GPU and editing the dataset paths in [`config.py`](experiments/staff_level_omr/config.py) to point at your local data.
+Then start the trusted v2 runtime:
+
+```bash
+uv run --frozen musvit staff-level-omr train \
+  --experiment_name catedrales \
+  --data_path /path/to/catedrales/data \
+  --dataset_bundle_path /path/to/catedrales/bundle \
+  --model_name musvit \
+  --method lora \
+  --patch_rows 8 \
+  --patch_cols 128
+```
+
+On Windows, the launcher requires the same two explicit data inputs:
+
+```powershell
+.\4.staff_level_omr.ps1 -DryRun `
+  -DataPath D:\path\to\catedrales\data `
+  -DatasetBundlePath D:\path\to\catedrales\bundle
+```
+
+The v2 runtime records immutable data/model identities, auditable CTC
+exclusions, layered CER metrics, and resumable run directories. Legacy
+state-dict-only checkpoints cannot resume into v2. See the
+[experiment README](experiments/staff_level_omr/README.md) for the complete
+contract and recovery workflow.
 
 ### Object Detection (Faster R-CNN fine-tuning)
 
