@@ -289,7 +289,7 @@ class SMTPP_Trainer(L.LightningModule):
         
     
     def validation_step(self, val_batch):
-        x, dec_in, y = val_batch
+        x, dec_in, y = val_batch[:3]
         del dec_in
         generation = self.model.generate_token_ids(input=x)
         self.preds.append(
