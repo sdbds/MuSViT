@@ -98,6 +98,7 @@ checkpoint 和恢复契约，部分错误会在训练过程中被静默掩盖。
 | manifest 和词表没有生产入口 | 协议无法用于真实数据 | 提供一次性、确定性的 `prepare-data` 命令 |
 | 增强未进入配置 hash | 训练身份不完整 | 有序增强契约进入 training contract |
 | 增强 RNG 绑定 worker seed | worker 数会改变训练样本 | 样本/epoch 派生增强 seed，worker 不参与语义 |
+| Gaussian blur 声明值依赖偶数 kernel 隐式纠正 | contract 与实际 kernel 行为错位 | 显式枚举 3/5 两个奇数 kernel 并拒绝运行时归一化 |
 | 输入几何自由字段却被 method 唯一决定 | 默认 linear probe 会撞组合校验 | v2 由 method 派生并拒绝显式覆盖 |
 | 大型排除列表内联配置 | 配置膨胀且难操作 | 使用绑定 manifest/宽度的规范化排除文件 |
 | base 权重未进入 registry identity | trainable-only checkpoint 依赖不完整 | 固定权重文件 size、LFS SHA-256 和 pointer oid |
@@ -722,6 +723,13 @@ persistent_workers = false
 worker。以上语义字段进入 `training_contract`，`num_workers` 本身只进入
 launch config，并由跨 worker 的逐字节输入测试证明它不是训练语义。
 
+显式 `in_order` 参数从 PyTorch 2.6 起可用；v2 不支持更早版本，也不以“旧版
+默认保序”作为隐式兼容路径。新运行 preflight 必须同时验证
+`torch >= 2.6` 且 `DataLoader` signature 含 `in_order`，否则在构建 loader 前
+失败。resume 的 PyTorch major.minor 硬约束继续阻止同一 run 跨实现版本恢复。
+依据是官方 PyTorch 2.6 `DataLoader` API：
+<https://docs.pytorch.org/docs/2.6/data.html#torch.utils.data.DataLoader>。
+
 ## 11. 输入和模型契约
 
 ### 11.1 输入几何
@@ -801,15 +809,30 @@ Compose(p=1.0)
   ColorJitter(brightness=[0.25,1.75], contrast=[0.25,1.75],
               saturation=[0.25,1.75], hue=[-0.05,0.05], p=0.75)
   OneOf(p=0.25)
-    GaussianBlur(blur_limit=[3,4], sigma_limit=[0.5,3.0], p=1.0)
-    MotionBlur(blur_limit=[3,4], allow_shifted=true,
+    OneOf(p=1.0)
+      GaussianBlur(blur_limit=[3,3], sigma_limit=[0.5,3.0], p=1.0)
+      GaussianBlur(blur_limit=[5,5], sigma_limit=[0.5,3.0], p=1.0)
+    MotionBlur(blur_limit=[3,5], allow_shifted=true,
                angle_range=[0,360], direction_range=[-1,1], p=1.0)
   ToGray(num_output_channels=3, method=weighted_average, p=0.1)
 ```
 
-规范化结构、顺序和 SHA-256 全部进入 `training_contract`。profile 名相同但展开
-内容不同必须产生不同 contract hash；库升级改变解析结果时也必须在 preflight
-中报出差异。
+blur 的嵌套 `OneOf` 不是新增增强强度：两个 Gaussian leaf 等权，显式保留
+legacy `(3,4)` 在 Albumentations 2.0.8 中实际产生 3/5 kernel 各半的分布；
+MotionBlur 构造后实际范围同样是 `[3,5]`。不能把 Gaussian 的 constructor
+属性 `(3,4)` 误解为“只会得到 3”：其 sampled 4 会在创建 kernel 时变成 5。
+v2 删除这个隐式偶数纠正，所有 blur leaf 的声明范围、构造后属性和实际 kernel
+size 都只含奇数。
+
+上述声明式结构本身是 augmentation identity 的唯一来源；不得用库的
+`to_dict()` 结果反向生成 contract。规范化结构、顺序和 SHA-256 全部进入
+`training_contract`。preflight 必须构造每个 leaf，并逐字段断言声明值等于
+构造后的实际属性；比较前只允许把 tuple/list 统一成 canonical JSON array，
+不能做数值或范围修正。还要用 tiny image 对每个 leaf 执行
+`force_apply=true` probe，任何 warning、隐式范围修正或非声明 kernel size
+都失败；blur leaf 的固定 seed matrix 必须覆盖声明中的每个 kernel size。
+profile 名相同但声明内容不同必须产生不同 contract hash；库升级改变实际属性
+或行为时必须在训练前失败，不能悄悄改写 identity。
 
 `[0,1]` 且不 normalization 不是任意选择。MuSViT 官方模型说明当前示例使用
 `Resize([1024, 1024])` 后直接 `ToTensor()`，并对 staff/non-page zero-shot
@@ -1051,16 +1074,21 @@ JSONL 保持 O(n) 总写入而不是每个 epoch 重写历史。
 ### 12.2 初始化和 epoch 随机性
 
 `seed_schedule_version` 固定为
-`staff_omr_sample_epoch_sha256_v1`。所有 seed 派生先定义同一个无歧义原语：
+`staff_omr_sample_epoch_sha256_v1`。所有 seed 派生先定义同一个无歧义 digest：
 
 ```text
+seed_digest(label, parts...) =
+  SHA256(UTF8("staff_omr_v2") + NUL
+         + UTF8(label) + NUL
+         + NUL.join(UTF8(part) for part in parts)).digest()
+
 seed32(label, parts...) =
-  int.from_bytes(
-    SHA256(UTF8("staff_omr_v2") + NUL
-           + UTF8(label) + NUL
-           + NUL.join(UTF8(part) for part in parts)).digest()[0:4],
-    byteorder="big",
-    signed=false)
+  int.from_bytes(seed_digest(label, parts...)[0:4],
+                 byteorder="big", signed=false)
+
+seed256(label, parts...) =
+  int.from_bytes(seed_digest(label, parts...),
+                 byteorder="big", signed=false)
 ```
 
 整数 part 使用无前导零的十进制 ASCII；`sample_id` 使用 manifest 中的原始
@@ -1085,21 +1113,35 @@ task head，linear probe 只建 task head。初始化因此不依赖 backbone �
 epoch_seed = seed32("epoch", decimal(seed), decimal(epoch))
 worker_base_seed = seed32("worker", decimal(seed), decimal(epoch))
 sample_augment_seed =
-  seed32("augment", decimal(seed), decimal(epoch), sample_id)
-
+  seed256("augment", decimal(seed), decimal(epoch), sample_id)
 sample_order_key =
-  SHA256(UTF8("staff_omr_v2") + NUL + UTF8("order") + NUL
-         + UTF8(decimal(seed)) + NUL + UTF8(decimal(epoch)) + NUL
-         + UTF8(sample_id))
+  seed_digest("order", decimal(seed), decimal(epoch), sample_id)
 ```
+
+各域职责不能混用：
+
+| 域 | 表示 | 唯一职责 | 训练语义 |
+|---|---|---|---|
+| `init` | `seed32` | adapter/task-head 初始化 | 是 |
+| `order` | 32-byte 完整 digest | epoch 内样本顺序 | 是 |
+| `augment` | 完整 digest 的 256-bit unsigned int | 每个样本的增强随机流 | 是 |
+| `epoch` | `seed32` | 主进程 dropout 及其他训练 RNG | 是 |
+| `worker` | `seed32` | DataLoader worker base-seed 分配 | 否 |
+
+增强不需要兼容 NumPy legacy `seed()` 的 32-bit 限制：
+Albumentations 2.0.8 的 `Compose.set_random_seed` 使用独立 generator，必须接受
+并保留 `seed256`。preflight 对完整 256-bit seed 做两次相同输入的逐字节等价
+probe；不支持时失败，不得退回 32-bit 截断。这样逐样本增强与排序都保留完整
+SHA-256 空间，不引入 5 万样本规模下可观的生日碰撞概率。
 
 train 保留样本按 `(sample_order_key bytes, UTF8(sample_id))` 升序构成该 epoch
 的完整 sampler；sampler item 固定为 `(epoch, manifest_sample_index)`，让
 Dataset 不依赖进程本地的可变 `current_epoch`。这就是
 `sha256_epoch_order_v1`，不调用 DataLoader `shuffle`。用 `epoch_seed` 重置
 Python、NumPy 和 Torch CPU/CUDA RNG，使 dropout 等训练随机性从 epoch 边界
-可重建。DataLoader 使用单独、以 `worker_base_seed` 初始化的 generator，
-避免 worker base-seed 分配消耗模型训练 RNG。
+可重建；`epoch_seed` 不控制样本顺序或增强。DataLoader 使用单独、以
+`worker_base_seed` 初始化的 generator，避免 worker base-seed 分配消耗模型
+训练 RNG。
 
 worker init 可以把 PyTorch worker seed 传给 Python/NumPy 作为非语义卫生措施，
 但禁止用它设置增强 pipeline。Dataset 的 `__getitem__` 必须在每次应用
@@ -1426,6 +1468,8 @@ backbone，公开与真实 backbone 相同的最小 config 和输出接口。
 - training contract 的 Adam、增强和排除文件 hash/count 稳定。
 - 只修改 worker、output/data location 或同内容排除文件的 source path，不改变
   training contract hash，但改变 launch config hash。
+- PyTorch `<2.6` 或 `DataLoader` signature 缺少 `in_order` 时在 loader 构建前
+  失败，不走旧版隐式 fallback。
 
 ### 17.2 Manifest 和词表测试
 
@@ -1470,10 +1514,16 @@ backbone，公开与真实 backbone 相同的最小 config 和输出接口。
 - 超长 target 不导致其他样本被全局 padding。
 - `sha256_epoch_order_v1` 对相同 seed/epoch/sample ids 产生稳定全排列，不受
   manifest 输入顺序影响。
-- 启用 `staff_omr_train_v1` 后，workers `0/2/4` 产生逐字节相同的 sample id
-  顺序、batch 边界和增强 tensor。
+- augmentation contract 不从 `to_dict()` 生成；每个声明字段等于构造后实际
+  属性，所有 leaf 的 tiny-image probe 无 warning 或隐式修正。
+- Gaussian blur 只存在显式 `[3,3]`/`[5,5]` leaf，二者等权；MotionBlur 的
+  构造前后范围均为 `[3,5]`。任何 `(3,4)` blur 声明在 preflight 失败。
+- 单独的 slow contract test 使用 8-12 个 `24x40` RGB fixture；启用
+  `staff_omr_train_v1` 后，workers `0/2/4` 产生逐字节相同的 sample id 顺序、
+  batch 边界和增强 tensor。该测试进入完整 CI/发布验收，可从快速本地测试集
+  排除。
 - 改变 epoch 或 sample id 会改变对应 sample seed；worker seed 不传给
-  Albumentations。
+  Albumentations。增强 seed 使用完整 256-bit digest，不能截断为 `seed32`。
 
 ### 17.5 模型契约测试
 
@@ -1574,6 +1624,8 @@ backbone，公开与真实 backbone 相同的最小 config 和输出接口。
     machine 有机器可执行的契约测试。
 15. 所有新增测试在 CPU、无网络环境通过。
 16. 相同 seed/epoch 下 workers `0/2/4` 的样本顺序和增强后 batch 逐字节相同。
+17. augmentation contract 不含偶数 blur range、运行时 warning 或隐式参数
+    修正；声明、构造后属性和实际 kernel 行为一致。
 
 ## 19. 后续阶段
 
