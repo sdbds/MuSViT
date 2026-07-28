@@ -196,6 +196,7 @@ uv run musvit full-page-omr \
   --config_path=experiments/full_page_omr/config/Page_OMR_PDMX/pretraining.json \
   --experiment_name=pdmx_from_polish \
   --finetuning=PDMX \
+  --validation_every_n_epochs=1 \
   --starting_weights=/path/to/polish.ckpt \
   --source_vocab_manifest=vocab/Polish_Scores_BeKern.source-vocab.json \
   --source_curriculum_step=282200 \

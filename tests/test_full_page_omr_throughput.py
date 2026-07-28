@@ -523,6 +523,39 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
             validation_every_n_epochs=2_001,
         )
 
+    def test_pdmx_stream_requires_validation_each_virtual_epoch(self):
+        pdmx_data = SimpleNamespace(
+            stream_resume_mode="virtual_epoch_boundary"
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "validation_every_n_epochs=1",
+        ):
+            finetune._validate_data_regime_contract(
+                pdmx_data,
+                protocol_version="full_page_omr_pdmx_v1",
+                validation_every_n_epochs=2_000,
+            )
+
+        with self.assertRaisesRegex(ValueError, "distinct protocol_version"):
+            finetune._validate_data_regime_contract(
+                pdmx_data,
+                protocol_version=finetune.PROTOCOL_VERSION,
+                validation_every_n_epochs=1,
+            )
+
+        finetune._validate_data_regime_contract(
+            pdmx_data,
+            protocol_version="full_page_omr_pdmx_v1",
+            validation_every_n_epochs=1,
+        )
+        finetune._validate_data_regime_contract(
+            SimpleNamespace(),
+            protocol_version=finetune.PROTOCOL_VERSION,
+            validation_every_n_epochs=2_000,
+        )
+
     def test_canonical_protocol_allows_wsd_endpoint_and_decay_overrides(self):
         finetune._validate_canonical_protocol_contract(
             finetune.PROTOCOL_VERSION,

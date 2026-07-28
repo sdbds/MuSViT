@@ -150,6 +150,20 @@ def test_source_id_rejects_parent_traversal():
         normalize_source_id("scores/../other.mxl")
 
 
+def test_scan_rejects_tar_member_parent_traversal(tmp_path):
+    tar_path = _write_tar(
+        tmp_path / "unsafe.tar",
+        {"../evil": _sample("scores/evil.mxl")},
+    )
+
+    with pytest.raises(ValueError, match="unsafe PDMX tar member"):
+        scan_pdmx_tar(
+            tar_path,
+            renderer="verovio",
+            logical_path="unsafe.tar",
+        )
+
+
 def test_discovery_accepts_only_official_kern_roots(tmp_path):
     expected_train, expected_validation = _make_snapshot(tmp_path)
     _write_tar(

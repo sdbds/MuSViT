@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from io import BytesIO
 import hashlib
 import json
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import tarfile
 from typing import Any, Mapping, Sequence
 
@@ -93,7 +93,17 @@ def normalize_source_id(value: str) -> str:
 
 
 def _split_member_name(name: str) -> tuple[str, str]:
-    normalized = name.replace("\\", "/").lstrip("./")
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"unsafe PDMX tar member: {name!r}")
+    normalized = name.replace("\\", "/")
+    components = normalized.split("/")
+    windows_path = PureWindowsPath(name)
+    if (
+        PurePosixPath(normalized).is_absolute()
+        or bool(windows_path.drive)
+        or any(component in {"", ".", ".."} for component in components)
+    ):
+        raise ValueError(f"unsafe PDMX tar member: {name!r}")
     for suffix in _KNOWN_SUFFIXES:
         marker = f".{suffix}"
         if normalized.endswith(marker):

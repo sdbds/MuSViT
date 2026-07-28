@@ -461,12 +461,12 @@ class PDMXValidationDataset(Dataset):
         snapshot_root: str | Path,
     ) -> None:
         super().__init__()
-        decoder = _PDMXSampleDecoder(
+        self.decoder = _PDMXSampleDecoder(
             vocabulary,
             teacher_forcing_probability=0.0,
         )
-        self.w2i = decoder.w2i
-        self.i2w = decoder.i2w
+        self.w2i = self.decoder.w2i
+        self.i2w = self.decoder.i2w
         rows = []
         root = Path(snapshot_root)
         for shard in sorted(
@@ -480,30 +480,35 @@ class PDMXValidationDataset(Dataset):
                     (
                         str(shard["logical_path"]),
                         key,
-                        decoder.decode(
-                            sample,
-                            shard=shard,
-                            virtual_epoch=0,
-                            global_ordinal=len(rows),
-                            source_cycle=0,
-                            occurrence_index=0,
-                        ),
+                        sample,
+                        dict(shard),
                     )
                 )
-        self.rows = tuple(
-            row
-            for _, _, row in sorted(rows, key=lambda item: (item[0], item[1]))
+        self._encoded_rows = tuple(
+            (sample, shard)
+            for _, _, sample, shard in sorted(
+                rows,
+                key=lambda item: (item[0], item[1]),
+            )
         )
-        if len(self.rows) != manifest["validation_sample_count"]:
+        if len(self._encoded_rows) != manifest["validation_sample_count"]:
             raise ValueError(
                 "validation sample count differs from dataset manifest"
             )
 
     def __len__(self) -> int:
-        return len(self.rows)
+        return len(self._encoded_rows)
 
     def __getitem__(self, index: int):
-        return self.rows[index]
+        sample, shard = self._encoded_rows[index]
+        return self.decoder.decode(
+            sample,
+            shard=shard,
+            virtual_epoch=0,
+            global_ordinal=index,
+            source_cycle=0,
+            occurrence_index=0,
+        )
 
 
 class PDMXPretrainingDataModule(LightningDataModule):
@@ -718,6 +723,14 @@ class PDMXPretrainingDataModule(LightningDataModule):
 
 
 class PDMXVirtualEpochCallback(Callback):
+    def on_fit_start(self, trainer, pl_module) -> None:
+        del pl_module
+        if trainer.world_size != 1:
+            raise RuntimeError(
+                "PDMX v1 supports only single-process training; "
+                f"received world_size={trainer.world_size}"
+            )
+
     def on_train_epoch_start(self, trainer, pl_module) -> None:
         data = trainer.datamodule
         if data is None or not hasattr(data, "set_train_epoch"):

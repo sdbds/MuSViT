@@ -120,6 +120,23 @@ def _validate_canonical_protocol_contract(
         )
 
 
+def _validate_data_regime_contract(
+        data,
+        *,
+        protocol_version: str,
+        validation_every_n_epochs: int) -> None:
+    if getattr(data, "stream_resume_mode", None) != "virtual_epoch_boundary":
+        return
+    if validation_every_n_epochs != 1:
+        raise ValueError(
+            "virtual-epoch streaming requires validation_every_n_epochs=1"
+        )
+    if protocol_version == PROTOCOL_VERSION:
+        raise ValueError(
+            "virtual-epoch streaming requires a distinct protocol_version"
+        )
+
+
 def _validate_max_steps(value: int, *, train: bool) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError("max_steps must be an integer")
@@ -1033,6 +1050,11 @@ def main(config: ExperimentConfig, experiment_name,
     logger.info(f"Using {finetuning_technique} technique, implementing {DATASETS_TYPE[finetuning_technique]}")
 
     data = DATASETS_TYPE[finetuning_technique](config)
+    _validate_data_regime_contract(
+        data,
+        protocol_version=protocol_version,
+        validation_every_n_epochs=validation_every_n_epochs,
+    )
     data_protocol = _data_protocol_metadata(data)
     encoder_unfreeze_step = data.encoder_unfreeze_step
     curriculum_step_offset = data.curriculum_step_offset

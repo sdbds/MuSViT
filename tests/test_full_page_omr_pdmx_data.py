@@ -17,6 +17,7 @@ from experiments.full_page_omr.config.ExperimentConfigWrapper import PDMXData
 from experiments.full_page_omr.pdmx_data import (
     PDMXConsumptionAuditCallback,
     PDMXPretrainingDataModule,
+    PDMXVirtualEpochCallback,
     _PDMXSampleDecoder,
     _webdataset_samples,
     deterministic_teacher_forcing,
@@ -197,6 +198,20 @@ def test_validation_dataset_is_ordered_and_variable_size_safe(pdmx_fixture):
     assert all(row[0].shape == (1, 3, 64, 64) for row in rows)
 
 
+def test_validation_dataset_keeps_compressed_samples_until_indexed(
+    pdmx_fixture,
+):
+    data = _build_data(pdmx_fixture)
+
+    encoded_sample, _ = data.val_dataset._encoded_rows[0]
+
+    assert isinstance(encoded_sample["image.png"], bytes)
+    assert not any(
+        isinstance(value, torch.Tensor)
+        for value in encoded_sample.values()
+    )
+
+
 @pytest.mark.parametrize("num_workers", [0, 2])
 def test_virtual_epoch_has_exact_global_length(pdmx_fixture, num_workers):
     data = _build_data(
@@ -277,6 +292,21 @@ def test_protocol_metadata_captures_dataset_vocab_and_runtime_identity(
     assert metadata["train_validation_source_overlap"] == 0
     assert metadata["software_versions"]["webdataset"]
     assert metadata["software_versions"]["torch"]
+
+
+def test_virtual_epoch_callback_rejects_distributed_training():
+    callback = PDMXVirtualEpochCallback()
+
+    with pytest.raises(RuntimeError, match="single-process"):
+        callback.on_fit_start(
+            SimpleNamespace(world_size=2),
+            Mock(),
+        )
+
+    callback.on_fit_start(
+        SimpleNamespace(world_size=1),
+        Mock(),
+    )
 
 
 def test_teacher_forcing_is_sample_scoped_and_does_not_touch_global_rng():
