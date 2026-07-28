@@ -22,6 +22,8 @@ from experiments.full_page_omr.utils.vocab_manifest import (
 
 
 EMBEDDING_KEY, OUTPUT_WEIGHT_KEY, OUTPUT_BIAS_KEY = TOKEN_AXIS_KEYS
+REPO_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_VOCAB_DIR = REPO_ROOT / "experiments" / "full_page_omr" / "vocab"
 
 
 def _state(vocab_size: int, *, offset: float) -> dict[str, torch.Tensor]:
@@ -270,3 +272,19 @@ def test_legacy_source_manifest_pins_both_numpy_files(tmp_path):
     np.save(i2w_path, {0: "<pad>", 1: "changed", 2: "a"})
     with pytest.raises(ValueError, match="SHA-256"):
         load_source_vocabulary_tokens(manifest_path)
+
+
+@pytest.mark.parametrize(
+    ("name", "size"),
+    [
+        ("Polish_Scores_BeKern", 215),
+        ("Mozarteum_BeKern", 191),
+        ("FP_GrandStaff_BeKern", 181),
+    ],
+)
+def test_checked_in_legacy_source_manifests_are_verified(name, size):
+    tokens = load_source_vocabulary_tokens(
+        PROJECT_VOCAB_DIR / f"{name}.source-vocab.json"
+    )
+
+    assert len(tokens) == size

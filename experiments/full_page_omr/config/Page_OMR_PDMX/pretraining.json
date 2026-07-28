@@ -1,0 +1,20 @@
+{
+  "data": {
+    "type": "pdmx_webdataset",
+    "dataset_id": "tobiashornbogen/page-omr-pdmx-renders",
+    "dataset_revision": "7da3ae5237963e57a8fe1c6ee375b1f10af34a09",
+    "dataset_manifest": "config/Page_OMR_PDMX/dataset-manifest.v1.json",
+    "vocab_manifest": "vocab/FullPageOMR_BeKern_v1.json",
+    "renderer_weights": {
+      "verovio": 0.5,
+      "mscore": 0.5
+    },
+    "batch_size": 1,
+    "num_workers": 8,
+    "tokenization_mode": "bekern",
+    "steps_per_epoch": 10000,
+    "shuffle_buffer": 2048,
+    "seed": 3407,
+    "runtime_augmentation": false
+  }
+}

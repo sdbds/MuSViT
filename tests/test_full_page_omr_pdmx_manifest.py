@@ -10,6 +10,7 @@ import pytest
 from experiments.full_page_omr.pdmx_manifest import (
     PDMX_DATASET_ID,
     PDMX_DATASET_REVISION,
+    build_vocabulary,
     build_pdmx_dataset_manifest,
     discover_official_pdmx_shards,
     load_pdmx_dataset_manifest,
@@ -18,9 +19,17 @@ from experiments.full_page_omr.pdmx_manifest import (
     verify_pdmx_dataset_manifest,
     write_pdmx_dataset_manifest,
 )
+from experiments.full_page_omr.utils.vocab_manifest import (
+    build_project_seed_tokens,
+    canonical_json_sha256,
+    load_legacy_ordered_tokens,
+    load_vocabulary_manifest,
+)
 
 
 VALID_KERN = "**kern\n*staff1\n*clefG2\n4c\n*-"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_VOCAB_DIR = REPO_ROOT / "experiments" / "full_page_omr" / "vocab"
 
 
 def _png_bytes(size: tuple[int, int] = (48, 32)) -> bytes:
@@ -259,3 +268,80 @@ def test_written_manifest_round_trips_and_verifies_local_files(tmp_path):
     (tmp_path / train[0][1]).write_bytes(b"tampered")
     with pytest.raises(ValueError, match="size mismatch|SHA-256 mismatch"):
         verify_pdmx_dataset_manifest(manifest, tmp_path)
+
+
+def test_build_vocabulary_extends_train_only_and_writes_legacy_pair(tmp_path):
+    train, validation = _make_snapshot(tmp_path)
+    manifest = build_pdmx_dataset_manifest(
+        snapshot_root=tmp_path,
+        dataset_id=PDMX_DATASET_ID,
+        dataset_revision=PDMX_DATASET_REVISION,
+        train_shards=train,
+        validation_shards=validation,
+        renderer_weights={"verovio": 0.5, "mscore": 0.5},
+    )
+    manifest["train_token_frequencies"]["pdmx-only-token"] = 1
+    manifest["validation_token_frequencies"]["pdmx-only-token"] = 1
+    manifest["manifest_sha256"] = canonical_json_sha256(
+        {
+            key: value
+            for key, value in manifest.items()
+            if key != "manifest_sha256"
+        }
+    )
+    dataset_manifest_path = write_pdmx_dataset_manifest(
+        manifest,
+        tmp_path / "dataset.json",
+    )
+    output_path = tmp_path / "FullPageOMR_BeKern_v1.json"
+
+    result = build_vocabulary(
+        dataset_manifest=str(dataset_manifest_path),
+        output=str(output_path),
+        snapshot_root=str(tmp_path),
+        vocab_dir=str(PROJECT_VOCAB_DIR),
+    )
+
+    vocabulary = load_vocabulary_manifest(result)
+    seed = build_project_seed_tokens(PROJECT_VOCAB_DIR)
+    assert vocabulary.ordered_tokens[: len(seed)] == seed
+    assert vocabulary.ordered_tokens[-1] == "pdmx-only-token"
+    assert vocabulary.source_dataset_manifests == (
+        manifest["manifest_sha256"],
+    )
+    assert load_legacy_ordered_tokens(
+        tmp_path / "FullPageOMR_BeKern_v1w2i.npy",
+        tmp_path / "FullPageOMR_BeKern_v1i2w.npy",
+    ) == vocabulary.ordered_tokens
+
+
+def test_build_vocabulary_rejects_validation_only_oov(tmp_path):
+    train, validation = _make_snapshot(tmp_path)
+    manifest = build_pdmx_dataset_manifest(
+        snapshot_root=tmp_path,
+        dataset_id=PDMX_DATASET_ID,
+        dataset_revision=PDMX_DATASET_REVISION,
+        train_shards=train,
+        validation_shards=validation,
+        renderer_weights={"verovio": 0.5, "mscore": 0.5},
+    )
+    manifest["validation_token_frequencies"]["validation-only-token"] = 1
+    manifest["manifest_sha256"] = canonical_json_sha256(
+        {
+            key: value
+            for key, value in manifest.items()
+            if key != "manifest_sha256"
+        }
+    )
+    dataset_manifest_path = write_pdmx_dataset_manifest(
+        manifest,
+        tmp_path / "dataset.json",
+    )
+
+    with pytest.raises(ValueError, match="validation.*OOV"):
+        build_vocabulary(
+            dataset_manifest=str(dataset_manifest_path),
+            output=str(tmp_path / "FullPageOMR_BeKern_v1.json"),
+            snapshot_root=str(tmp_path),
+            vocab_dir=str(PROJECT_VOCAB_DIR),
+        )

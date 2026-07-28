@@ -1,6 +1,7 @@
 import json
 import unittest
 from copy import deepcopy
+from pathlib import Path
 
 from experiments.full_page_omr.config.ExperimentConfigWrapper import (
     Data,
@@ -141,6 +142,43 @@ class FullPageOMRConfigTests(unittest.TestCase):
             experiment_config_from_dict(
                 self._pdmx_config(runtime_augmentation=True)
             )
+
+    def test_new_pdmx_and_downstream_configs_parse(self):
+        config_root = (
+            Path(__file__).resolve().parents[1]
+            / "experiments"
+            / "full_page_omr"
+            / "config"
+        )
+        cases = (
+            (
+                config_root / "Page_OMR_PDMX" / "pretraining.json",
+                PDMXData,
+            ),
+            (
+                config_root / "Polish_Scores" / "pdmx_finetuning.json",
+                Data,
+            ),
+            (
+                config_root / "Mozarteum" / "pdmx_finetuning.json",
+                Data,
+            ),
+        )
+        for path, expected_type in cases:
+            with self.subTest(path=path):
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                config = experiment_config_from_dict(payload)
+                self.assertIsInstance(config.data, expected_type)
+                if isinstance(config.data, PDMXData):
+                    self.assertEqual(
+                        config.data.vocab_manifest,
+                        "vocab/FullPageOMR_BeKern_v1.json",
+                    )
+                else:
+                    self.assertEqual(
+                        config.data.vocab_name,
+                        "FullPageOMR_BeKern_v1",
+                    )
 
 
 if __name__ == "__main__":

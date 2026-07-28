@@ -14,7 +14,17 @@ from huggingface_hub import snapshot_download
 from PIL import Image, UnidentifiedImageError
 
 from .tokenization import parse_kern_file
-from .utils.vocab_manifest import canonical_json_sha256
+from .utils.vocab_manifest import (
+    VocabularyManifest,
+    build_project_seed_tokens,
+    canonical_json_sha256,
+    extend_ordered_tokens,
+    load_legacy_ordered_tokens,
+    load_vocabulary_manifest,
+    ordered_token_sha256,
+    write_legacy_numpy_pair,
+    write_vocabulary_manifest,
+)
 
 
 PDMX_DATASET_ID = "tobiashornbogen/page-omr-pdmx-renders"
@@ -630,8 +640,117 @@ def scan(
     return str(write_pdmx_dataset_manifest(manifest, output))
 
 
+def _frequency_tokens(
+    manifest: Mapping[str, Any],
+    field_name: str,
+) -> tuple[str, ...]:
+    frequencies = manifest.get(field_name)
+    if not isinstance(frequencies, dict) or not frequencies:
+        raise ValueError(f"dataset manifest {field_name} must be non-empty")
+    for token, count in frequencies.items():
+        if not isinstance(token, str) or not token:
+            raise ValueError(f"dataset manifest {field_name} has invalid token")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            raise ValueError(
+                f"dataset manifest {field_name} has invalid count for {token!r}"
+            )
+    return tuple(frequencies)
+
+
+def build_vocabulary(
+    dataset_manifest: str,
+    output: str,
+    snapshot_root: str | None = None,
+    cache_dir: str | None = None,
+    vocab_dir: str | None = None,
+) -> str:
+    manifest = load_pdmx_dataset_manifest(dataset_manifest)
+    root = (
+        Path(snapshot_root)
+        if snapshot_root is not None
+        else resolve_local_snapshot(cache_dir=cache_dir)
+    )
+    verify_pdmx_dataset_manifest(manifest, root)
+
+    project_vocab_dir = (
+        Path(vocab_dir)
+        if vocab_dir is not None
+        else Path(__file__).resolve().parent / "vocab"
+    )
+    seed = build_project_seed_tokens(project_vocab_dir)
+    train_tokens = _frequency_tokens(
+        manifest,
+        "train_token_frequencies",
+    )
+    validation_tokens = set(
+        _frequency_tokens(
+            manifest,
+            "validation_token_frequencies",
+        )
+    )
+    ordered_tokens = extend_ordered_tokens(seed, [train_tokens])
+    validation_oov = sorted(
+        validation_tokens - set(ordered_tokens),
+        key=lambda token: token.encode("utf-8"),
+    )
+    if validation_oov:
+        raise ValueError(
+            f"validation contains OOV tokens not seen in train: {validation_oov}"
+        )
+
+    output_path = Path(output)
+    if output_path.suffix.lower() != ".json" or not output_path.stem:
+        raise ValueError("vocabulary output must be a named .json file")
+    name = output_path.stem
+    additions = ordered_tokens[len(seed) :]
+    vocabulary = VocabularyManifest(
+        schema_version=1,
+        name=name,
+        tokenization_mode="bekern",
+        base_name="FullPageOMRProjectSeed",
+        base_size=len(seed),
+        base_digest=ordered_token_sha256(seed),
+        ordered_tokens=ordered_tokens,
+        token_provenance={
+            token: f"pdmx-train:{manifest['manifest_sha256']}"
+            for token in additions
+        },
+        source_dataset_manifests=(manifest["manifest_sha256"],),
+        vocab_sha256=ordered_token_sha256(ordered_tokens),
+    )
+
+    if output_path.exists():
+        existing = load_vocabulary_manifest(output_path)
+        if existing.vocab_sha256 != vocabulary.vocab_sha256:
+            raise FileExistsError(
+                "refusing to overwrite a vocabulary with a different digest; "
+                "choose a new output version"
+            )
+    w2i_path = output_path.parent / f"{name}w2i.npy"
+    i2w_path = output_path.parent / f"{name}i2w.npy"
+    if w2i_path.exists() or i2w_path.exists():
+        if not (w2i_path.exists() and i2w_path.exists()):
+            raise FileExistsError("legacy vocabulary pair is incomplete")
+        existing_tokens = load_legacy_ordered_tokens(w2i_path, i2w_path)
+        if existing_tokens != ordered_tokens:
+            raise FileExistsError(
+                "refusing to overwrite a legacy pair with a different digest; "
+                "choose a new output version"
+            )
+
+    write_vocabulary_manifest(vocabulary, output_path)
+    write_legacy_numpy_pair(vocabulary, output_path.parent)
+    return str(output_path)
+
+
 def main() -> None:
-    Fire({"prepare": prepare, "scan": scan})
+    Fire(
+        {
+            "prepare": prepare,
+            "scan": scan,
+            "build-vocabulary": build_vocabulary,
+        }
+    )
 
 
 if __name__ == "__main__":
