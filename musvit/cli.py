@@ -32,6 +32,7 @@ class Experiment:
     location: str
     loader: Callable[[], Any]
     help_rows: tuple[tuple[str, str], ...]
+    default_subcommand: str | None = None
 
 
 def _load_full_page_omr():
@@ -46,7 +47,9 @@ def _load_embeddings():
 
 def _load_staff_level_omr():
     from experiments.staff_level_omr.entrypoint import run
-    return run
+    from experiments.staff_level_omr.prepare_data import prepare_data
+
+    return {"train": run, "prepare-data": prepare_data}
 
 
 def _load_object_detection():
@@ -74,8 +77,11 @@ EXPERIMENTS: tuple[Experiment, ...] = (
     ),
     Experiment(
         "staff-level-omr", "experiments/staff_level_omr", _load_staff_level_omr,
-        (("staff-level-omr --ds_name <name> --model_name <musvit|musvit_light>",
-          "Train staff-level OMR (MuSViT backbone + BiLSTM/CTC; linear-probe or LoRA)."),),
+        (("staff-level-omr prepare-data --data_path <dir> --dataset_id <id>",
+          "Build a deterministic staff-level dataset bundle."),
+         ("staff-level-omr train --ds_name <name> --model_name <musvit|musvit_light>",
+          "Run the current staff-level trainer (explicit train form).")),
+        default_subcommand="train",
     ),
     Experiment(
         "object-detection", "experiments/object_detection", _load_object_detection,
@@ -94,6 +100,25 @@ EXPERIMENTS: tuple[Experiment, ...] = (
 )
 
 _REGISTRY = {exp.command: exp for exp in EXPERIMENTS}
+
+
+def _select_fire_target(
+    experiment: Experiment,
+    target: Any,
+    arguments: list[str],
+) -> tuple[Any, list[str]]:
+    """Apply an omitted-subcommand compatibility alias when configured."""
+    default = experiment.default_subcommand
+    if default is None:
+        return target, arguments
+    if not isinstance(target, dict) or default not in target:
+        raise RuntimeError(
+            f"experiment {experiment.command!r} declares missing default "
+            f"subcommand {default!r}"
+        )
+    if not arguments or arguments[0].startswith("-"):
+        return target[default], arguments
+    return target, arguments
 
 
 def list_experiments():
@@ -137,8 +162,12 @@ def main():
     from fire import Fire
 
     # Import ONLY the requested experiment, then let Fire parse the rest.
-    target = _REGISTRY[command].loader()
-    Fire(target, command=argv[1:], name=f"musvit {command}")
+    experiment = _REGISTRY[command]
+    target = experiment.loader()
+    target, fire_arguments = _select_fire_target(
+        experiment, target, argv[1:]
+    )
+    Fire(target, command=fire_arguments, name=f"musvit {command}")
 
 
 if __name__ == "__main__":
