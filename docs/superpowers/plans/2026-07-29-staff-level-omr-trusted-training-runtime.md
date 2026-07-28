@@ -301,10 +301,10 @@ def test_checkpoint_embeds_vocab_but_not_manifest(checkpoint):
     assert checkpoint["split_manifest_sha256"]
     assert "split_manifest" not in checkpoint
 
-def test_metrics_repair_accepts_only_uncommitted_valid_suffix(run):
+def test_metrics_repair_rejects_records_ahead_of_last_checkpoint(run):
     append_raw(run.metrics_path, valid_future_epoch_line)
-    repair_metrics_jsonl(run.metrics_path, committed_epoch=2)
-    assert read_epochs(run.metrics_path) == [1, 2]
+    with pytest.raises(ProtocolError, match="ahead"):
+        repair_metrics_jsonl(run.metrics_path, committed_epoch=2)
 ```
 
 - [ ] **Step 2: Run tests and confirm missing-module failures**
