@@ -158,6 +158,21 @@ def test_load_bundle_exposes_stable_vocabulary_mapping(tmp_path):
         vocabulary.decode([0])
 
 
+def test_load_bundle_accepts_run_local_bundle_filename(tmp_path):
+    data_path, bundle_path, report = _prepare(tmp_path)
+    (bundle_path / "bundle.json").replace(
+        bundle_path / "dataset_bundle.json"
+    )
+
+    loaded = load_dataset_bundle(
+        bundle_path,
+        data_path,
+        bundle_filename="dataset_bundle.json",
+    )
+
+    assert loaded.dataset_bundle_sha256 == report.bundle_sha256
+
+
 def test_prepare_data_rejects_invalid_regex_without_publishing(tmp_path):
     data_path = _make_dataset(tmp_path)
     missing_group_out = tmp_path / "missing-group"

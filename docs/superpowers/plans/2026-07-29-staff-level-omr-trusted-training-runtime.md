@@ -264,7 +264,7 @@ Run: `.venv\Scripts\python.exe -m pytest tests/test_staff_level_omr_data_pipelin
 
 - [ ] **Step 3: Implement epoch-index sampling and loaders**
 
-Sort each epoch by `(sample_order_digest, sample_id UTF-8 bytes)` and yield `(epoch, manifest_index)`. The dataset sets its Compose instance to the full sample-level 256-bit seed immediately before augmentation. Require `in_order` in `inspect.signature(DataLoader)`, use `shuffle=False`, `drop_last=False`, `persistent_workers=False`, a separately seeded loader generator, and `pin_memory=torch.cuda.is_available()`.
+Sort each epoch by `(sample_order_digest, sample_id UTF-8 bytes)` and yield `(epoch, manifest_index)`. The dataset sets its Compose instance to the full sample-level 256-bit seed immediately before augmentation. Require `in_order` in `inspect.signature(DataLoader)`, use `shuffle=False`, `drop_last=False`, `persistent_workers=False`, `pin_memory=False`, and a separately seeded loader generator. Pinning remains in the measured performance phase instead of being smuggled into the trusted baseline.
 
 - [ ] **Step 4: Implement finite CTC training and layered evaluation**
 

@@ -36,6 +36,7 @@ SPLIT_ALGORITHM = "sha256_group_largest_remainder_v1"
 IMAGE_SUFFIX = "_region.png"
 TARGET_SUFFIX = "_gt.txt"
 BUNDLE_FILE = "bundle.json"
+RUN_BUNDLE_FILE = "dataset_bundle.json"
 MANIFEST_FILE = "split_manifest.json"
 VOCABULARY_FILE = "vocabulary.json"
 IMAGE_INDEX_FILE = "image_verification_index.json"
@@ -675,6 +676,7 @@ def load_dataset_bundle(
     data_path: str | Path,
     *,
     verify_image_hashes: str = "always",
+    bundle_filename: str = BUNDLE_FILE,
 ) -> ValidatedDatasetBundle:
     """Load and cross-validate a complete dataset bundle and its source data."""
     if verify_image_hashes not in {"always", "cached"}:
@@ -693,7 +695,15 @@ def load_dataset_bundle(
     if not source_root.is_dir():
         raise ProtocolError(f"data_path must be a directory: {source_root}")
 
-    bundle = _require_object(read_json(bundle_root / BUNDLE_FILE), "bundle")
+    if bundle_filename not in {BUNDLE_FILE, RUN_BUNDLE_FILE}:
+        raise ProtocolError(
+            f"bundle_filename must be {BUNDLE_FILE!r} or "
+            f"{RUN_BUNDLE_FILE!r}"
+        )
+    bundle = _require_object(
+        read_json(bundle_root / bundle_filename),
+        "bundle",
+    )
     _require_exact_keys(
         bundle,
         {

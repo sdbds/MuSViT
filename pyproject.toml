@@ -57,6 +57,11 @@ packages = ["musvit", "experiments"]
 [tool.hatch.build.targets.sdist]
 include = ["musvit", "experiments", "README.md", "pyproject.toml"]
 
+[tool.pytest.ini_options]
+markers = [
+    "slow: deterministic multiprocessing contract tests",
+]
+
 [tool.uv]
 package = true
 
