@@ -723,12 +723,12 @@ persistent_workers = false
 worker。以上语义字段进入 `training_contract`，`num_workers` 本身只进入
 launch config，并由跨 worker 的逐字节输入测试证明它不是训练语义。
 
-显式 `in_order` 参数从 PyTorch 2.6 起可用；v2 不支持更早版本，也不以“旧版
-默认保序”作为隐式兼容路径。新运行 preflight 必须同时验证
-`torch >= 2.6` 且 `DataLoader` signature 含 `in_order`，否则在构建 loader 前
-失败。resume 的 PyTorch major.minor 硬约束继续阻止同一 run 跨实现版本恢复。
-依据是官方 PyTorch 2.6 `DataLoader` API：
+`DataLoader` signature 中显式存在 `in_order` 才是 v2 的能力门槛；缺失即在
+构建 loader 前失败，不以“旧版默认保序”作为隐式兼容路径。版本号只写入
+metadata，不作为替代能力检查或额外下限，因此带可靠 backport 的实现不会被
+误拒。官方 PyTorch 2.6 API 已包含该参数：
 <https://docs.pytorch.org/docs/2.6/data.html#torch.utils.data.DataLoader>。
+resume 的 PyTorch major.minor 硬约束继续阻止同一 run 跨实现版本恢复。
 
 ## 11. 输入和模型契约
 
@@ -831,6 +831,9 @@ size 都只含奇数。
 不能做数值或范围修正。还要用 tiny image 对每个 leaf 执行
 `force_apply=true` probe，任何 warning、隐式范围修正或非声明 kernel size
 都失败；blur leaf 的固定 seed matrix 必须覆盖声明中的每个 kernel size。
+probe 前先断言 leaf `p > 0`，因为 `force_apply=true` 对 `p=0` 不生效。
+GaussianBlur `(3,4)` 的构造后属性仍是 `(3,4)`，所以属性比较本身抓不到问题；
+实际 kernel-size probe 是拒绝这类声明的承重检查，不能省略。
 profile 名相同但声明内容不同必须产生不同 contract hash；库升级改变实际属性
 或行为时必须在训练前失败，不能悄悄改写 identity。
 
@@ -1130,9 +1133,10 @@ sample_order_key =
 
 增强不需要兼容 NumPy legacy `seed()` 的 32-bit 限制：
 Albumentations 2.0.8 的 `Compose.set_random_seed` 使用独立 generator，必须接受
-并保留 `seed256`。preflight 对完整 256-bit seed 做两次相同输入的逐字节等价
-probe；不支持时失败，不得退回 32-bit 截断。这样逐样本增强与排序都保留完整
-SHA-256 空间，不引入 5 万样本规模下可观的生日碰撞概率。
+并保留 `seed256`。preflight 先对完整 256-bit seed 做两次相同输入的逐字节
+等价 probe，再把同一 seed 的 bit 200 翻转并断言输出不同；只做第一项无法发现
+库内部截断。任一项不满足都失败，不得退回 32-bit 截断。这样逐样本增强与
+排序都保留完整 SHA-256 空间，不引入 5 万样本规模下可观的生日碰撞概率。
 
 train 保留样本按 `(sample_order_key bytes, UTF8(sample_id))` 升序构成该 epoch
 的完整 sampler；sampler item 固定为 `(epoch, manifest_sample_index)`，让
@@ -1468,8 +1472,8 @@ backbone，公开与真实 backbone 相同的最小 config 和输出接口。
 - training contract 的 Adam、增强和排除文件 hash/count 稳定。
 - 只修改 worker、output/data location 或同内容排除文件的 source path，不改变
   training contract hash，但改变 launch config hash。
-- PyTorch `<2.6` 或 `DataLoader` signature 缺少 `in_order` 时在 loader 构建前
-  失败，不走旧版隐式 fallback。
+- `DataLoader` signature 缺少 `in_order` 时在 loader 构建前失败；版本号高但
+  缺能力仍失败，版本号低但有经过测试的 backport 可以通过。
 
 ### 17.2 Manifest 和词表测试
 
@@ -1523,7 +1527,8 @@ backbone，公开与真实 backbone 相同的最小 config 和输出接口。
   batch 边界和增强 tensor。该测试进入完整 CI/发布验收，可从快速本地测试集
   排除。
 - 改变 epoch 或 sample id 会改变对应 sample seed；worker seed 不传给
-  Albumentations。增强 seed 使用完整 256-bit digest，不能截断为 `seed32`。
+  Albumentations。增强 seed 使用完整 256-bit digest，不能截断为 `seed32`；
+  相同 256-bit seed 输出逐字节相等，只翻转 bit 200 时输出必须不同。
 
 ### 17.5 模型契约测试
 
