@@ -194,14 +194,10 @@ class CheckpointStatic:
             raise ProtocolError(
                 "train_exclusions_count must be non-negative"
             )
-        if train_exclusions_count == 0:
-            if (
-                train_exclusions_relpath is not None
-                or train_exclusions_sha256 is not None
-            ):
-                raise ProtocolError(
-                    "zero exclusions require null exclusions path and hash"
-                )
+        if (
+            train_exclusions_relpath is None
+            and train_exclusions_sha256 is None
+        ):
             exclusion_path = None
             exclusion_hash = None
         else:
@@ -431,22 +427,22 @@ def validate_checkpoint_payload(checkpoint: object) -> dict[str, object]:
     count = checkpoint["train_exclusions_count"]
     if isinstance(count, bool) or not isinstance(count, int) or count < 0:
         raise ProtocolError("checkpoint train_exclusions_count is invalid")
-    if count == 0:
-        if (
-            checkpoint["train_exclusions_relpath"] is not None
-            or checkpoint["train_exclusions_sha256"] is not None
-        ):
-            raise ProtocolError("checkpoint exclusions metadata is inconsistent")
-    else:
+    exclusion_path = checkpoint["train_exclusions_relpath"]
+    exclusion_hash = checkpoint["train_exclusions_sha256"]
+    if exclusion_path is None and exclusion_hash is None:
+        pass
+    elif exclusion_path is not None and exclusion_hash is not None:
         _safe_relpath(
-            checkpoint["train_exclusions_relpath"],
+            exclusion_path,
             "train_exclusions_relpath",
             "train_exclusions.json",
         )
         _sha256(
-            checkpoint["train_exclusions_sha256"],
+            exclusion_hash,
             "train_exclusions_sha256",
         )
+    else:
+        raise ProtocolError("checkpoint exclusions metadata is inconsistent")
     if (
         checkpoint["seed_schedule_version"] != SEED_SCHEDULE_VERSION
         or checkpoint["init_seed"]
