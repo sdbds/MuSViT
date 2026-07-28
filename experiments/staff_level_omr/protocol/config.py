@@ -192,6 +192,7 @@ class StaffOMRConfig:
                 )
             if (
                 isinstance(shape_patches, (str, bytes))
+                or not isinstance(shape_patches, Sequence)
                 or len(shape_patches) != 2
             ):
                 raise ProtocolError(

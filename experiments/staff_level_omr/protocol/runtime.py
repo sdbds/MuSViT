@@ -36,6 +36,7 @@ from .checkpoint import (
     load_checkpoint,
     restore_checkpoint,
     save_checkpoint,
+    validate_resume_artifact_identity,
     validate_resume_checkpoint,
 )
 from .config import StaffOMRConfig
@@ -83,6 +84,18 @@ CORE_PACKAGES = (
     "numpy",
     "albumentations",
     "opencv",
+)
+RESUME_MUTABLE_LAUNCH_FIELDS = frozenset(
+    {
+        "data_path",
+        "dataset_bundle_path",
+        "device",
+        "max_epochs",
+        "num_workers",
+        "output_root",
+        "train_exclusions_path",
+        "verify_image_hashes",
+    }
 )
 
 
@@ -740,6 +753,128 @@ def _test_identity(
     }
 
 
+def _valid_distribution(value: object, expected_count: int) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "count",
+        "min",
+        "max",
+        "mean",
+    }:
+        return False
+    if value["count"] != expected_count:
+        return False
+    if expected_count == 0:
+        return all(value[field] is None for field in ("min", "max", "mean"))
+    minimum = value["min"]
+    maximum = value["max"]
+    mean = value["mean"]
+    return (
+        isinstance(minimum, int)
+        and not isinstance(minimum, bool)
+        and isinstance(maximum, int)
+        and not isinstance(maximum, bool)
+        and isinstance(mean, (int, float))
+        and not isinstance(mean, bool)
+        and math.isfinite(float(mean))
+        and 0 < minimum <= maximum
+    )
+
+
+def _valid_capacity_population(value: object, expected_count: int) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "samples",
+        "target_length",
+        "required_frames",
+    }:
+        return False
+    return (
+        value["samples"] == expected_count
+        and _valid_distribution(value["target_length"], expected_count)
+        and _valid_distribution(value["required_frames"], expected_count)
+    )
+
+
+def _valid_test_document(
+    value: object,
+    identity: dict[str, object],
+    *,
+    expected_best_epoch: int,
+    expected_sample_count: int,
+) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if set(value) != set(identity) | {"best_epoch", "metrics", "sample_count"}:
+        return False
+    if any(value.get(key) != expected for key, expected in identity.items()):
+        return False
+    best_epoch = value["best_epoch"]
+    sample_count = value["sample_count"]
+    if (
+        best_epoch != expected_best_epoch
+        or sample_count != expected_sample_count
+    ):
+        return False
+    metrics = value["metrics"]
+    expected_metric_fields = {
+        "test_CER_all",
+        "test_CER_feasible",
+        "test_feasible_samples",
+        "test_infeasible_samples",
+        "test_infeasible_ratio",
+        "test_capacity",
+    }
+    if not isinstance(metrics, dict) or set(metrics) != expected_metric_fields:
+        return False
+    feasible = metrics["test_feasible_samples"]
+    infeasible = metrics["test_infeasible_samples"]
+    if (
+        isinstance(feasible, bool)
+        or not isinstance(feasible, int)
+        or feasible < 0
+        or isinstance(infeasible, bool)
+        or not isinstance(infeasible, int)
+        or infeasible < 0
+        or feasible + infeasible != sample_count
+    ):
+        return False
+    cer_all = metrics["test_CER_all"]
+    cer_feasible = metrics["test_CER_feasible"]
+    ratio = metrics["test_infeasible_ratio"]
+    if (
+        isinstance(cer_all, bool)
+        or not isinstance(cer_all, (int, float))
+        or not math.isfinite(float(cer_all))
+        or float(cer_all) < 0
+        or isinstance(ratio, bool)
+        or not isinstance(ratio, (int, float))
+        or not math.isfinite(float(ratio))
+        or float(ratio) != infeasible / sample_count
+    ):
+        return False
+    if feasible == 0:
+        if cer_feasible is not None:
+            return False
+    elif (
+        isinstance(cer_feasible, bool)
+        or not isinstance(cer_feasible, (int, float))
+        or not math.isfinite(float(cer_feasible))
+        or float(cer_feasible) < 0
+    ):
+        return False
+    capacity = metrics["test_capacity"]
+    if not isinstance(capacity, dict) or set(capacity) != {
+        "all",
+        "feasible",
+        "infeasible",
+    }:
+        return False
+    return (
+        _valid_capacity_population(capacity["all"], sample_count)
+        and _valid_capacity_population(capacity["feasible"], feasible)
+        and _valid_capacity_population(capacity["infeasible"], infeasible)
+    )
+
+
 def _finalize(
     prepared: PreparedRuntime,
     state: TrainingState,
@@ -759,6 +894,13 @@ def _finalize(
         prepared.contracts.training_contract_sha256
     ):
         raise ProtocolError("best checkpoint training identity mismatch")
+    if (
+        best["best_epoch"] != state.best_epoch
+        or best["best_metric_value"] != state.best_metric_value
+    ):
+        raise ProtocolError(
+            "best checkpoint conflicts with terminal state"
+        )
     load_trainable_state_dict(
         prepared.model,
         best["trainable_state_dict"],
@@ -767,9 +909,17 @@ def _finalize(
     identity = _test_identity(prepared, best_sha)
     test_document: dict[str, object] | None = None
     if prepared.artifacts.test_path.exists():
-        candidate = read_json(prepared.artifacts.test_path)
-        if isinstance(candidate, dict) and all(
-            candidate.get(key) == value for key, value in identity.items()
+        try:
+            candidate = read_json(prepared.artifacts.test_path)
+        except ProtocolError:
+            candidate = None
+        if _valid_test_document(
+            candidate,
+            identity,
+            expected_best_epoch=best["best_epoch"],
+            expected_sample_count=len(
+                prepared.bundle.split_samples("test")
+            ),
         ):
             test_document = candidate
     if test_document is None:
@@ -1101,6 +1251,109 @@ def _repair_epoch_sidecars(
     )
 
 
+def _validate_resume_run_document(
+    artifacts: RunArtifacts,
+    run_document: dict[str, object],
+    last: dict[str, object],
+) -> None:
+    """Cross-check immutable run ownership before sidecar repair."""
+    if run_document.get("schema_version") != RUN_SCHEMA:
+        raise ProtocolError("run.json schema_version mismatch")
+    if run_document.get("protocol_version") != PROTOCOL_VERSION:
+        raise ProtocolError("run.json protocol_version mismatch")
+    if run_document.get("run_id") != last["run_id"]:
+        raise ProtocolError("run.json run_id conflicts with last checkpoint")
+    if run_document.get("run_name") != artifacts.run_dir.name:
+        raise ProtocolError("run.json run_name conflicts with its directory")
+
+    immutable_pairs = (
+        (
+            "training_contract",
+            last["training_contract"],
+        ),
+        (
+            "training_contract_sha256",
+            last["training_contract_sha256"],
+        ),
+        (
+            "initial_launch_config",
+            last["initial_launch_config"],
+        ),
+        (
+            "initial_launch_config_sha256",
+            last["initial_launch_config_sha256"],
+        ),
+        ("input_contract", last["input_contract"]),
+        (
+            "augmentation_contract_sha256",
+            last["augmentation_contract_sha256"],
+        ),
+        ("backbone_config", last["backbone_config"]),
+    )
+    for field, expected in immutable_pairs:
+        if run_document.get(field) != expected:
+            raise ProtocolError(
+                f"run.json {field} conflicts with last checkpoint"
+            )
+
+    identity_hashes = run_document.get("identity_hashes")
+    expected_identity = {
+        "split_manifest_sha256": last["split_manifest_sha256"],
+        "training_contract_sha256": last["training_contract_sha256"],
+        "vocabulary_sha256": last["vocabulary_sha256"],
+    }
+    if identity_hashes != expected_identity:
+        raise ProtocolError(
+            "run.json identity_hashes conflict with last checkpoint"
+        )
+    dataset = run_document.get("dataset")
+    if not isinstance(dataset, dict):
+        raise ProtocolError("run.json dataset must be an object")
+    expected_dataset_hashes = {
+        "dataset_bundle_sha256": last["dataset_bundle_sha256"],
+        "split_manifest_sha256": last["split_manifest_sha256"],
+        "vocabulary_sha256": last["vocabulary_sha256"],
+    }
+    for field, expected in expected_dataset_hashes.items():
+        if dataset.get(field) != expected:
+            raise ProtocolError(
+                f"run.json dataset.{field} conflicts with last checkpoint"
+            )
+
+    registry_evidence = last["base_model_registry_evidence"]
+    if (
+        not isinstance(registry_evidence, dict)
+        or run_document.get("base_model_registry_evidence")
+        != registry_evidence
+    ):
+        raise ProtocolError(
+            "run.json base_model_registry_evidence conflicts with "
+            "last checkpoint"
+        )
+    current_launch = run_document.get("current_launch_config")
+    current_launch_hash = run_document.get("current_launch_config_sha256")
+    if not isinstance(current_launch, dict):
+        raise ProtocolError("run.json current_launch_config must be an object")
+    if canonical_sha256(current_launch) != current_launch_hash:
+        raise ProtocolError("run.json current_launch_config SHA-256 mismatch")
+    initial_launch = last["initial_launch_config"]
+    if set(current_launch) != set(initial_launch):
+        raise ProtocolError("run.json current_launch_config fields mismatch")
+    for field in sorted(
+        set(initial_launch) - RESUME_MUTABLE_LAUNCH_FIELDS,
+        key=lambda value: value.encode("utf-8"),
+    ):
+        if current_launch[field] != initial_launch[field]:
+            raise ProtocolError(
+                f"run.json current_launch_config.{field} changed a "
+                "training-semantic field"
+            )
+    if not isinstance(run_document.get("launch_history"), list):
+        raise ProtocolError("run.json launch_history must be an array")
+    if not isinstance(run_document.get("resume_history"), list):
+        raise ProtocolError("run.json resume_history must be an array")
+
+
 def _resume_config(
     *,
     run_dir: Path,
@@ -1194,6 +1447,12 @@ def resume(
         )
         if last["run_id"] != artifacts.run_id:
             raise ProtocolError("last checkpoint belongs to another run")
+        run_document = artifacts.load_run()
+        _validate_resume_run_document(artifacts, run_document, last)
+        validate_resume_artifact_identity(
+            last,
+            run_dir=artifacts.run_dir,
+        )
         _repair_epoch_sidecars(artifacts, last)
         run_document = artifacts.load_run()
         config, previous_launch, old_max = _resume_config(

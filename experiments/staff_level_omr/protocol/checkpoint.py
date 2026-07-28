@@ -91,6 +91,19 @@ def _safe_relpath(value: object, field: str, expected: str) -> str:
     return str(value)
 
 
+def _plain_filename(value: object, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value in {".", ".."}
+        or "/" in value
+        or "\\" in value
+        or "\0" in value
+    ):
+        raise ProtocolError(f"{field} must be a safe plain filename")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class CheckpointStatic:
     training_contract: dict[str, object]
@@ -170,14 +183,10 @@ class CheckpointStatic:
             raise ProtocolError(
                 "base_model_revision must be an immutable commit SHA"
             )
-        if (
-            not isinstance(base_model_weights_filename, str)
-            or PurePosixPath(base_model_weights_filename).name
-            != base_model_weights_filename
-        ):
-            raise ProtocolError(
-                "base_model_weights_filename must be a plain filename"
-            )
+        weight_filename = _plain_filename(
+            base_model_weights_filename,
+            "base_model_weights_filename",
+        )
         weight_hash = _sha256(
             base_model_weights_sha256,
             "base_model_weights_sha256",
@@ -236,7 +245,7 @@ class CheckpointStatic:
             vocabulary_sha256=canonical_sha256(vocabulary),
             base_model_id=base_model_id,
             base_model_revision=base_model_revision,
-            base_model_weights_filename=base_model_weights_filename,
+            base_model_weights_filename=weight_filename,
             base_model_weights_sha256=weight_hash,
             base_model_registry_evidence=dict(
                 base_model_registry_evidence
@@ -392,6 +401,10 @@ def validate_checkpoint_payload(checkpoint: object) -> dict[str, object]:
         "initial_launch_config_sha256"
     ]:
         raise ProtocolError("checkpoint initial_launch_config SHA-256 mismatch")
+    if not isinstance(checkpoint["training_contract"], dict):
+        raise ProtocolError("checkpoint training_contract must be an object")
+    if not isinstance(checkpoint["initial_launch_config"], dict):
+        raise ProtocolError("checkpoint initial_launch_config must be an object")
     for field in (
         "training_contract_sha256",
         "initial_launch_config_sha256",
@@ -430,7 +443,10 @@ def validate_checkpoint_payload(checkpoint: object) -> dict[str, object]:
     exclusion_path = checkpoint["train_exclusions_relpath"]
     exclusion_hash = checkpoint["train_exclusions_sha256"]
     if exclusion_path is None and exclusion_hash is None:
-        pass
+        if count != 0:
+            raise ProtocolError(
+                "checkpoint train exclusions count requires an exclusion file"
+            )
     elif exclusion_path is not None and exclusion_hash is not None:
         _safe_relpath(
             exclusion_path,
@@ -443,22 +459,148 @@ def validate_checkpoint_payload(checkpoint: object) -> dict[str, object]:
         )
     else:
         raise ProtocolError("checkpoint exclusions metadata is inconsistent")
+    base_seed = checkpoint["base_seed"]
+    if (
+        isinstance(base_seed, bool)
+        or not isinstance(base_seed, int)
+        or base_seed < 0
+    ):
+        raise ProtocolError("checkpoint base_seed must be non-negative")
     if (
         checkpoint["seed_schedule_version"] != SEED_SCHEDULE_VERSION
         or checkpoint["init_seed"]
-        != initialization_seed(checkpoint["base_seed"])
+        != initialization_seed(base_seed)
     ):
         raise ProtocolError("checkpoint seed schedule metadata mismatch")
+    if (
+        not isinstance(checkpoint["base_model_id"], str)
+        or not checkpoint["base_model_id"]
+    ):
+        raise ProtocolError("checkpoint base_model_id must be non-empty")
+    if (
+        not isinstance(checkpoint["base_model_revision"], str)
+        or not _REVISION.fullmatch(checkpoint["base_model_revision"])
+    ):
+        raise ProtocolError(
+            "checkpoint base_model_revision must be an immutable commit SHA"
+        )
+    _plain_filename(
+        checkpoint["base_model_weights_filename"],
+        "checkpoint base_model_weights_filename",
+    )
+    for field in (
+        "base_model_registry_evidence",
+        "backbone_config",
+        "input_contract",
+    ):
+        if not isinstance(checkpoint[field], dict):
+            raise ProtocolError(f"checkpoint {field} must be an object")
+    package_versions = checkpoint["package_versions"]
+    if not isinstance(package_versions, dict) or any(
+        not isinstance(key, str)
+        or not key
+        or not isinstance(value, str)
+        or not value
+        for key, value in package_versions.items()
+    ):
+        raise ProtocolError(
+            "checkpoint package_versions must map non-empty strings "
+            "to non-empty strings"
+        )
     epoch = checkpoint["epoch"]
     if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch <= 0:
         raise ProtocolError("checkpoint epoch is invalid")
     if checkpoint["next_epoch"] != epoch + 1:
         raise ProtocolError("checkpoint next_epoch must equal epoch + 1")
+    global_step = checkpoint["global_step"]
     if (
-        not isinstance(checkpoint["epoch_record"], dict)
-        or checkpoint["epoch_record"].get("epoch") != epoch
+        isinstance(global_step, bool)
+        or not isinstance(global_step, int)
+        or global_step < 0
     ):
+        raise ProtocolError("checkpoint global_step must be non-negative")
+    early = checkpoint["early_stopping_state"]
+    expected_early_fields = {"bad_epochs", "evaluations", "patience"}
+    if not isinstance(early, dict) or set(early) != expected_early_fields:
+        raise ProtocolError(
+            "checkpoint early_stopping_state fields mismatch"
+        )
+    for field in ("bad_epochs", "evaluations"):
+        value = early[field]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ProtocolError(
+                f"checkpoint early_stopping_state.{field} must be "
+                "non-negative"
+            )
+    patience = early["patience"]
+    if (
+        isinstance(patience, bool)
+        or not isinstance(patience, int)
+        or patience <= 0
+    ):
+        raise ProtocolError(
+            "checkpoint early_stopping_state.patience must be positive"
+        )
+    if checkpoint["best_metric_name"] != "val_CER_all":
+        raise ProtocolError(
+            "checkpoint best_metric_name must be 'val_CER_all'"
+        )
+    best_value = checkpoint["best_metric_value"]
+    best_epoch = checkpoint["best_epoch"]
+    if (best_value is None) != (best_epoch is None):
+        raise ProtocolError(
+            "checkpoint best_metric_value and best_epoch must both be null "
+            "or both be present"
+        )
+    if best_value is not None and (
+        isinstance(best_value, bool)
+        or not isinstance(best_value, (int, float))
+        or not math.isfinite(float(best_value))
+    ):
+        raise ProtocolError(
+            "checkpoint best_metric_value must be finite or null"
+        )
+    if best_epoch is not None and (
+        isinstance(best_epoch, bool)
+        or not isinstance(best_epoch, int)
+        or best_epoch <= 0
+        or best_epoch > epoch
+    ):
+        raise ProtocolError(
+            "checkpoint best_epoch must be null or within committed epochs"
+        )
+    best_updated = checkpoint["best_updated"]
+    if not isinstance(best_updated, bool):
+        raise ProtocolError("checkpoint best_updated must be boolean")
+    if best_updated and best_epoch != epoch:
+        raise ProtocolError(
+            "checkpoint best_updated requires best_epoch to equal epoch"
+        )
+    if checkpoint["checkpoint_role"] == "best" and not best_updated:
+        raise ProtocolError(
+            "best checkpoint must represent its improving epoch"
+        )
+    stop_reason = checkpoint["stop_reason"]
+    if stop_reason not in {None, "max_epochs", "early_stopping"}:
+        raise ProtocolError("checkpoint stop_reason is invalid")
+    epoch_record = checkpoint["epoch_record"]
+    if not isinstance(epoch_record, dict) or epoch_record.get("epoch") != epoch:
         raise ProtocolError("checkpoint epoch_record is invalid")
+    expected_record_values = {
+        "global_step": global_step,
+        "best_checkpoint_updated": best_updated,
+        "best_metric_name": checkpoint["best_metric_name"],
+        "best_metric_value": best_value,
+        "best_epoch": best_epoch,
+        "early_stopping_bad_epochs": early["bad_epochs"],
+        "early_stopping_evaluations": early["evaluations"],
+        "stop_reason": stop_reason,
+    }
+    for field, expected in expected_record_values.items():
+        if epoch_record.get(field) != expected:
+            raise ProtocolError(
+                f"checkpoint epoch_record.{field} conflicts with metadata"
+            )
     names = checkpoint["trainable_parameter_names"]
     optimizer_names = checkpoint["optimizer_parameter_names"]
     if (
@@ -534,7 +676,13 @@ def load_checkpoint(
 
 
 def _run_document_hash(run_dir: Path, relpath: str, field: str) -> str:
-    path = (run_dir / relpath).resolve(strict=True)
+    candidate = run_dir / relpath
+    try:
+        path = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise ProtocolError(
+            f"run-local {field} is missing or unavailable: {candidate}"
+        ) from exc
     try:
         path.relative_to(run_dir)
     except ValueError as exc:
@@ -542,29 +690,15 @@ def _run_document_hash(run_dir: Path, relpath: str, field: str) -> str:
     return canonical_sha256(read_json(path))
 
 
-def validate_resume_checkpoint(
+def validate_resume_artifact_identity(
     checkpoint: dict[str, object],
     *,
     run_dir: str | Path,
-    expected_training_contract_sha256: str,
-    expected_optimizer_parameter_names: list[str],
-    expected_trainable_parameter_names: list[str],
 ) -> None:
+    """Validate immutable run-local inputs before repairing any sidecar."""
     validate_checkpoint_payload(checkpoint)
     if checkpoint["checkpoint_role"] != "last":
         raise ProtocolError("resume requires checkpoint role 'last'")
-    if checkpoint["training_contract_sha256"] != (
-        expected_training_contract_sha256
-    ):
-        raise ProtocolError("resume training contract identity mismatch")
-    if checkpoint["optimizer_parameter_names"] != (
-        expected_optimizer_parameter_names
-    ):
-        raise ProtocolError("resume optimizer_parameter_names mismatch")
-    if checkpoint["trainable_parameter_names"] != (
-        expected_trainable_parameter_names
-    ):
-        raise ProtocolError("resume trainable parameter names mismatch")
     root = Path(run_dir).resolve(strict=True)
     bundle_hash = _run_document_hash(
         root,
@@ -600,6 +734,29 @@ def validate_resume_checkpoint(
         )
         if exclusion_hash != checkpoint["train_exclusions_sha256"]:
             raise ProtocolError("run-local train exclusions hash mismatch")
+
+
+def validate_resume_checkpoint(
+    checkpoint: dict[str, object],
+    *,
+    run_dir: str | Path,
+    expected_training_contract_sha256: str,
+    expected_optimizer_parameter_names: list[str],
+    expected_trainable_parameter_names: list[str],
+) -> None:
+    validate_resume_artifact_identity(checkpoint, run_dir=run_dir)
+    if checkpoint["training_contract_sha256"] != (
+        expected_training_contract_sha256
+    ):
+        raise ProtocolError("resume training contract identity mismatch")
+    if checkpoint["optimizer_parameter_names"] != (
+        expected_optimizer_parameter_names
+    ):
+        raise ProtocolError("resume optimizer_parameter_names mismatch")
+    if checkpoint["trainable_parameter_names"] != (
+        expected_trainable_parameter_names
+    ):
+        raise ProtocolError("resume trainable parameter names mismatch")
 
 
 def restore_checkpoint(

@@ -16,6 +16,7 @@ from experiments.staff_level_omr.protocol.canonical import (
     write_canonical_json,
 )
 from experiments.staff_level_omr.protocol.errors import ProtocolError
+from experiments.staff_level_omr.protocol import artifacts as artifacts_module
 
 
 CONTRACT_HASH = "a" * 64
@@ -124,6 +125,50 @@ def test_run_name_collision_fails_instead_of_reusing_directory(tmp_path):
             now=NOW,
             run_uuid="1" * 32,
         )
+
+
+def test_opening_missing_run_directory_uses_protocol_error(tmp_path):
+    with pytest.raises(ProtocolError, match="run_dir.*does not exist"):
+        RunArtifacts.from_existing(tmp_path / "missing-run")
+
+
+def test_run_creation_records_failure_after_directory_ownership(
+    tmp_path,
+    monkeypatch,
+):
+    source = _source_bundle(tmp_path)
+    real_write = artifacts_module.write_canonical_json
+
+    def fail_manifest(path, document):
+        if Path(path).name == "split_manifest.json":
+            raise ProtocolError("simulated bundle copy failure")
+        return real_write(path, document)
+
+    monkeypatch.setattr(
+        artifacts_module,
+        "write_canonical_json",
+        fail_manifest,
+    )
+
+    with pytest.raises(ProtocolError, match="simulated"):
+        RunArtifacts.create(
+            output_root=tmp_path / "runs",
+            experiment_name="fixture",
+            training_contract_sha256=CONTRACT_HASH,
+            source_bundle_path=source,
+            run_document={
+                "status": "preflighting",
+                "resume_history": [],
+            },
+            now=NOW,
+            run_uuid="3" * 32,
+        )
+
+    run_dir = next((tmp_path / "runs" / "fixture").iterdir())
+    run = read_json(run_dir / "run.json")
+    assert run["status"] == "failed"
+    assert run["stage"] == "artifact_initialization"
+    assert run["failure"]["type"] == "ProtocolError"
 
 
 def test_metrics_append_is_canonical_and_repair_adds_committed_record(tmp_path):

@@ -169,6 +169,14 @@ class RunArtifacts:
         run_name = (
             f"{timestamp}-{training_contract_sha256[:12]}-{run_id}"
         )
+        document = dict(run_document)
+        if "run_id" in document or "run_name" in document:
+            raise ProtocolError(
+                "run_document cannot predefine run_id or run_name"
+            )
+        document["run_id"] = run_id
+        document["run_name"] = run_name
+        canonical_json_bytes(document)
         experiment_dir = Path(output_root).resolve(strict=False) / experiment_name
         run_dir = experiment_dir / run_name
         try:
@@ -194,24 +202,44 @@ class RunArtifacts:
             IMAGE_INDEX_FILE: IMAGE_INDEX_FILE,
         }
         try:
-            for source_name, destination_name in copies.items():
-                document = read_json(source / source_name)
-                write_canonical_json(run_dir / destination_name, document)
-            document = dict(run_document)
-            if "run_id" in document or "run_name" in document:
-                raise ProtocolError(
-                    "run_document cannot predefine run_id or run_name"
-                )
-            document["run_id"] = run_id
-            document["run_name"] = run_name
+            # Publish the ownership/status record first so later initialization
+            # failures remain auditable inside the run directory.
             write_canonical_json(artifacts.run_json, document)
-        except Exception:
+            for source_name, destination_name in copies.items():
+                source_document = read_json(source / source_name)
+                write_canonical_json(
+                    run_dir / destination_name,
+                    source_document,
+                )
+        except Exception as exc:
+            failed = dict(document)
+            failed.update(
+                {
+                    "status": "failed",
+                    "stage": "artifact_initialization",
+                    "failure": {
+                        "stage": "artifact_initialization",
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                    },
+                }
+            )
+            try:
+                write_canonical_json(artifacts.run_json, failed)
+            except Exception:
+                pass
             raise
         return artifacts
 
     @classmethod
     def from_existing(cls, run_dir: str | Path) -> "RunArtifacts":
-        resolved = Path(run_dir).resolve(strict=True)
+        source = Path(run_dir)
+        try:
+            resolved = source.resolve(strict=True)
+        except OSError as exc:
+            raise ProtocolError(
+                f"run_dir does not exist or is unavailable: {source}"
+            ) from exc
         if not resolved.is_dir():
             raise ProtocolError(f"run_dir must be a directory: {resolved}")
         document = read_json(resolved / RUN_FILE)

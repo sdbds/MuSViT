@@ -18,6 +18,7 @@ from experiments.staff_level_omr.protocol.checkpoint import (
     load_checkpoint,
     restore_checkpoint,
     save_checkpoint,
+    validate_checkpoint_payload,
     validate_resume_checkpoint,
 )
 from experiments.staff_level_omr.protocol.errors import ProtocolError
@@ -102,6 +103,25 @@ def _checkpoint(
 ):
     model = TinyTrainableModel()
     optimizer, names = build_optimizer(model, 3e-4)
+    best_epoch = 2 if role == "best" else 1
+    best_updated = role == "best"
+    early_stopping_state = {
+        "bad_epochs": 1,
+        "evaluations": 2,
+        "patience": 3,
+    }
+    epoch_record = {
+        "epoch": 2,
+        "global_step": 6,
+        "train_loss": 0.5,
+        "best_checkpoint_updated": best_updated,
+        "best_metric_name": "val_CER_all",
+        "best_metric_value": 0.25,
+        "best_epoch": best_epoch,
+        "early_stopping_bad_epochs": 1,
+        "early_stopping_evaluations": 2,
+        "stop_reason": "max_epochs",
+    }
     payload = build_checkpoint(
         static=static or _static(),
         run_id="1" * 12,
@@ -111,13 +131,13 @@ def _checkpoint(
         optimizer_parameter_names=names,
         epoch=2,
         global_step=6,
-        early_stopping_state={"bad_epochs": 1},
+        early_stopping_state=early_stopping_state,
         best_metric_name="val_CER_all",
         best_metric_value=0.25,
-        best_epoch=1,
-        best_updated=False,
+        best_epoch=best_epoch,
+        best_updated=best_updated,
         stop_reason="max_epochs",
-        epoch_record={"epoch": 2, "train_loss": 0.5},
+        epoch_record=epoch_record,
     )
     return model, optimizer, names, payload
 
@@ -204,6 +224,49 @@ def test_loader_rejects_legacy_state_dict_and_best_for_resume(tmp_path):
         load_checkpoint(path, expected_role="last")
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("global_step", -1, "global_step"),
+        ("stop_reason", "unknown", "stop_reason"),
+        ("package_versions", [], "package_versions"),
+        ("base_model_revision", "main", "base_model_revision"),
+        ("base_model_weights_filename", "", "weights_filename"),
+    ],
+)
+def test_checkpoint_loader_rejects_invalid_dynamic_metadata(
+    field,
+    value,
+    match,
+):
+    _, _, _, checkpoint = _checkpoint()
+    checkpoint[field] = value
+
+    with pytest.raises(ProtocolError, match=match):
+        validate_checkpoint_payload(checkpoint)
+
+
+def test_checkpoint_loader_rejects_incoherent_best_and_early_stop_state():
+    _, _, _, checkpoint = _checkpoint()
+    checkpoint["early_stopping_state"] = {
+        "bad_epochs": -1,
+        "evaluations": 1,
+        "patience": 3,
+    }
+    with pytest.raises(ProtocolError, match="bad_epochs"):
+        validate_checkpoint_payload(checkpoint)
+
+    _, _, _, checkpoint = _checkpoint()
+    checkpoint["best_epoch"] = None
+    with pytest.raises(ProtocolError, match="best_metric|best_epoch"):
+        validate_checkpoint_payload(checkpoint)
+
+    _, _, _, checkpoint = _checkpoint()
+    checkpoint["best_updated"] = True
+    with pytest.raises(ProtocolError, match="best_updated"):
+        validate_checkpoint_payload(checkpoint)
+
+
 def test_static_metadata_rejects_hash_and_exclusion_inconsistency():
     values = _static().__dict__ if hasattr(_static(), "__dict__") else None
     assert values is None
@@ -229,6 +292,12 @@ def test_static_metadata_rejects_hash_and_exclusion_inconsistency():
             base_seed=7,
             package_versions={"python": "3.11.11"},
         )
+
+
+@pytest.mark.parametrize("filename", ["", ".", "..", "dir/model.safetensors"])
+def test_static_metadata_requires_a_safe_plain_weight_filename(filename):
+    with pytest.raises(ProtocolError, match="weights_filename"):
+        _static(base_model_weights_filename=filename)
 
 
 def test_optimizer_name_mismatch_is_rejected_before_optimizer_load(monkeypatch):
@@ -305,6 +374,36 @@ def test_resume_validation_checks_run_local_document_hashes(tmp_path):
 
     write_canonical_json(run / "split_manifest.json", {"identity": "changed"})
     with pytest.raises(ProtocolError, match="manifest"):
+        validate_resume_checkpoint(
+            checkpoint,
+            run_dir=run,
+            expected_training_contract_sha256=(
+                checkpoint["training_contract_sha256"]
+            ),
+            expected_optimizer_parameter_names=names,
+            expected_trainable_parameter_names=(
+                checkpoint["trainable_parameter_names"]
+            ),
+        )
+
+
+def test_resume_validation_wraps_missing_run_document_as_protocol_error(
+    tmp_path,
+):
+    bundle_hash = canonical_sha256({"identity": "bundle"})
+    manifest_hash = canonical_sha256({"identity": "manifest"})
+    vocabulary = _vocabulary_document()
+    vocabulary["source_manifest_sha256"] = manifest_hash
+    static = _static(
+        dataset_bundle_sha256=bundle_hash,
+        split_manifest_sha256=manifest_hash,
+        vocabulary=vocabulary,
+    )
+    _, _, names, checkpoint = _checkpoint(static=static)
+    run = _run_files(tmp_path, static)
+    (run / "split_manifest.json").unlink()
+
+    with pytest.raises(ProtocolError, match="split manifest.*missing|missing.*split"):
         validate_resume_checkpoint(
             checkpoint,
             run_dir=run,

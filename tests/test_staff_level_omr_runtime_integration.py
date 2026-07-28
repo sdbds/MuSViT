@@ -17,7 +17,11 @@ from experiments.staff_level_omr.protocol.backbone import (
     BlobEvidence,
     WeightEvidence,
 )
-from experiments.staff_level_omr.protocol.checkpoint import load_checkpoint
+from experiments.staff_level_omr.protocol import runtime as runtime_module
+from experiments.staff_level_omr.protocol.checkpoint import (
+    load_checkpoint,
+    save_checkpoint,
+)
 from experiments.staff_level_omr.protocol.config import StaffOMRConfig
 from experiments.staff_level_omr.protocol.ctc import CTCInfeasibleError
 from experiments.staff_level_omr.protocol.data_bundle import (
@@ -28,7 +32,11 @@ from experiments.staff_level_omr.protocol.runtime import (
     resume,
     train,
 )
-from experiments.staff_level_omr.protocol.canonical import read_json
+from experiments.staff_level_omr.protocol.canonical import (
+    canonical_sha256,
+    read_json,
+    write_canonical_json,
+)
 
 
 REVISION = "a" * 40
@@ -356,16 +364,182 @@ def test_resume_repairs_best_metrics_and_terminal_finalization(tmp_path):
     (run_dir / "summary.json").unlink()
     run = read_json(run_dir / "run.json")
     run["status"] = "failed"
-    from experiments.staff_level_omr.protocol.canonical import (
-        write_canonical_json,
-    )
-
     write_canonical_json(run_dir / "run.json", run)
 
     resume(run_dir, dependencies=_dependencies(run_uuid="8" * 32))
 
     _assert_complete_run(run_dir, 1)
     assert len((run_dir / "metrics.jsonl").read_text().splitlines()) == 1
+
+
+def test_finalization_rejects_best_checkpoint_conflicting_with_terminal_state(
+    tmp_path,
+    monkeypatch,
+):
+    real_run_epochs = runtime_module._run_epochs
+
+    def run_then_corrupt_best(prepared, state, dependencies):
+        terminal = real_run_epochs(prepared, state, dependencies)
+        best = load_checkpoint(prepared.artifacts.best_checkpoint)
+        best["best_metric_value"] += 1.0
+        best["epoch_record"]["best_metric_value"] = best[
+            "best_metric_value"
+        ]
+        save_checkpoint(prepared.artifacts.best_checkpoint, best)
+        return terminal
+
+    monkeypatch.setattr(
+        runtime_module,
+        "_run_epochs",
+        run_then_corrupt_best,
+    )
+
+    with pytest.raises(Exception, match="best checkpoint.*terminal state"):
+        train(
+            _config(tmp_path, max_epochs=1),
+            dependencies=_dependencies(),
+        )
+
+    run_dir = next((tmp_path / "runs" / "fixture").iterdir())
+    run = read_json(run_dir / "run.json")
+    assert run["status"] == "failed"
+    assert run["failure"]["stage"] == "finalization"
+
+
+def test_finalization_recomputes_invalid_matching_test_sidecar(tmp_path):
+    run_dir = train(
+        _config(tmp_path, max_epochs=1),
+        dependencies=_dependencies(),
+    )
+    test_document = read_json(run_dir / "test.json")
+    test_document["metrics"] = {"fake": 1}
+    write_canonical_json(run_dir / "test.json", test_document)
+    (run_dir / "summary.json").unlink()
+
+    resume(run_dir, dependencies=_dependencies(run_uuid="5" * 32))
+
+    repaired = read_json(run_dir / "test.json")
+    assert "fake" not in repaired["metrics"]
+    assert repaired["metrics"]["test_CER_all"] is not None
+    assert repaired["metrics"]["test_capacity"]["all"]["samples"] == (
+        repaired["sample_count"]
+    )
+
+
+def test_finalization_recomputes_test_sidecar_with_wrong_terminal_metadata(
+    tmp_path,
+):
+    run_dir = train(
+        _config(tmp_path, max_epochs=1),
+        dependencies=_dependencies(),
+    )
+    test_document = read_json(run_dir / "test.json")
+    test_document["best_epoch"] += 100
+    test_document["sample_count"] = 2
+    metrics = test_document["metrics"]
+    metrics["test_feasible_samples"] = 2
+    for population in ("all", "feasible"):
+        capacity = metrics["test_capacity"][population]
+        capacity["samples"] = 2
+        capacity["target_length"]["count"] = 2
+        capacity["required_frames"]["count"] = 2
+    write_canonical_json(run_dir / "test.json", test_document)
+    (run_dir / "summary.json").unlink()
+
+    resume(run_dir, dependencies=_dependencies(run_uuid="4" * 32))
+
+    repaired = read_json(run_dir / "test.json")
+    best = load_checkpoint(run_dir / "checkpoints" / "best.pt")
+    assert repaired["best_epoch"] == best["best_epoch"]
+    assert repaired["sample_count"] == 1
+
+
+def test_finalization_recomputes_malformed_test_sidecar(tmp_path):
+    run_dir = train(
+        _config(tmp_path, max_epochs=1),
+        dependencies=_dependencies(),
+    )
+    (run_dir / "test.json").write_bytes(b'{"schema_version":')
+    (run_dir / "summary.json").unlink()
+
+    resume(run_dir, dependencies=_dependencies(run_uuid="3" * 32))
+
+    repaired = read_json(run_dir / "test.json")
+    assert repaired["schema_version"] == "staff_omr_test_v2"
+    assert repaired["sample_count"] == 1
+
+
+def test_resume_rejects_corrupt_run_identity_before_backbone_inspection(
+    tmp_path,
+):
+    run_dir = train(
+        _config(tmp_path, max_epochs=1),
+        dependencies=_dependencies(),
+    )
+    run = read_json(run_dir / "run.json")
+    run["protocol_version"] = "staff_omr_v3"
+    write_canonical_json(run_dir / "run.json", run)
+    provider = DummyBackboneProvider()
+
+    with pytest.raises(Exception, match="run.json protocol_version"):
+        resume(
+            run_dir,
+            max_epochs=2,
+            dependencies=_dependencies(provider),
+        )
+
+    assert provider.inspect_calls == 0
+    assert provider.load_calls == 0
+
+
+def test_resume_rejects_semantic_current_launch_drift_before_inspection(
+    tmp_path,
+):
+    run_dir = train(
+        _config(tmp_path, max_epochs=1),
+        dependencies=_dependencies(),
+    )
+    run = read_json(run_dir / "run.json")
+    run["current_launch_config"]["method"] = "lora"
+    run["current_launch_config_sha256"] = canonical_sha256(
+        run["current_launch_config"]
+    )
+    write_canonical_json(run_dir / "run.json", run)
+    provider = DummyBackboneProvider()
+
+    with pytest.raises(Exception, match="current_launch_config.method"):
+        resume(
+            run_dir,
+            max_epochs=2,
+            dependencies=_dependencies(provider),
+        )
+
+    assert provider.inspect_calls == 0
+    assert provider.load_calls == 0
+
+
+def test_resume_validates_run_bundle_before_repairing_sidecars(tmp_path):
+    run_dir = train(
+        _config(tmp_path, max_epochs=1),
+        dependencies=_dependencies(),
+    )
+    manifest = read_json(run_dir / "split_manifest.json")
+    manifest["dataset_id"] = "corrupt"
+    write_canonical_json(run_dir / "split_manifest.json", manifest)
+    partial_metrics = b'{"epoch":1'
+    (run_dir / "metrics.jsonl").write_bytes(partial_metrics)
+    provider = DummyBackboneProvider()
+
+    with pytest.raises(Exception, match="manifest.*(SHA|hash)"):
+        resume(
+            run_dir,
+            max_epochs=2,
+            dependencies=_dependencies(provider),
+        )
+
+    assert (run_dir / "metrics.jsonl").read_bytes() == partial_metrics
+    assert provider.inspect_calls == 0
+    assert provider.load_calls == 0
 
 
 def test_resume_rejects_core_major_minor_drift_before_state_restore(tmp_path):

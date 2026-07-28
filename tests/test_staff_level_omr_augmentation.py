@@ -1,6 +1,10 @@
 import hashlib
+import os
 import random
+import subprocess
+import sys
 import warnings
+from pathlib import Path
 
 import albumentations as A
 import numpy as np
@@ -26,6 +30,32 @@ from experiments.staff_level_omr.protocol.seeding import (
     seed_digest,
     worker_base_seed,
 )
+
+
+def test_package_disables_albumentations_network_update_check():
+    environment = os.environ.copy()
+    environment.pop("NO_ALBUMENTATIONS_UPDATE", None)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os; import experiments.staff_level_omr; "
+                "print(os.environ.get('NO_ALBUMENTATIONS_UPDATE'))"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+        timeout=30,
+        env=environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "1"
 
 
 def _manual_digest(label: str, *parts: object) -> bytes:
