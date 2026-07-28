@@ -17,12 +17,16 @@ from experiments.full_page_omr.config.ExperimentConfigWrapper import PDMXData
 from experiments.full_page_omr.pdmx_data import (
     PDMXConsumptionAuditCallback,
     PDMXPretrainingDataModule,
+    _PDMXSampleDecoder,
+    _webdataset_samples,
     deterministic_teacher_forcing,
 )
 from experiments.full_page_omr.pdmx_manifest import (
     PDMX_DATASET_ID,
     PDMX_DATASET_REVISION,
     build_pdmx_dataset_manifest,
+    load_pdmx_dataset_manifest,
+    resolve_local_snapshot,
     write_pdmx_dataset_manifest,
 )
 from experiments.full_page_omr.utils.vocab_manifest import (
@@ -30,6 +34,7 @@ from experiments.full_page_omr.utils.vocab_manifest import (
     build_project_seed_tokens,
     extend_ordered_tokens,
     ordered_token_sha256,
+    load_vocabulary_manifest,
     write_vocabulary_manifest,
 )
 
@@ -249,6 +254,31 @@ def test_data_module_explicitly_has_no_test_split(pdmx_fixture):
     assert data.stream_resume_mode == "virtual_epoch_boundary"
 
 
+def test_protocol_metadata_captures_dataset_vocab_and_runtime_identity(
+    pdmx_fixture,
+):
+    data = _build_data(pdmx_fixture)
+
+    metadata = data.protocol_metadata()
+
+    assert metadata["dataset_revision"] == PDMX_DATASET_REVISION
+    assert metadata["dataset_manifest_sha256"]
+    assert metadata["vocab_sha256"]
+    assert metadata["vocab_base_digest"]
+    assert metadata["renderer_shard_counts"] == {
+        "mscore": 2,
+        "verovio": 2,
+    }
+    assert metadata["renderer_sample_counts"] == {
+        "mscore": 2,
+        "verovio": 2,
+    }
+    assert metadata["validation_sample_count"] == 2
+    assert metadata["train_validation_source_overlap"] == 0
+    assert metadata["software_versions"]["webdataset"]
+    assert metadata["software_versions"]["torch"]
+
+
 def test_teacher_forcing_is_sample_scoped_and_does_not_touch_global_rng():
     target = torch.tensor([100, 1, 2, 3, 4, 5, 183])
     before = torch.random.get_rng_state().clone()
@@ -272,6 +302,85 @@ def test_teacher_forcing_is_sample_scoped_and_does_not_touch_global_rng():
     assert first[0] == target[0]
     assert not torch.equal(first[1:], target[1:])
     assert torch.equal(torch.random.get_rng_state(), before)
+
+
+def test_tiny_snapshot_scans_builds_vocab_and_yields_both_splits(
+    pdmx_fixture,
+):
+    data = _build_data(pdmx_fixture, steps_per_epoch=32)
+
+    train_rows = list(data.train_dataloader())
+    validation_rows = list(data.val_dataloader())
+
+    assert len(train_rows) == 32
+    assert {row[3]["renderer"] for row in train_rows} == {
+        "verovio",
+        "mscore",
+    }
+    assert len(validation_rows) == 2
+    assert data.has_test_split is False
+
+
+@pytest.mark.pdmx_official
+def test_fixed_revision_official_snapshot_smoke(monkeypatch):
+    package_root = REPO_ROOT / "experiments" / "full_page_omr"
+    dataset_manifest_path = (
+        package_root
+        / "config"
+        / "Page_OMR_PDMX"
+        / "dataset-manifest.v1.json"
+    )
+    vocab_manifest_path = (
+        package_root / "vocab" / "FullPageOMR_BeKern_v1.json"
+    )
+    try:
+        snapshot_root = resolve_local_snapshot()
+    except FileNotFoundError:
+        pytest.skip(
+            "fixed PDMX revision is absent; run `python -m "
+            "experiments.full_page_omr.pdmx_manifest prepare`"
+        )
+    if not dataset_manifest_path.is_file() or not vocab_manifest_path.is_file():
+        pytest.skip(
+            "PDMX artifacts are absent; run the scan and build-vocabulary "
+            "commands documented in README.md"
+        )
+
+    monkeypatch.setattr(_globals, "resolution", 1024)
+    manifest = load_pdmx_dataset_manifest(dataset_manifest_path)
+    vocabulary = load_vocabulary_manifest(vocab_manifest_path)
+    decoder = _PDMXSampleDecoder(
+        vocabulary,
+        teacher_forcing_probability=0.0,
+    )
+    selected = [
+        next(
+            shard
+            for shard in manifest["train_shards"]
+            if shard["renderer"] == renderer
+        )
+        for renderer in ("verovio", "mscore")
+    ]
+    selected.append(manifest["validation_shards"][0])
+
+    for ordinal, shard in enumerate(selected):
+        path = snapshot_root / Path(
+            *Path(shard["logical_path"]).parts
+        )
+        assert path.is_file()
+        assert path.stat().st_size == shard["bytes"]
+        sample = next(_webdataset_samples(path))
+        decoded = decoder.decode(
+            sample,
+            shard=shard,
+            virtual_epoch=0,
+            global_ordinal=ordinal,
+            source_cycle=0,
+            occurrence_index=0,
+        )
+        assert decoded[0].shape == (1, 3, 1024, 1024)
+        assert decoded[1].shape == decoded[2].shape
+        assert decoded[3]["sample_key"]
 
 
 def test_consumption_audit_records_both_renderers_and_first_images(tmp_path):

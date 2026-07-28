@@ -306,8 +306,15 @@ def _validate_run_contract(*, config, from_checkpoint, starting_weights,
                            source_checkpoint_sha256: str | None = None,
                            expected_protocol_snapshot: dict | None = None,
                            expected_model=None,
-                           optimizer_config: AdamWWSDConfig | None = None):
+                           optimizer_config: AdamWWSDConfig | None = None,
+                           vocabulary_migration: bool = False):
     protocol_version = _validate_protocol_version(protocol_version)
+    if not isinstance(vocabulary_migration, bool):
+        raise TypeError("vocabulary_migration must be a boolean")
+    if vocabulary_migration and starting_weights is None:
+        raise ValueError(
+            "vocabulary_migration is valid only with starting_weights"
+        )
     if from_checkpoint is not None:
         if source_curriculum_step is not None or source_checkpoint_sha256 is not None:
             raise ValueError(
@@ -390,7 +397,15 @@ def _validate_run_contract(*, config, from_checkpoint, starting_weights,
             raise ValueError(
                 "a weights-only experiment fork must use its own protocol_version"
             )
-        if config.data.skip_steps != source_curriculum_step:
+        if vocabulary_migration and config.data.skip_steps != 0:
+            raise ValueError(
+                "vocabulary migration starts a new run and requires "
+                "config data.skip_steps=0"
+            )
+        if (
+            not vocabulary_migration
+            and config.data.skip_steps != source_curriculum_step
+        ):
             raise ValueError(
                 "config data.skip_steps must equal source_curriculum_step: "
                 f"{config.data.skip_steps} != {source_curriculum_step}"
@@ -1100,6 +1115,7 @@ def main(config: ExperimentConfig, experiment_name,
         expected_protocol_snapshot=protocol_snapshot,
         expected_model=model,
         optimizer_config=optimizer_config,
+        vocabulary_migration=source_vocab_manifest is not None,
     )
     if (
         checkpoint_state is not None

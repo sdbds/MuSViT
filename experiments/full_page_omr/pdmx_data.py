@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from io import BytesIO
 import hashlib
+from importlib.metadata import PackageNotFoundError, version
 import json
 import math
 from pathlib import Path, PurePosixPath
@@ -37,6 +38,13 @@ from .utils.vocab_manifest import (
 def _stable_seed(*parts: object) -> int:
     payload = "\x1f".join(str(part) for part in parts).encode("utf-8")
     return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+
+
+def _package_version(distribution: str) -> str:
+    try:
+        return version(distribution)
+    except PackageNotFoundError:
+        return "unavailable"
 
 
 def deterministic_teacher_forcing(
@@ -612,14 +620,53 @@ class PDMXPretrainingDataModule(LightningDataModule):
         self.train_dataset.set_virtual_epoch(epoch)
 
     def protocol_metadata(self) -> dict[str, Any]:
+        renderer_shard_counts = Counter(
+            shard["renderer"]
+            for shard in self.dataset_manifest["train_shards"]
+        )
+        renderer_sample_counts = Counter()
+        for shard in self.dataset_manifest["train_shards"]:
+            renderer_sample_counts[shard["renderer"]] += shard["sample_count"]
         return {
             "dataset_id": PDMX_DATASET_ID,
             "dataset_revision": PDMX_DATASET_REVISION,
+            "dataset_license": self.dataset_manifest["license"],
             "dataset_manifest_sha256": self.dataset_manifest["manifest_sha256"],
+            "selected_renderers": list(
+                self.dataset_manifest["selected_renderers"]
+            ),
+            "renderer_shard_counts": dict(
+                sorted(renderer_shard_counts.items())
+            ),
+            "renderer_sample_counts": dict(
+                sorted(renderer_sample_counts.items())
+            ),
+            "train_sample_count": self.dataset_manifest["train_sample_count"],
+            "validation_sample_count": self.dataset_manifest[
+                "validation_sample_count"
+            ],
+            "train_sequence_lengths": dict(
+                self.dataset_manifest["train_sequence_lengths"]
+            ),
+            "validation_sequence_lengths": dict(
+                self.dataset_manifest["validation_sequence_lengths"]
+            ),
+            "excluded_samples": list(
+                self.dataset_manifest["excluded_samples"]
+            ),
+            "train_validation_source_overlap": self.dataset_manifest[
+                "train_validation_source_overlap"
+            ],
+            "max_sequence_length": self.dataset_manifest[
+                "max_sequence_length"
+            ],
             "vocab_name": self.vocabulary.name,
             "vocab_size": len(self.vocabulary.ordered_tokens),
             "vocab_sha256": self.vocabulary.vocab_sha256,
             "vocab_schema_version": self.vocabulary.schema_version,
+            "vocab_base_name": self.vocabulary.base_name,
+            "vocab_base_size": self.vocabulary.base_size,
+            "vocab_base_digest": self.vocabulary.base_digest,
             "renderer_weights": dict(self.config.renderer_weights),
             "steps_per_epoch": self.steps_per_epoch,
             "shuffle_buffer": self.shuffle_buffer,
@@ -631,6 +678,16 @@ class PDMXPretrainingDataModule(LightningDataModule):
                 "batch_size": self.batch_size,
             },
             "runtime_augmentation": False,
+            "software_versions": {
+                distribution: _package_version(distribution)
+                for distribution in (
+                    "webdataset",
+                    "torch",
+                    "lightning",
+                    "datasets",
+                    "huggingface-hub",
+                )
+            },
         }
 
     def _loader(self, dataset, *, num_workers: int) -> DataLoader:

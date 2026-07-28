@@ -1022,6 +1022,25 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
 
         self.assertIsNone(state.protocol_snapshot)
 
+    def test_vocabulary_migration_starts_target_curriculum_at_zero(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint = Path(tmpdir) / "legacy-weights.ckpt"
+            torch.save({"global_step": 40}, checkpoint)
+
+            state = finetune._validate_run_contract(
+                config=SimpleNamespace(data=SimpleNamespace(skip_steps=0)),
+                from_checkpoint=None,
+                starting_weights=str(checkpoint),
+                max_steps=4_000_000,
+                train=True,
+                protocol_version="vocabulary_migration_v1",
+                source_curriculum_step=40,
+                source_checkpoint_sha256=_sha256_file(checkpoint),
+                vocabulary_migration=True,
+            )
+
+        self.assertEqual(state.curriculum_step, 40)
+
     def test_full_resume_rejects_curriculum_offset_mismatch(self):
         model = _TinyModel()
         snapshot = _protocol_snapshot(model, curriculum__step_offset=10)

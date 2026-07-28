@@ -61,6 +61,11 @@ include = ["musvit", "experiments", "README.md", "pyproject.toml"]
 [tool.uv]
 package = true
 
+[tool.pytest.ini_options]
+markers = [
+    "pdmx_official: opt-in smoke tests against the pinned local PDMX snapshot",
+]
+
 [[tool.uv.index]]
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
