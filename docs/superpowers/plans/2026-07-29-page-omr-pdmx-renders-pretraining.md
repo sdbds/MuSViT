@@ -13,6 +13,8 @@
 - Dataset id is `tobiashornbogen/page-omr-pdmx-renders`.
 - Dataset revision is exactly `7da3ae5237963e57a8fe1c6ee375b1f10af34a09`.
 - Training is local-only and must never download missing shards implicitly.
+- Config artifact paths are resolved against `experiments/full_page_omr`, never against the caller's current
+  directory; this matches the public entrypoint's package-directory execution contract.
 - Batch size is exactly 1, input resolution is 1024, model maxlen is 7512, and tokenization is `bekern`.
 - Existing Arrow configs without `data.type` remain valid and keep their current loader behavior.
 - Existing Polish, Mozarteum, FP GrandStaff vocabulary files and checkpoints are not rewritten.
@@ -188,7 +190,9 @@ git commit -m "feat: add deterministic OMR vocabulary manifests"
 
 **Interfaces:**
 - Consumes: `parse_kern_file()` and Task 1 digest/extension functions.
-- Produces: `PDMXSampleRecord`, `ShardScanResult`, `scan_pdmx_tar()`, `build_pdmx_dataset_manifest()`, `verify_pdmx_dataset_manifest()`, and CLI commands `prepare` and `scan`.
+- Produces: `PDMXSampleRecord`, `ShardScanResult`, `normalize_source_id()`,
+  `discover_official_pdmx_shards()`, `scan_pdmx_tar()`, `build_pdmx_dataset_manifest()`,
+  `verify_pdmx_dataset_manifest()`, and CLI commands `prepare` and `scan`.
 
 - [ ] **Step 1: Write a reusable tiny-tar fixture and failing strict-pairing tests**
 
@@ -264,9 +268,19 @@ def scan_pdmx_tar(
     logical_path: str,
     max_sequence_length: int = 7512,
 ) -> ShardScanResult: ...
+
+def normalize_source_id(value: str) -> str: ...
+
+def discover_official_pdmx_shards(
+    snapshot_root: str | Path,
+) -> tuple[tuple[tuple[str, str], ...], tuple[str, ...]]: ...
 ```
 
 Recognize suffixes from the right so keys may contain dots. Decode Kern/source strictly as UTF-8, verify PNG with Pillow, call the shared BeKern parser, add BOS/EOS before length validation, normalize source with `.strip()`, and fail with logical path plus key for every malformed record.
+`normalize_source_id()` replaces backslashes with slashes, removes empty and `.` components, rejects `..`,
+and returns one stable relative POSIX identifier without case folding. Discovery accepts train tar files only
+under the two pinned official roots and accepts only `curated_validation_pdmx.tar` for validation; ABC tar
+files and unexpected roots are excluded.
 
 - [ ] **Step 4: Write failing tests for manifest identity and source overlap**
 
@@ -568,6 +582,9 @@ class PDMXPretrainingDataModule(LightningDataModule):
     def train_dataloader(self): ...
     def val_dataloader(self): ...
 
+    @staticmethod
+    def resolve_artifact_path(value: str | Path) -> Path: ...
+
 
 class PDMXVirtualEpochCallback(Callback):
     def on_train_epoch_start(self, trainer, pl_module) -> None:
@@ -582,6 +599,8 @@ class PDMXConsumptionAuditCallback(Callback):
 ```
 
 Use `prefetch_factor=1`, ordered delivery, `persistent_workers=False`, no DataLoader shuffle, and existing batch-size-1 collate. Do not implement `test_dataloader()`.
+`resolve_artifact_path()` resolves relative paths against `Path(__file__).resolve().parent`, so launching from
+the repository root, package directory, or another cwd finds the same manifest and vocabulary.
 The audit callback consumes only metadata returned to the main process. It records actual renderer/source-cycle/
 voice-bucket/density-bucket counts per virtual epoch, logs renderer ratios, and saves the first processed image
 plus original/final dimensions for each renderer under the run-instance directory. It raises when a completed
@@ -636,6 +655,12 @@ def test_final_evaluation_runs_for_legacy_datamodule_without_capability():
     trainer = Mock()
     assert _run_test_if_available(trainer, Mock(), object(), "model.ckpt") is True
     trainer.test.assert_called_once()
+
+
+def test_validation_step_accepts_optional_batch_metadata(model_wrapper):
+    batch = make_validation_batch(with_metadata=True)
+    model_wrapper.validation_step(batch)
+    assert len(model_wrapper.grtrs) == 1
 ```
 
 - [ ] **Step 2: Run focused training tests and verify red**
@@ -663,6 +688,8 @@ def _run_test_if_available(trainer, model_wrapper, data, checkpoint_path) -> boo
 ```
 
 Legacy modules default to true to preserve behavior. Do not catch missing-test exceptions.
+Change `SMTPP_Trainer.validation_step()` to unpack `val_batch[:3]`; the optional fourth metadata element is
+audit information and must not alter generation or target scoring.
 
 - [ ] **Step 4: Write failing protocol and resume-boundary tests**
 
@@ -869,7 +896,10 @@ def test_new_configs_parse(path):
 
 - [ ] **Step 2: Add the fixed PDMX config**
 
-Use the exact JSON contract from the approved spec. `dataset_manifest` and `vocab_manifest` are repository-relative logical paths. Do not add `reduce_ratio`, `skip_steps`, or a test split.
+Use the exact JSON contract from the approved spec, with package-relative
+`"dataset_manifest": "config/Page_OMR_PDMX/dataset-manifest.v1.json"` and
+`"vocab_manifest": "vocab/FullPageOMR_BeKern_v1.json"`. Do not add `reduce_ratio`, `skip_steps`, or a
+test split.
 
 - [ ] **Step 3: Add downstream configs without modifying legacy configs**
 

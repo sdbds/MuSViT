@@ -193,6 +193,9 @@ prepare 必须扫描 tar 成员并验证：
 - `[<bos>, ..., <eos>]` 总长度不超过 7512；
 - train 与 curated validation 的 normalized `source.txt` 集合不相交。
 
+source id normalization 必须把反斜线转换为 `/`、删除空和 `.` path component、拒绝 `..`，
+并保留大小写；只做 `.strip()` 不足以发现 Windows/POSIX 表示不同的同一来源。
+
 损坏、缺配对、重复 key、source overlap 默认都是 fatal。超过 7512 的页面可以被显式排除，
 但 key、原因和数量必须写入 manifest；训练时的排除集合必须与 manifest 完全一致。
 不能运行时遇到长样本才静默截断。
@@ -223,8 +226,8 @@ v1 不对 `voices_9p`、`triplet_heavy` 或其他 bucket 单独过采样；没�
     "type": "pdmx_webdataset",
     "dataset_id": "tobiashornbogen/page-omr-pdmx-renders",
     "dataset_revision": "7da3ae5237963e57a8fe1c6ee375b1f10af34a09",
-    "dataset_manifest": "experiments/full_page_omr/config/Page_OMR_PDMX/dataset-manifest.v1.json",
-    "vocab_manifest": "experiments/full_page_omr/vocab/FullPageOMR_BeKern_v1.json",
+    "dataset_manifest": "config/Page_OMR_PDMX/dataset-manifest.v1.json",
+    "vocab_manifest": "vocab/FullPageOMR_BeKern_v1.json",
     "renderer_weights": {
       "verovio": 0.5,
       "mscore": 0.5
@@ -239,6 +242,10 @@ v1 不对 `voices_9p`、`triplet_heavy` 或其他 bucket 单独过采样；没�
   }
 }
 ```
+
+上述两个 artifact path 相对 `experiments/full_page_omr` package root 解析，而不是相对调用者
+当前目录解析。公开 entrypoint 会切换到 package root；显式解析仍需保留，以确保测试、直接
+Python 调用和 CLI 调用得到相同文件。
 
 上述 `num_workers` 是参考值，不宣称为性能最优值；实际生产值必须进入 run protocol，
 完整恢复要求保持一致。
