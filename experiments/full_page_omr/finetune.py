@@ -20,6 +20,7 @@ from .pdmx_data import (
     PDMXPretrainingDataModule,
     PDMXVirtualEpochCallback,
 )
+from .migrate_vocabulary_checkpoint import load_vocabulary_aware_weights
 from .smt_foundation import SMTFoundationConfig, SMTFoundationModelForCausalLM
 from .optimization import (
     AdamWWSDConfig,
@@ -153,6 +154,24 @@ def _validate_checkpoint_sources(from_checkpoint, starting_weights):
     if all(value is not None for value in normalized):
         raise ValueError("from_checkpoint and starting_weights are mutually exclusive")
     return tuple(normalized)
+
+
+def _validate_source_vocab_manifest(
+    starting_weights,
+    source_vocab_manifest,
+) -> str | None:
+    if source_vocab_manifest is None or (
+        isinstance(source_vocab_manifest, str)
+        and not source_vocab_manifest.strip()
+    ):
+        return None
+    if not isinstance(source_vocab_manifest, str):
+        raise TypeError("source_vocab_manifest must be a path string or None")
+    if starting_weights is None:
+        raise ValueError(
+            "source_vocab_manifest is valid only with starting_weights"
+        )
+    return source_vocab_manifest
 
 
 def _validate_non_negative_integer(value, field_name: str) -> int:
@@ -918,6 +937,18 @@ def _data_callbacks(data, run_instance_directory: str | Path) -> list[Callback]:
     return callbacks
 
 
+def _target_vocab_manifest_path(data) -> Path:
+    explicit = getattr(data, "vocab_manifest_path", None)
+    if explicit is not None:
+        return Path(explicit)
+    vocab_name = getattr(data, "vocab_name", None)
+    if not isinstance(vocab_name, str) or not vocab_name:
+        raise ValueError(
+            "vocabulary migration requires a target vocabulary manifest"
+        )
+    return Path(__file__).resolve().parent / "vocab" / f"{vocab_name}.json"
+
+
 def main(config: ExperimentConfig, experiment_name,
          foundation_architecture="ViTMAEBase", foundation_weights="carlospm12/LSMT-MAE-Base-1024-16",
          finetuning_technique="CL", from_checkpoint: str | None = None, resolution: int | None = None,
@@ -933,7 +964,8 @@ def main(config: ExperimentConfig, experiment_name,
          validation_every_n_epochs: int = 2_000,
          protocol_version: str = PROTOCOL_VERSION,
          source_curriculum_step: int | None = None,
-         source_checkpoint_sha256: str | None = None):
+         source_checkpoint_sha256: str | None = None,
+         source_vocab_manifest: str | None = None):
     checkpoint_every_n_epochs = _validate_checkpoint_every_n_epochs(checkpoint_every_n_epochs)
     validation_every_n_epochs = _validate_validation_every_n_epochs(
         validation_every_n_epochs
@@ -969,6 +1001,10 @@ def main(config: ExperimentConfig, experiment_name,
     from_checkpoint, starting_weights = _validate_checkpoint_sources(
         from_checkpoint,
         starting_weights,
+    )
+    source_vocab_manifest = _validate_source_vocab_manifest(
+        starting_weights,
+        source_vocab_manifest,
     )
     if resolution is None:
         _globals.resolution = 1024
@@ -1094,6 +1130,13 @@ def main(config: ExperimentConfig, experiment_name,
             ),
         })
 
+    run_record_id = uuid.uuid4().hex
+    run_record_root = Path("logs") / "run_instances" / run_record_id
+    run_instance_directory = (
+        run_record_root / experiment_name / protocol_version
+    )
+    protocol_metadata["run_record_id"] = run_record_id
+
     optimizer_wrapper_kwargs = {
         "run_protocol_version": protocol_version,
         "optimizer_protocol": optimizer_config.protocol,
@@ -1108,7 +1151,7 @@ def main(config: ExperimentConfig, experiment_name,
         "wsd_min_lr_ratio": optimizer_config.min_lr_ratio,
         "protocol_snapshot": protocol_snapshot,
     }
-    if starting_weights is None:
+    if starting_weights is None or source_vocab_manifest is not None:
         model_wrapper = SMTPP_Trainer(
             smt_config,
             model,
@@ -1119,6 +1162,26 @@ def main(config: ExperimentConfig, experiment_name,
             accumulate_grad_batches=ACCUMULATE_GRAD_BATCHES,
             **optimizer_wrapper_kwargs,
         )
+        if source_vocab_manifest is not None:
+            migration_report_path = (
+                run_instance_directory / "vocabulary_migration.json"
+            )
+            migration_report = load_vocabulary_aware_weights(
+                model_wrapper,
+                starting_weights,
+                source_vocab_manifest=source_vocab_manifest,
+                target_vocab_manifest=_target_vocab_manifest_path(data),
+                report_path=migration_report_path,
+            )
+            protocol_metadata.update(
+                {
+                    "source_vocab_manifest": source_vocab_manifest,
+                    "vocabulary_migration_report_path": str(
+                        migration_report_path.resolve()
+                    ),
+                    "vocabulary_migration": migration_report,
+                }
+            )
     else:
         model_wrapper = SMTPP_Trainer.load_from_checkpoint(
             starting_weights,
@@ -1146,9 +1209,6 @@ def main(config: ExperimentConfig, experiment_name,
         finetuning_technique,
     )
 
-    run_record_id = uuid.uuid4().hex
-    run_record_root = Path("logs") / "run_instances" / run_record_id
-    protocol_metadata["run_record_id"] = run_record_id
     resize_audit_path = _write_resize_audit(
         data,
         experiment_name=experiment_name,
@@ -1234,7 +1294,8 @@ def launch(config_path: str, experiment_name: str,
            validation_every_n_epochs: int = 2_000,
            protocol_version: str = PROTOCOL_VERSION,
            source_curriculum_step: int | None = None,
-           source_checkpoint_sha256: str | None = None):
+           source_checkpoint_sha256: str | None = None,
+           source_vocab_manifest: str | None = None):
     checkpoint_every_n_epochs = _validate_checkpoint_every_n_epochs(checkpoint_every_n_epochs)
     validation_every_n_epochs = _validate_validation_every_n_epochs(
         validation_every_n_epochs
@@ -1249,6 +1310,10 @@ def launch(config_path: str, experiment_name: str,
     from_checkpoint, starting_weights = _validate_checkpoint_sources(
         from_checkpoint,
         starting_weights,
+    )
+    source_vocab_manifest = _validate_source_vocab_manifest(
+        starting_weights,
+        source_vocab_manifest,
     )
     with open(config_path, 'r') as file:
         config_dict = json.load(file)
@@ -1268,7 +1333,8 @@ def launch(config_path: str, experiment_name: str,
          validation_every_n_epochs=validation_every_n_epochs,
          protocol_version=protocol_version,
          source_curriculum_step=source_curriculum_step,
-         source_checkpoint_sha256=source_checkpoint_sha256)
+         source_checkpoint_sha256=source_checkpoint_sha256,
+         source_vocab_manifest=source_vocab_manifest)
 
 
 if __name__ == "__main__":

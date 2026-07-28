@@ -300,8 +300,10 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                 wsd_warmup_steps=20_000,
                 wsd_decay_steps=500_000,
                 protocol_version="full_page_omr_resize_v1",
+                starting_weights="weights.ckpt",
                 source_curriculum_step=282200,
                 source_checkpoint_sha256="a" * 64,
+                source_vocab_manifest="source-vocab.json",
             )
 
         self.assertEqual(launch.call_args.kwargs["checkpoint_every_n_epochs"], 37)
@@ -319,6 +321,10 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
         )
         self.assertEqual(launch.call_args.kwargs["source_curriculum_step"], 282200)
         self.assertEqual(launch.call_args.kwargs["source_checkpoint_sha256"], "a" * 64)
+        self.assertEqual(
+            launch.call_args.kwargs["source_vocab_manifest"],
+            "source-vocab.json",
+        )
 
     def test_launch_forwards_checkpoint_interval_to_main(self):
         config = {
@@ -347,8 +353,10 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                     wsd_warmup_steps=20_000,
                     wsd_decay_steps=500_000,
                     protocol_version="full_page_omr_resize_v1",
+                    starting_weights="weights.ckpt",
                     source_curriculum_step=282200,
                     source_checkpoint_sha256="a" * 64,
+                    source_vocab_manifest="source-vocab.json",
                 )
 
         self.assertEqual(main.call_args.kwargs["checkpoint_every_n_epochs"], 37)
@@ -366,6 +374,86 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
         )
         self.assertEqual(main.call_args.kwargs["source_curriculum_step"], 282200)
         self.assertEqual(main.call_args.kwargs["source_checkpoint_sha256"], "a" * 64)
+        self.assertEqual(
+            main.call_args.kwargs["source_vocab_manifest"],
+            "source-vocab.json",
+        )
+
+    def test_source_vocab_manifest_requires_starting_weights(self):
+        with self.assertRaisesRegex(ValueError, "starting_weights"):
+            finetune._validate_source_vocab_manifest(
+                None,
+                "source-vocab.json",
+            )
+        self.assertEqual(
+            finetune._validate_source_vocab_manifest(
+                "weights.ckpt",
+                "source-vocab.json",
+            ),
+            "source-vocab.json",
+        )
+
+    def test_main_uses_fresh_wrapper_for_vocabulary_migration(self):
+        class SizedDataset(SimpleNamespace):
+            def __len__(self):
+                return 83
+
+        data_module = SimpleNamespace(
+            train_dataset=SizedDataset(
+                w2i={"<pad>": 0},
+                i2w={0: "<pad>"},
+            ),
+            encoder_unfreeze_step=0,
+            curriculum_step_offset=0,
+            tokenization_mode="bekern",
+            batch_size=1,
+            num_workers=0,
+            vocab_manifest_path=Path("target-vocab.json"),
+        )
+        config = SimpleNamespace(
+            data=SimpleNamespace(skip_steps=0, reduce_ratio=1.0)
+        )
+        model = _TinyModel()
+        model.encoder.config = SimpleNamespace(patch_size=16)
+        wrapper = Mock()
+        trainer_class = Mock(return_value=wrapper)
+
+        with (
+            patch.object(finetune, "_validate_run_contract", return_value=None),
+            patch.dict(finetune.DATASETS_TYPE, {"CL": lambda _: data_module}),
+            patch.object(finetune, "set_up_processor"),
+            patch.object(finetune, "SMTFoundationConfig", return_value=object()),
+            patch.object(
+                finetune,
+                "SMTFoundationModelForCausalLM",
+                return_value=model,
+            ),
+            patch.object(finetune, "SMTPP_Trainer", trainer_class),
+            patch.object(
+                finetune,
+                "load_vocabulary_aware_weights",
+                side_effect=RuntimeError("migration captured"),
+            ) as migrate,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "migration captured"):
+                finetune.main(
+                    config,
+                    "migration-run",
+                    starting_weights="weights.ckpt",
+                    source_vocab_manifest="source-vocab.json",
+                    protocol_version="vocab-migration-v1",
+                )
+
+        trainer_class.assert_called_once()
+        trainer_class.load_from_checkpoint.assert_not_called()
+        self.assertEqual(
+            migrate.call_args.kwargs["source_vocab_manifest"],
+            "source-vocab.json",
+        )
+        self.assertEqual(
+            migrate.call_args.kwargs["target_vocab_manifest"],
+            Path("target-vocab.json"),
+        )
 
     def test_checkpoint_interval_must_be_a_positive_integer(self):
         for value in (0, -1, True, 1.5):
