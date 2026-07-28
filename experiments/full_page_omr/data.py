@@ -5,6 +5,7 @@ import multiprocessing
 import numpy as np
 from dataclasses import dataclass
 from .config.ExperimentConfigWrapper import ExperimentConfig
+from .batching import batch_preparation_img2seq
 from .Generator.SynthGenerator import VerovioGenerator, SyntheticScoreGenerationError
 from .data_augmentation.data_augmentation import augment, convert_img_to_tensor
 from .tokenization import (
@@ -175,32 +176,6 @@ class _ArrowOMRSource:
         for transcription in self.rows["transcription"]:
             yield self._tokenize(transcription)
 
-
-def batch_preparation_img2seq(data):
-    if len(data) != 1:
-        raise ValueError(
-            f"full-page OMR collate requires batch_size=1; received {len(data)} samples"
-        )
-    images = [sample[0] for sample in data]
-    dec_in = [sample[1] for sample in data]
-    gt = [sample[2] for sample in data]
-    input_metadata = data[0][3] if len(data[0]) == 4 else None
-
-    X_train = images[0]
-    
-    max_length_seq = max([len(w) for w in gt])
-
-    decoder_input = torch.zeros(size=[len(dec_in),max_length_seq])
-    y = torch.zeros(size=[len(gt),max_length_seq])
-
-    for i, seq in enumerate(dec_in):
-        decoder_input[i, 0:len(seq)-1] = torch.from_numpy(np.asarray([char for char in seq[:-1]]))
-    
-    for i, seq in enumerate(gt):
-        y[i, 0:len(seq)-1] = torch.from_numpy(np.asarray([char for char in seq[1:]]))
-    
-    batch = (X_train, decoder_input.long(), y.long())
-    return (*batch, input_metadata) if input_metadata is not None else batch
 
 class OMRIMG2SEQDataset(Dataset):
     def __init__(self, teacher_forcing_perc=0.2, augment=False) -> None:
