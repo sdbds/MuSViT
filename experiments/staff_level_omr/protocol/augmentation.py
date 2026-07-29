@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import warnings
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 import albumentations as A
@@ -443,6 +444,24 @@ def _probe_full_seed_support() -> tuple[bool, bool]:
     return np.array_equal(first, repeated), not np.array_equal(first, high_bit)
 
 
+def _is_contract_warning(item: warnings.WarningMessage) -> bool:
+    if issubclass(
+        item.category,
+        (DeprecationWarning, PendingDeprecationWarning, FutureWarning),
+    ):
+        return False
+    try:
+        source = Path(item.filename).resolve(strict=False)
+        albumentations_root = Path(A.__file__).resolve().parent
+    except OSError:
+        return False
+    try:
+        source.relative_to(albumentations_root)
+        return True
+    except ValueError:
+        return source == Path(__file__).resolve()
+
+
 def preflight_augmentation(
     profile: str,
     *,
@@ -518,8 +537,13 @@ def preflight_augmentation(
                     )
 
         repeat_equal, high_bit_changes = _probe_full_seed_support()
-        if caught:
-            messages = "; ".join(str(item.message) for item in caught)
+        contract_warnings = [
+            item for item in caught if _is_contract_warning(item)
+        ]
+        if contract_warnings:
+            messages = "; ".join(
+                str(item.message) for item in contract_warnings
+            )
             raise ProtocolError(
                 f"augmentation construction or probes emitted warnings: {messages}"
             )

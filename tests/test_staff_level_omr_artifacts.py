@@ -17,6 +17,7 @@ from experiments.staff_level_omr.protocol.canonical import (
 )
 from experiments.staff_level_omr.protocol.errors import ProtocolError
 from experiments.staff_level_omr.protocol import artifacts as artifacts_module
+from experiments.staff_level_omr.protocol import canonical as canonical_module
 
 
 CONTRACT_HASH = "a" * 64
@@ -67,6 +68,21 @@ def _create(tmp_path: Path, *, run_uuid: str = "1" * 32) -> RunArtifacts:
     )
 
 
+def test_canonical_atomic_replace_syncs_parent_directory(tmp_path, monkeypatch):
+    synced = []
+    monkeypatch.setattr(
+        canonical_module,
+        "fsync_parent_directory",
+        lambda path: synced.append(Path(path)),
+        raising=False,
+    )
+    destination = tmp_path / "artifact.json"
+
+    write_canonical_json(destination, {"value": 1})
+
+    assert synced == [tmp_path]
+
+
 def test_run_directory_is_short_unique_and_copies_canonical_inputs(tmp_path):
     artifacts = _create(tmp_path)
 
@@ -109,6 +125,13 @@ def test_same_contract_creates_distinct_runs_without_overwrite(tmp_path):
     assert values[0].run_dir != values[1].run_dir
     assert values[0].run_dir.is_dir()
     assert values[1].run_dir.is_dir()
+
+
+def test_run_updates_reject_undeclared_schema_fields(tmp_path):
+    artifacts = _create(tmp_path)
+
+    with pytest.raises(ProtocolError, match="undeclared|field"):
+        artifacts.update_run(model_prefight={"typo": True})
 
 
 def test_run_name_collision_fails_instead_of_reusing_directory(tmp_path):

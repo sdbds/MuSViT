@@ -88,6 +88,53 @@ def test_train_epoch_exposes_infinite_ctc_instead_of_zeroing_it():
         )
 
 
+def test_train_epoch_checks_gradients_with_one_aggregated_norm(monkeypatch):
+    calls = []
+
+    def record_norm(tensors, *, norm_type=2.0, error_if_nonfinite=False, foreach=None):
+        calls.append(
+            {
+                "count": len(list(tensors)),
+                "error_if_nonfinite": error_if_nonfinite,
+                "foreach": foreach,
+            }
+        )
+        return torch.tensor(1.0)
+
+    monkeypatch.setattr(torch.nn.utils, "get_total_norm", record_norm)
+    model = TrainableLogits(time_steps=3, classes=3)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    train_epoch(
+        model,
+        [_batch([[1, 2]], [True])],
+        optimizer,
+        device=torch.device("cpu"),
+    )
+
+    assert calls == [
+        {
+            "count": 1,
+            "error_if_nonfinite": True,
+            "foreach": None,
+        }
+    ]
+
+
+def test_aggregated_gradient_guard_rejects_non_finite_values():
+    model = TrainableLogits(time_steps=3, classes=3)
+    model.logits.register_hook(lambda gradient: gradient.fill_(float("nan")))
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    with pytest.raises(ProtocolError, match="non-finite gradients"):
+        train_epoch(
+            model,
+            [_batch([[1, 2]], [True])],
+            optimizer,
+            device=torch.device("cpu"),
+        )
+
+
 def test_evaluation_reports_all_and_feasible_metrics_plus_capacity():
     result = evaluate_split(
         FixedPredictions(),

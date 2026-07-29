@@ -53,6 +53,36 @@ PACKAGE_VERSIONS = {
 }
 
 
+def test_runtime_package_capture_is_limited_to_training_dependencies():
+    versions = runtime_module.collect_package_versions()
+
+    assert set(versions) == set(runtime_module.CORE_PACKAGES)
+
+
+def test_auxiliary_package_changes_do_not_count_as_resume_drift():
+    saved = {**PACKAGE_VERSIONS, "ruff": "0.12.1"}
+    current = {**PACKAGE_VERSIONS, "ruff": "0.13.0", "pytest": "9.0.2"}
+
+    hard, soft = runtime_module._environment_differences(saved, current)
+
+    assert hard == []
+    assert soft == []
+
+
+def test_git_metadata_is_optional_outside_a_git_checkout(monkeypatch):
+    def unavailable(*args, **kwargs):
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(runtime_module.subprocess, "run", unavailable)
+
+    assert runtime_module.collect_git_metadata() == {
+        "available": False,
+        "commit": None,
+        "dirty": None,
+        "reason": "git_unavailable",
+    }
+
+
 class DummyBackbone(nn.Module):
     def __init__(self):
         super().__init__()
@@ -580,6 +610,18 @@ def test_resume_requires_explicit_acceptance_for_patch_environment_drift(
             dependencies=deps,
         )
 
+    rejected = read_json(run_dir / "run.json")
+    assert rejected["status"] == "completed"
+    assert rejected["failure"] is None
+    assert rejected["stop_reason"] == "max_epochs"
+    assert rejected["reproducibility_status"] == "exact"
+    rejection = rejected["resume_rejections"][-1]
+    assert rejection["stage"] == "resume_validation"
+    assert rejection["timestamp"] == "2026-07-29T03:04:05Z"
+    assert rejection["error"]["type"] == "ProtocolError"
+    assert "--allow_env_drift" in rejection["error"]["message"]
+    assert "transformers" in rejection["error"]["message"]
+
     resume(
         run_dir,
         max_epochs=2,
@@ -596,6 +638,36 @@ def test_resume_requires_explicit_acceptance_for_patch_environment_drift(
             "reason": "patch_or_build",
         }
     ]
+
+
+def test_resume_environment_rejection_does_not_repair_sidecars(tmp_path):
+    run_dir = train(
+        _config(tmp_path, max_epochs=1),
+        dependencies=_dependencies(),
+    )
+    partial_metrics = b'{"epoch":1'
+    (run_dir / "metrics.jsonl").write_bytes(partial_metrics)
+    best_path = run_dir / "checkpoints" / "best.pt"
+    best_before = best_path.read_bytes()
+    summary_before = (run_dir / "summary.json").read_bytes()
+    drifted = dict(PACKAGE_VERSIONS)
+    drifted["transformers"] = "4.57.6"
+    deps = _dependencies(run_uuid="5" * 32)
+    deps.package_versions_factory = lambda: drifted
+
+    with pytest.raises(Exception, match="allow_env_drift"):
+        resume(
+            run_dir,
+            max_epochs=2,
+            dependencies=deps,
+    )
+
+    assert (run_dir / "metrics.jsonl").read_bytes() == partial_metrics
+    assert best_path.read_bytes() == best_before
+    assert (run_dir / "summary.json").read_bytes() == summary_before
+    run = read_json(run_dir / "run.json")
+    assert run["status"] == "completed"
+    assert run["failure"] is None
 
 
 def test_unavailable_cuda_fails_after_data_preflight_before_weight_load(

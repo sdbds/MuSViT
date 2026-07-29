@@ -91,6 +91,9 @@ class StaffOMRModel(nn.Module):
         super().__init__()
         task_head_contract(plan.metadata, num_classes)
         self.backbone = backbone
+        self._backbone_is_frozen = not any(
+            parameter.requires_grad for parameter in backbone.parameters()
+        )
         self.plan = plan
         self.input_dropout = nn.Dropout(p=0.25)
         self.projection = nn.Linear(
@@ -109,6 +112,12 @@ class StaffOMRModel(nn.Module):
             proj_size=0,
         )
         self.classifier_ctc = nn.Linear(512, num_classes, bias=True)
+
+    def train(self, mode: bool = True) -> "StaffOMRModel":
+        super().train(mode)
+        if self._backbone_is_frozen:
+            self.backbone.eval()
+        return self
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         output = self.backbone(

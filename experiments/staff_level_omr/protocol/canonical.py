@@ -12,6 +12,24 @@ from uuid import uuid4
 from .errors import ProtocolError
 
 
+def fsync_parent_directory(path: str | Path) -> None:
+    """Persist a completed rename on platforms that support directory fsync."""
+    if os.name == "nt":
+        return
+    directory = Path(path)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(directory, flags)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError as exc:
+        raise ProtocolError(
+            f"cannot fsync artifact directory {directory}: {exc}"
+        ) from exc
+
+
 def canonical_json_bytes(value: Any) -> bytes:
     """Serialize a JSON value using the protocol's stable byte representation."""
     try:
@@ -80,6 +98,7 @@ def write_canonical_json(path: str | Path, value: Any) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, destination)
+        fsync_parent_directory(destination.parent)
     except OSError as exc:
         try:
             temporary.unlink(missing_ok=True)

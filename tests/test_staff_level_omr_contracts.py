@@ -201,6 +201,7 @@ def test_training_contract_contains_optimizer_seed_ctc_and_head_contracts(
         "type": "torch.nn.functional.ctc_loss",
         "zero_infinity": False,
     }
+    assert training["backbone_train_mode"] == "eval"
     assert training["seed"]["schedule_version"] == (
         "staff_omr_sample_epoch_sha256_v1"
     )

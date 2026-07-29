@@ -6,8 +6,6 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
-
 from .canonical import canonical_sha256, read_json, write_canonical_json
 from .data_bundle import BundleSample, SPLITS
 from .errors import ProtocolError

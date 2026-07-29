@@ -184,6 +184,9 @@ def build_protocol_contracts(
             "worker_assignment_semantic": False,
         },
         "optimizer": optimizer_contract(config.learning_rate),
+        "backbone_train_mode": (
+            "eval" if config.method == "linear_probe" else "train"
+        ),
         "lora": dict(LORA_CONTRACT) if config.method == "lora" else None,
         "validation": {
             "start_eval": config.start_eval,

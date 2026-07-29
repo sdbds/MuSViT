@@ -7,13 +7,12 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
 from uuid import uuid4
 
 import torch
 from torch import nn
 
-from .canonical import canonical_sha256, read_json
+from .canonical import canonical_sha256, fsync_parent_directory, read_json
 from .errors import ProtocolError
 from .modeling import load_trainable_state_dict, trainable_state_dict
 from .seeding import SEED_SCHEDULE_VERSION, initialization_seed
@@ -363,7 +362,6 @@ def build_checkpoint(
         "next_epoch": epoch + 1,
     }
     payload.update(static.payload_fields())
-    validate_checkpoint_payload(payload)
     return payload
 
 
@@ -637,6 +635,7 @@ def save_checkpoint(path: str | Path, checkpoint: dict[str, object]) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, destination)
+        fsync_parent_directory(destination.parent)
     except Exception as exc:
         try:
             temporary.unlink(missing_ok=True)
@@ -696,7 +695,6 @@ def validate_resume_artifact_identity(
     run_dir: str | Path,
 ) -> None:
     """Validate immutable run-local inputs before repairing any sidecar."""
-    validate_checkpoint_payload(checkpoint)
     if checkpoint["checkpoint_role"] != "last":
         raise ProtocolError("resume requires checkpoint role 'last'")
     root = Path(run_dir).resolve(strict=True)
@@ -739,12 +737,10 @@ def validate_resume_artifact_identity(
 def validate_resume_checkpoint(
     checkpoint: dict[str, object],
     *,
-    run_dir: str | Path,
     expected_training_contract_sha256: str,
     expected_optimizer_parameter_names: list[str],
     expected_trainable_parameter_names: list[str],
 ) -> None:
-    validate_resume_artifact_identity(checkpoint, run_dir=run_dir)
     if checkpoint["training_contract_sha256"] != (
         expected_training_contract_sha256
     ):
@@ -766,7 +762,6 @@ def restore_checkpoint(
     optimizer: torch.optim.Optimizer,
     optimizer_parameter_names: list[str],
 ) -> None:
-    validate_checkpoint_payload(checkpoint)
     current_names = _trainable_names(model)
     if optimizer_parameter_names != current_names:
         raise ProtocolError(

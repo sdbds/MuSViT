@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Iterable
 
 import torch
 from torch import nn
@@ -107,15 +107,21 @@ def train_epoch(
         )
         loss_value = _finite_scalar(loss, f"train batch {batch_index} loss")
         loss.backward()
-        for name, parameter in model.named_parameters():
-            if (
-                parameter.grad is not None
-                and not torch.isfinite(parameter.grad).all()
-            ):
-                raise ProtocolError(
-                    f"train batch {batch_index} produced non-finite "
-                    f"gradient for {name!r}"
-                )
+        gradients = [
+            parameter.grad
+            for parameter in model.parameters()
+            if parameter.grad is not None
+        ]
+        try:
+            torch.nn.utils.get_total_norm(
+                gradients,
+                error_if_nonfinite=True,
+                foreach=None,
+            )
+        except RuntimeError as exc:
+            raise ProtocolError(
+                f"train batch {batch_index} produced non-finite gradients"
+            ) from exc
         optimizer.step()
         size = int(batch.images.shape[0])
         weighted_loss += loss_value * size

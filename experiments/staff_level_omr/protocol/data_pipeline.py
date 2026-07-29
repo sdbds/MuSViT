@@ -14,7 +14,7 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset, Sampler
 
 from .augmentation import build_augmentation
-from .batching import CTCBatch, ctc_collate
+from .batching import ctc_collate
 from .ctc import CTCPreflight
 from .data_bundle import BundleSample
 from .errors import ProtocolError

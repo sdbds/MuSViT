@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch import nn
 
+from experiments.staff_level_omr.protocol import checkpoint as checkpoint_module
 from experiments.staff_level_omr.protocol.canonical import (
     canonical_sha256,
     write_canonical_json,
@@ -19,6 +20,7 @@ from experiments.staff_level_omr.protocol.checkpoint import (
     restore_checkpoint,
     save_checkpoint,
     validate_checkpoint_payload,
+    validate_resume_artifact_identity,
     validate_resume_checkpoint,
 )
 from experiments.staff_level_omr.protocol.errors import ProtocolError
@@ -360,9 +362,9 @@ def test_resume_validation_checks_run_local_document_hashes(tmp_path):
     _, _, names, checkpoint = _checkpoint(static=static)
     run = _run_files(tmp_path, static)
 
+    validate_resume_artifact_identity(checkpoint, run_dir=run)
     validate_resume_checkpoint(
         checkpoint,
-        run_dir=run,
         expected_training_contract_sha256=(
             checkpoint["training_contract_sha256"]
         ),
@@ -374,17 +376,51 @@ def test_resume_validation_checks_run_local_document_hashes(tmp_path):
 
     write_canonical_json(run / "split_manifest.json", {"identity": "changed"})
     with pytest.raises(ProtocolError, match="manifest"):
-        validate_resume_checkpoint(
-            checkpoint,
-            run_dir=run,
-            expected_training_contract_sha256=(
-                checkpoint["training_contract_sha256"]
-            ),
-            expected_optimizer_parameter_names=names,
-            expected_trainable_parameter_names=(
-                checkpoint["trainable_parameter_names"]
-            ),
-        )
+        validate_resume_artifact_identity(checkpoint, run_dir=run)
+
+
+def test_post_load_resume_layers_do_not_repeat_full_schema_validation(
+    tmp_path,
+    monkeypatch,
+):
+    bundle_hash = canonical_sha256({"identity": "bundle"})
+    manifest_hash = canonical_sha256({"identity": "manifest"})
+    vocabulary = _vocabulary_document()
+    vocabulary["source_manifest_sha256"] = manifest_hash
+    static = _static(
+        dataset_bundle_sha256=bundle_hash,
+        split_manifest_sha256=manifest_hash,
+        vocabulary=vocabulary,
+    )
+    model, optimizer, names, checkpoint = _checkpoint(static=static)
+    run = _run_files(tmp_path, static)
+
+    def repeated_validation(_):
+        raise AssertionError("full checkpoint validation belongs at load/save")
+
+    monkeypatch.setattr(
+        checkpoint_module,
+        "validate_checkpoint_payload",
+        repeated_validation,
+    )
+
+    validate_resume_artifact_identity(checkpoint, run_dir=run)
+    validate_resume_checkpoint(
+        checkpoint,
+        expected_training_contract_sha256=(
+            checkpoint["training_contract_sha256"]
+        ),
+        expected_optimizer_parameter_names=names,
+        expected_trainable_parameter_names=(
+            checkpoint["trainable_parameter_names"]
+        ),
+    )
+    restore_checkpoint(
+        checkpoint,
+        model=model,
+        optimizer=optimizer,
+        optimizer_parameter_names=names,
+    )
 
 
 def test_resume_validation_wraps_missing_run_document_as_protocol_error(
@@ -399,19 +435,9 @@ def test_resume_validation_wraps_missing_run_document_as_protocol_error(
         split_manifest_sha256=manifest_hash,
         vocabulary=vocabulary,
     )
-    _, _, names, checkpoint = _checkpoint(static=static)
+    _, _, _, checkpoint = _checkpoint(static=static)
     run = _run_files(tmp_path, static)
     (run / "split_manifest.json").unlink()
 
     with pytest.raises(ProtocolError, match="split manifest.*missing|missing.*split"):
-        validate_resume_checkpoint(
-            checkpoint,
-            run_dir=run,
-            expected_training_contract_sha256=(
-                checkpoint["training_contract_sha256"]
-            ),
-            expected_optimizer_parameter_names=names,
-            expected_trainable_parameter_names=(
-                checkpoint["trainable_parameter_names"]
-            ),
-        )
+        validate_resume_artifact_identity(checkpoint, run_dir=run)

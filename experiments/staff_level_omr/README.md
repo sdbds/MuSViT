@@ -203,12 +203,22 @@ commit point; sidecars are repaired from it after an interrupted write.
 `best.pt` is selected by strictly lower `val_CER_all`. Final test runs from
 `best.pt`, and finalization is idempotent.
 
+Resume performs all ownership, artifact, environment, contract, model, and
+optimizer compatibility checks before repairing any sidecar. A rejected attempt
+leaves the existing terminal status and artifacts intact and appends an audit
+entry to `run.json.resume_rejections` only after run ownership is established.
+
 Checkpoints save trainable state, optimizer state, exact parameter-name mapping,
 the full vocabulary, input/training contracts, manifest identity, and approved
 base-weight identity. They omit the large immutable backbone and complete
 manifest. A standalone checkpoint can decode already-produced ids without
 scanning target files, but inference still needs the recorded base revision and
 matching weight SHA-256.
+
+Atomic replacements flush and sync the temporary file first. POSIX also syncs
+the parent directory after replacement. Windows uses atomic `os.replace`, but
+does not claim portable power-loss durability because Python cannot fsync a
+directory handle there.
 
 Structured JSON artifacts are authoritative; terminal output is only a
 convenience view.

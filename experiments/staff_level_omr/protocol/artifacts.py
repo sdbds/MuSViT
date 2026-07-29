@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from .canonical import (
     canonical_json_bytes,
+    fsync_parent_directory,
     read_json,
     write_canonical_json,
 )
@@ -28,6 +29,7 @@ from .errors import ProtocolError
 
 
 RUN_FILE = "run.json"
+RUN_DOCUMENT_SCHEMA = "staff_omr_run_v2"
 METRICS_FILE = "metrics.jsonl"
 TEST_FILE = "test.json"
 SUMMARY_FILE = "summary.json"
@@ -36,6 +38,89 @@ LAST_CHECKPOINT = "last.pt"
 BEST_CHECKPOINT = "best.pt"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _RUN_UUID = re.compile(r"^[0-9a-f]{12,32}$")
+RUN_UPDATE_FIELDS = frozenset(
+    {
+        "base_model_registry_evidence",
+        "best_epoch",
+        "best_metric_value",
+        "committed_epoch",
+        "current_launch_config",
+        "current_launch_config_sha256",
+        "early_stopping_state",
+        "failure",
+        "global_step",
+        "image_verification",
+        "launch_history",
+        "model_preflight",
+        "package_versions",
+        "preflight",
+        "reproducibility_status",
+        "resume_history",
+        "runtime_environment",
+        "stage",
+        "status",
+        "stop_reason",
+        "summary_sha256",
+        "trainable_parameters",
+        "updated_at",
+    }
+)
+RUN_DOCUMENT_FIELDS = frozenset(
+    {
+        "augmentation_contract_sha256",
+        "backbone_config",
+        "base_model_registry_evidence",
+        "best_epoch",
+        "best_metric_name",
+        "best_metric_value",
+        "committed_epoch",
+        "created_at",
+        "current_launch_config",
+        "current_launch_config_sha256",
+        "dataset",
+        "early_stopping_state",
+        "failure",
+        "git",
+        "global_step",
+        "identity_hashes",
+        "image_verification",
+        "initial_launch_config",
+        "initial_launch_config_sha256",
+        "input_contract",
+        "launch_history",
+        "model_preflight",
+        "package_versions",
+        "preflight",
+        "protocol_version",
+        "reproducibility_status",
+        "resume_history",
+        "resume_rejections",
+        "run_id",
+        "run_name",
+        "runtime_environment",
+        "schema_version",
+        "stage",
+        "status",
+        "stop_reason",
+        "summary_sha256",
+        "trainable_parameters",
+        "training_contract",
+        "training_contract_sha256",
+        "updated_at",
+    }
+)
+
+
+def _validate_run_document_shape(document: dict[str, object]) -> None:
+    if document.get("schema_version") != RUN_DOCUMENT_SCHEMA:
+        return
+    actual = set(document)
+    if actual != RUN_DOCUMENT_FIELDS:
+        raise ProtocolError(
+            "run document fields mismatch; "
+            f"missing={sorted(RUN_DOCUMENT_FIELDS - actual)!r}, "
+            f"extra={sorted(actual - RUN_DOCUMENT_FIELDS)!r}"
+        )
 
 
 def file_sha256(path: str | Path) -> str:
@@ -59,6 +144,7 @@ def _atomic_write_bytes(path: Path, payload: bytes) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        fsync_parent_directory(path.parent)
     except OSError as exc:
         try:
             temporary.unlink(missing_ok=True)
@@ -176,6 +262,7 @@ class RunArtifacts:
             )
         document["run_id"] = run_id
         document["run_name"] = run_name
+        _validate_run_document_shape(document)
         canonical_json_bytes(document)
         experiment_dir = Path(output_root).resolve(strict=False) / experiment_name
         run_dir = experiment_dir / run_name
@@ -245,6 +332,7 @@ class RunArtifacts:
         document = read_json(resolved / RUN_FILE)
         if not isinstance(document, dict):
             raise ProtocolError("run.json must be an object")
+        _validate_run_document_shape(document)
         run_id = document.get("run_id")
         if not isinstance(run_id, str) or not re.fullmatch(
             r"[0-9a-f]{12}", run_id
@@ -260,9 +348,15 @@ class RunArtifacts:
         value = read_json(self.run_json)
         if not isinstance(value, dict):
             raise ProtocolError("run.json must be an object")
+        _validate_run_document_shape(value)
         return value
 
     def update_run(self, **changes: object) -> dict[str, object]:
+        undeclared = set(changes) - RUN_UPDATE_FIELDS
+        if undeclared:
+            raise ProtocolError(
+                f"run update contains undeclared fields: {sorted(undeclared)!r}"
+            )
         if "resume_history" in changes:
             raise ProtocolError(
                 "resume_history can only change through append_resume_event"
@@ -284,6 +378,21 @@ class RunArtifacts:
         if not isinstance(history, list):
             raise ProtocolError("run.json resume_history must be an array")
         history.append(event)
+        write_canonical_json(self.run_json, document)
+        return document
+
+    def append_resume_rejection(
+        self,
+        rejection: dict[str, object],
+    ) -> dict[str, object]:
+        if not isinstance(rejection, dict) or not rejection:
+            raise ProtocolError("resume rejection must be a non-empty object")
+        canonical_json_bytes(rejection)
+        document = self.load_run()
+        rejections = document.get("resume_rejections")
+        if not isinstance(rejections, list):
+            raise ProtocolError("run resume_rejections must be an array")
+        rejections.append(rejection)
         write_canonical_json(self.run_json, document)
         return document
 
@@ -325,6 +434,7 @@ class RunArtifacts:
                 stream.write(payload + b"\n")
                 stream.flush()
                 os.fsync(stream.fileno())
+            fsync_parent_directory(self.metrics_path.parent)
         except OSError as exc:
             raise ProtocolError("cannot append metrics.jsonl") from exc
 

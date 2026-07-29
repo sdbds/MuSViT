@@ -179,6 +179,21 @@ def test_linear_probe_builds_exact_head_and_freezes_only_backbone():
     )
 
 
+def test_linear_probe_keeps_frozen_backbone_in_eval_mode_during_training():
+    model = build_model(
+        RecordingBackbone(),
+        META,
+        _config("linear_probe"),
+        num_classes=9,
+    )
+
+    model.train()
+
+    assert model.training is True
+    assert model.projection.training is True
+    assert model.backbone.training is False
+
+
 def test_linear_and_lora_paths_have_same_time_axis_for_same_grid():
     linear = build_model(
         RecordingBackbone(),
@@ -197,10 +212,12 @@ def test_linear_and_lora_paths_have_same_time_axis_for_same_grid():
 
 def test_lora_trains_only_adapter_and_complete_task_head():
     model = build_model(_tiny_vit(), META, _config("lora"), num_classes=9)
+    model.train()
     trainable = {
         name for name, parameter in model.named_parameters() if parameter.requires_grad
     }
 
+    assert model.backbone.training is True
     assert LORA_CONTRACT == {
         "rank": 8,
         "alpha": 16,

@@ -1058,11 +1058,13 @@ patience >= 1
 `null`。两者同 epoch 发生时按 `early_stopping` 处理，不能靠延长预算绕过。
 
 若进程在步骤 4 前失败，本 epoch 未提交；步骤 4 后失败时，`last.pt` 是权威
-状态。resume 必须先用其中的 `epoch_record` 修复滞后的 metrics/run sidecar；
-若它同时记录 `best_updated=true` 且 `best.pt` 落后，则从 `last.pt` 修复
-同一 state 重新序列化 `checkpoint_role=best` 的 `best.pt`。修复完成后再按
-`stop_reason` 决定是否允许进入 `next_epoch`，不能
-把 sidecar repair 当作继续训练许可。
+状态。resume 必须先完成 run/checkpoint ownership、bundle hash、环境漂移、
+重新派生 training contract、backbone/task-head/optimizer 兼容性等全部只读
+授权校验，之后才能修改任何 sidecar。授权通过后，用 `epoch_record` 修复滞后
+的 metrics/run sidecar；若它同时记录 `best_updated=true` 且 `best.pt` 落后，
+则从 `last.pt` 修复同一 state 重新序列化 `checkpoint_role=best` 的
+`best.pt`。修复完成后再按 `stop_reason` 决定是否允许进入 `next_epoch`，
+不能把 sidecar repair 当作继续训练许可。
 
 `metrics.jsonl` 修复规则固定为：只承认以换行结束且能解析的 canonical JSON
 记录；先截断崩溃留下的尾部半行，再要求已有 epoch 从 1 连续递增且不超过
@@ -1198,12 +1200,19 @@ resume 校验分三级。
 
 **环境漂移：**
 
-上述关键库的 patch 版本、其他非关键 package 的任意版本、OS/driver、device
-type、deterministic flags 或 cuDNN flags 不同，默认拒绝；
+上述关键库的 patch 版本、OS/driver、device type、deterministic flags 或
+cuDNN flags 不同，默认拒绝；
 调用者可用 `--allow_env_drift` 显式接受。
 接受后保存逐字段差异并将 run 标记为
 `reproducibility_status=environment_drift`。该开关不能绕过训练语义或
-major.minor 版本不匹配。
+major.minor 版本不匹配。checkpoint 只记录这组直接影响协议语义的关键运行库；
+ruff、pytest 等辅助 distribution 不参与 resume 授权，安装或升级它们不能要求
+`--allow_env_drift`。
+
+只读授权被拒绝时不得改变既有 `status`、`failure`、checkpoint、metrics、
+test 或 summary。身份校验已经证明该目录属于目标 run 后，拒绝事件追加到
+`run.json.resume_rejections`，记录时间、阶段和错误，但不得伪造一次训练失败；
+身份本身无法验证时不写入该目录。
 
 `num_workers`、输出路径和日志详细度是可自由改变的 launch 字段，每次调用
 仍记录新旧值，但不需要 `--allow_env_drift`。这项豁免建立在 §12.2 的样本
@@ -1272,8 +1281,13 @@ append：每条 canonical JSON 加单个 `\n`，以 binary append 完整写入�
 `dataset_bundle.json`、`split_manifest.json`、`vocabulary.json` 和
 `image_verification_index.json` 是输入 bundle 的一次 run 级副本。preflight
 结果合并进 `run.json`，不额外维护内容重复的
-`preflight.json`。resume event 追加到 `run.json.resume_history` 数组，更新时
-仍使用临时文件加原子 replace，历史项不得删除或改写。
+`preflight.json`。成功 resume event 追加到 `run.json.resume_history`，
+授权拒绝追加到 `run.json.resume_rejections`；两者更新时仍使用临时文件加
+原子 replace，历史项不得删除或改写。
+
+临时文件在 replace 前必须 `flush + fsync`。POSIX 在 replace 后还必须
+`fsync` 父目录，使目录项在掉电后具备持久性；Windows 没有可移植的目录
+`fsync`，只承诺 `os.replace` 的进程崩溃原子性，不宣称覆盖断电持久性。
 
 成功的 `exclude_listed` run 还保存经过 canonical 校验的
 `train_exclusions.json`；source path 只留在 launch audit 中。默认 `fail`
@@ -1423,9 +1437,12 @@ run metadata 记录：
 `last.pt` 和诊断信息。该 checkpoint 只是恢复点，不是自动修复：操作者必须先
 定位数据、数值或环境原因，原 training contract 不允许通过 resume 偷换参数。
 
-run 目录创建后发生的任何失败都必须把 `run.json.status` 原子更新为 `failed`，
-记录阶段、异常类型和结构化上下文；创建前失败只向调用者返回错误。失败记录
-不得删除既有 committed checkpoint 或伪造 summary 为成功。
+新训练已创建 run 且进入会改变 run 状态的阶段后，或已授权 resume 开始
+sidecar repair/training/finalization 后发生的失败，必须把
+`run.json.status` 原子更新为 `failed`，记录阶段、异常类型和结构化上下文。
+创建前失败只向调用者返回错误；resume 的只读授权拒绝按 §12.3 记录 rejection，
+不能改写既有终态。失败记录不得删除既有 committed checkpoint 或伪造 summary
+为成功。
 
 错误信息必须给出具体字段、样本 id 或 checkpoint 字段，不能只返回底层
 reshape、`KeyError` 或 `FileNotFoundError`。
@@ -1519,7 +1536,8 @@ backbone，公开与真实 backbone 相同的最小 config 和输出接口。
 - `sha256_epoch_order_v1` 对相同 seed/epoch/sample ids 产生稳定全排列，不受
   manifest 输入顺序影响。
 - augmentation contract 不从 `to_dict()` 生成；每个声明字段等于构造后实际
-  属性，所有 leaf 的 tiny-image probe 无 warning 或隐式修正。
+  属性，所有 leaf 的 tiny-image probe 无行为 warning 或隐式修正；无关依赖
+  发出的 deprecation warning 不阻断 preflight。
 - Gaussian blur 只存在显式 `[3,3]`/`[5,5]` leaf，二者等权；MotionBlur 的
   构造前后范围均为 `[3,5]`。任何 `(3,4)` blur 声明在 preflight 失败。
 - 单独的 slow contract test 使用 8-12 个 `24x40` RGB fixture；启用
@@ -1540,7 +1558,8 @@ backbone，公开与真实 backbone 相同的最小 config 和输出接口。
 - exact-grid 的 position embedding 结果与
   `bicubic, align_corners=false, antialias=false` reference 一致；其他隐式
   行为在 preflight 失败。
-- linear probe 只冻结 backbone。
+- linear probe 只冻结 backbone，外层模型进入 train mode 时冻结 backbone
+  仍固定为 eval mode；该行为进入 training contract。
 - LoRA 只有 adapter 和 task head 可训练。
 - 两种几何的非匹配 token count 均产生描述性错误。
 - 不同 backbone image size 不依赖 `64` 或 `1024`。
@@ -1586,6 +1605,9 @@ backbone，公开与真实 backbone 相同的最小 config 和输出接口。
 - `max_epochs` 只能增大；package patch/device 漂移必须显式
   `--allow_env_drift` 并留下审计记录；worker 数只记录，major.minor 漂移
   仍失败。
+- 未授权的环境/contract resume 在任何 sidecar repair 前失败；保持既有
+  status、failure、metrics、checkpoint、test 和 summary，只追加
+  `resume_rejections`。ruff/pytest 等非训练依赖变化不构成漂移。
 - v2 loader 无条件拒绝 legacy state dict。
 - summary 中的 checkpoint 文件 hash 与实际文件一致。
 
@@ -1619,7 +1641,7 @@ backbone，公开与真实 backbone 相同的最小 config 和输出接口。
    字面量，位置编码插值经过 reference 校验。
 8. 完整 run artifact bundle 配合同内容数据和 approved base
    revision/weight SHA，能在 epoch 边界从 last 恢复训练，并允许只增大
-   `max_epochs`。
+   `max_epochs`；未授权 resume 不修复 sidecar、不改写既有终态。
 9. v2 loader 明确拒绝 legacy checkpoint。
 10. 全量 CER、可行子集 CER、可行 validation loss 和容量统计同时落盘。
 11. README、CLI help 和实际参数语义一致。

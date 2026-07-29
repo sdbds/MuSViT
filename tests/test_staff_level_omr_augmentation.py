@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 import torch
 
+from experiments.staff_level_omr.protocol import augmentation as augmentation_module
 from experiments.staff_level_omr.protocol.augmentation import (
     STAFF_OMR_TRAIN_V1,
     augmentation_contract,
@@ -299,6 +300,28 @@ def test_preflight_probes_actual_kernels_and_full_256_bit_seed():
     assert report["contract_sha256"] == canonical_sha256(
         augmentation_contract(STAFF_OMR_TRAIN_V1)
     )
+
+
+def test_preflight_ignores_unrelated_deprecation_warnings(monkeypatch):
+    original_probe = augmentation_module._probe_full_seed_support
+
+    def probe_with_dependency_warning():
+        warnings.warn(
+            "unrelated dependency deprecation",
+            DeprecationWarning,
+            stacklevel=1,
+        )
+        return original_probe()
+
+    monkeypatch.setattr(
+        augmentation_module,
+        "_probe_full_seed_support",
+        probe_with_dependency_warning,
+    )
+
+    report = preflight_augmentation(STAFF_OMR_TRAIN_V1)
+
+    assert report["status"] == "passed"
 
 
 def test_preflight_rejects_even_blur_declaration():

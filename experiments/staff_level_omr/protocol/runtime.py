@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib.metadata
 import math
 import platform
 import re
@@ -22,7 +21,7 @@ import torch
 import torchvision
 import transformers
 
-from .artifacts import RunArtifacts, file_sha256
+from .artifacts import RUN_DOCUMENT_SCHEMA, RunArtifacts, file_sha256
 from .augmentation import preflight_augmentation
 from .backbone import (
     BackboneInspection,
@@ -72,7 +71,7 @@ from .optimization import build_optimizer
 from .seeding import reset_epoch_rng, reset_initialization_rng
 
 
-RUN_SCHEMA = "staff_omr_run_v2"
+RUN_SCHEMA = RUN_DOCUMENT_SCHEMA
 SUMMARY_SCHEMA = "staff_omr_summary_v2"
 TEST_SCHEMA = "staff_omr_test_v2"
 CORE_PACKAGES = (
@@ -100,23 +99,16 @@ RESUME_MUTABLE_LAUNCH_FIELDS = frozenset(
 
 
 def collect_package_versions() -> dict[str, str]:
-    versions: dict[str, str] = {}
-    for distribution in importlib.metadata.distributions():
-        name = distribution.metadata.get("Name")
-        if isinstance(name, str) and name:
-            versions[name.lower().replace("_", "-")] = distribution.version
-    versions.update(
-        {
-            "python": platform.python_version(),
-            "torch": torch.__version__,
-            "torchvision": torchvision.__version__,
-            "transformers": transformers.__version__,
-            "peft": peft.__version__,
-            "numpy": numpy.__version__,
-            "albumentations": albumentations.__version__,
-            "opencv": cv2.__version__,
-        }
-    )
+    versions = {
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "torchvision": torchvision.__version__,
+        "transformers": transformers.__version__,
+        "peft": peft.__version__,
+        "numpy": numpy.__version__,
+        "albumentations": albumentations.__version__,
+        "opencv": cv2.__version__,
+    }
     return dict(sorted(versions.items(), key=lambda item: item[0].encode("utf-8")))
 
 
@@ -137,11 +129,25 @@ def collect_git_metadata() -> dict[str, object]:
             capture_output=True,
             text=True,
         ).stdout
-    except (OSError, subprocess.CalledProcessError) as exc:
-        raise ProtocolError("cannot collect git provenance") from exc
+    except OSError:
+        return {
+            "available": False,
+            "commit": None,
+            "dirty": None,
+            "reason": "git_unavailable",
+        }
+    except subprocess.CalledProcessError:
+        return {
+            "available": False,
+            "commit": None,
+            "dirty": None,
+            "reason": "not_a_git_checkout",
+        }
     return {
+        "available": True,
         "commit": commit,
         "dirty": bool(status),
+        "reason": None,
     }
 
 
@@ -231,6 +237,7 @@ class PreparedRuntime:
     runtime_environment: dict[str, object]
     package_versions: dict[str, str]
     reproducibility_status: str
+    model_preflight: dict[str, object]
 
 
 def _utc_text(value: datetime) -> str:
@@ -290,6 +297,7 @@ def _initial_run_document(
         "current_launch_config_sha256": contracts.launch_config_sha256,
         "launch_history": [launch_event],
         "resume_history": [],
+        "resume_rejections": [],
         "dataset": {
             "dataset_id": bundle.dataset_id,
             "source_dataset_bundle_path": str(config.dataset_bundle_path),
@@ -322,6 +330,13 @@ def _initial_run_document(
         "git": git_metadata,
         "runtime_environment": None,
         "reproducibility_status": "exact",
+        "model_preflight": None,
+        "trainable_parameters": None,
+        "early_stopping_state": {
+            "bad_epochs": 0,
+            "evaluations": 0,
+        },
+        "summary_sha256": None,
         "failure": None,
     }
 
@@ -343,6 +358,28 @@ def _record_failure(
                 "type": type(error).__name__,
                 "message": str(error),
             },
+        )
+    except Exception:
+        pass
+
+
+def _record_resume_rejection(
+    artifacts: RunArtifacts,
+    *,
+    stage: str,
+    error: BaseException,
+    dependencies: RuntimeDependencies,
+) -> None:
+    try:
+        artifacts.append_resume_rejection(
+            {
+                "timestamp": _utc_text(dependencies.now_factory()),
+                "stage": stage,
+                "error": {
+                    "type": type(error).__name__,
+                    "message": str(error),
+                },
+            }
         )
     except Exception:
         pass
@@ -544,32 +581,6 @@ def _prepare_after_preflight(
         config=config,
         package_versions=package_versions,
     )
-    trainable_names = [
-        name
-        for name, parameter in model.named_parameters()
-        if parameter.requires_grad
-    ]
-    artifacts.update_run(
-        status="running",
-        stage="training",
-        updated_at=_utc_text(dependencies.now_factory()),
-        runtime_environment=environment,
-        model_preflight=model_preflight,
-        base_model_registry_evidence=static.base_model_registry_evidence,
-        trainable_parameters={
-            "count": sum(
-                parameter.numel()
-                for parameter in model.parameters()
-                if parameter.requires_grad
-            ),
-            "names": sorted(
-                trainable_names,
-                key=lambda value: value.encode("utf-8"),
-            ),
-        },
-        reproducibility_status=reproducibility_status,
-        failure=None,
-    )
     return PreparedRuntime(
         config=config,
         artifacts=artifacts,
@@ -588,6 +599,41 @@ def _prepare_after_preflight(
         runtime_environment=environment,
         package_versions=package_versions,
         reproducibility_status=reproducibility_status,
+        model_preflight=model_preflight,
+    )
+
+
+def _activate_prepared_runtime(
+    prepared: PreparedRuntime,
+    dependencies: RuntimeDependencies,
+) -> None:
+    trainable_names = [
+        name
+        for name, parameter in prepared.model.named_parameters()
+        if parameter.requires_grad
+    ]
+    prepared.artifacts.update_run(
+        status="running",
+        stage="training",
+        updated_at=_utc_text(dependencies.now_factory()),
+        runtime_environment=prepared.runtime_environment,
+        model_preflight=prepared.model_preflight,
+        base_model_registry_evidence=(
+            prepared.checkpoint_static.base_model_registry_evidence
+        ),
+        trainable_parameters={
+            "count": sum(
+                parameter.numel()
+                for parameter in prepared.model.parameters()
+                if parameter.requires_grad
+            ),
+            "names": sorted(
+                trainable_names,
+                key=lambda value: value.encode("utf-8"),
+            ),
+        },
+        reproducibility_status=prepared.reproducibility_status,
+        failure=None,
     )
 
 
@@ -1095,6 +1141,7 @@ def train(
             initial_launch_config=contracts.launch_config,
             reproducibility_status="exact",
         )
+        _activate_prepared_runtime(prepared, deps)
         stage = "training"
         state = _run_epochs(prepared, TrainingState(), deps)
         stage = "finalization"
@@ -1153,19 +1200,6 @@ def _environment_differences(
                     "saved": saved[name],
                     "current": current[name],
                     "reason": "patch_or_build",
-                }
-            )
-    for name in sorted(
-        (set(saved) | set(current)) - set(CORE_PACKAGES),
-        key=lambda value: value.encode("utf-8"),
-    ):
-        if saved.get(name) != current.get(name):
-            soft.append(
-                {
-                    "field": name,
-                    "saved": saved.get(name),
-                    "current": current.get(name),
-                    "reason": "non_core_package",
                 }
             )
     return hard, soft
@@ -1352,6 +1386,8 @@ def _validate_resume_run_document(
         raise ProtocolError("run.json launch_history must be an array")
     if not isinstance(run_document.get("resume_history"), list):
         raise ProtocolError("run.json resume_history must be an array")
+    if not isinstance(run_document.get("resume_rejections"), list):
+        raise ProtocolError("run.json resume_rejections must be an array")
 
 
 def _resume_config(
@@ -1440,6 +1476,8 @@ def resume(
     deps = dependencies or RuntimeDependencies.production()
     artifacts = RunArtifacts.from_existing(run_dir)
     stage = "resume_validation"
+    identity_validated = False
+    mutation_started = False
     try:
         last = load_checkpoint(
             artifacts.last_checkpoint,
@@ -1453,8 +1491,7 @@ def resume(
             last,
             run_dir=artifacts.run_dir,
         )
-        _repair_epoch_sidecars(artifacts, last)
-        run_document = artifacts.load_run()
+        identity_validated = True
         config, previous_launch, old_max = _resume_config(
             run_dir=artifacts.run_dir,
             run_document=run_document,
@@ -1550,9 +1587,9 @@ def resume(
             resolved_device=resolved_device,
             runtime_environment=current_environment,
         )
+        stage = "checkpoint_validation"
         validate_resume_checkpoint(
             last,
-            run_dir=artifacts.run_dir,
             expected_training_contract_sha256=(
                 contracts.training_contract_sha256
             ),
@@ -1569,6 +1606,10 @@ def resume(
             optimizer=prepared.optimizer,
             optimizer_parameter_names=prepared.optimizer_parameter_names,
         )
+        stage = "resume_repair"
+        mutation_started = True
+        _repair_epoch_sidecars(artifacts, last)
+        _activate_prepared_runtime(prepared, deps)
         launch = contracts.launch_config
         launch_hash = contracts.launch_config_sha256
         timestamp = _utc_text(deps.now_factory())
@@ -1650,10 +1691,18 @@ def resume(
         _finalize(prepared, state, deps)
         return artifacts.run_dir
     except Exception as exc:
-        _record_failure(
-            artifacts,
-            stage=stage,
-            error=exc,
-            dependencies=deps,
-        )
+        if mutation_started:
+            _record_failure(
+                artifacts,
+                stage=stage,
+                error=exc,
+                dependencies=deps,
+            )
+        elif identity_validated:
+            _record_resume_rejection(
+                artifacts,
+                stage=stage,
+                error=exc,
+                dependencies=deps,
+            )
         raise

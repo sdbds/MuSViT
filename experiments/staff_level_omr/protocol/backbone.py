@@ -6,7 +6,7 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Protocol
 
 from transformers import ViTModel
 
@@ -48,6 +48,19 @@ class BackboneRegistryEntry:
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
+
+
+class BackboneIdentity(Protocol):
+    model_id: str
+    revision: str
+    prefix_tokens: int
+
+
+@dataclass(frozen=True, slots=True)
+class _LoadedBackboneIdentity:
+    model_id: str
+    revision: str
+    prefix_tokens: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,7 +215,7 @@ def _dimension_pair(value: object, field: str) -> tuple[int, int]:
 
 def metadata_from_raw_config(
     raw_config: dict[str, object],
-    entry: BackboneRegistryEntry | Any,
+    entry: BackboneIdentity,
 ) -> BackboneMetadata:
     """Validate reviewed ViT-MAE config data without loading model weights."""
     if not isinstance(raw_config, dict):
@@ -397,15 +410,11 @@ def validate_loading_info(loading_info: dict[str, object]) -> None:
 
 
 def _loaded_metadata(model: ViTModel, expected: BackboneMetadata) -> BackboneMetadata:
-    entry = type(
-        "_LoadedEntry",
-        (),
-        {
-            "model_id": expected.model_id,
-            "revision": expected.revision,
-            "prefix_tokens": expected.prefix_tokens,
-        },
-    )()
+    entry = _LoadedBackboneIdentity(
+        model_id=expected.model_id,
+        revision=expected.revision,
+        prefix_tokens=expected.prefix_tokens,
+    )
     raw_config = {
         "model_type": model.config.model_type,
         "architectures": model.config.architectures,
