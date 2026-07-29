@@ -15,6 +15,12 @@ import torch
 from . import _globals
 from .config.ExperimentConfigWrapper import ExperimentConfig, experiment_config_from_dict
 from .data import SyntheticGrandStaffDataset, CLFinetuningDataset, SynthRealFinetuningDataset
+from .pdmx_data import (
+    PDMXConsumptionAuditCallback,
+    PDMXPretrainingDataModule,
+    PDMXVirtualEpochCallback,
+)
+from .migrate_vocabulary_checkpoint import load_vocabulary_aware_weights
 from .smt_foundation import SMTFoundationConfig, SMTFoundationModelForCausalLM
 from .optimization import (
     AdamWWSDConfig,
@@ -37,6 +43,7 @@ DATASETS_TYPE = {
     "CL": CLFinetuningDataset,
     "SR": SynthRealFinetuningDataset,
     "CL1": SyntheticGrandStaffDataset,
+    "PDMX": PDMXPretrainingDataModule,
     "R": None
 }
 
@@ -105,6 +112,23 @@ def _validate_canonical_protocol_contract(
         )
 
 
+def _validate_data_regime_contract(
+        data,
+        *,
+        protocol_version: str,
+        validation_every_n_epochs: int) -> None:
+    if getattr(data, "stream_resume_mode", None) != "virtual_epoch_boundary":
+        return
+    if validation_every_n_epochs != 1:
+        raise ValueError(
+            "virtual-epoch streaming requires validation_every_n_epochs=1"
+        )
+    if protocol_version == PROTOCOL_VERSION:
+        raise ValueError(
+            "virtual-epoch streaming requires a distinct protocol_version"
+        )
+
+
 def _validate_max_steps(value: int, *, train: bool) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError("max_steps must be an integer")
@@ -141,10 +165,65 @@ def _validate_checkpoint_sources(from_checkpoint, starting_weights):
     return tuple(normalized)
 
 
+def _validate_source_vocab_manifest(
+    starting_weights,
+    source_vocab_manifest,
+) -> str | None:
+    if source_vocab_manifest is None or (
+        isinstance(source_vocab_manifest, str)
+        and not source_vocab_manifest.strip()
+    ):
+        return None
+    if not isinstance(source_vocab_manifest, str):
+        raise TypeError("source_vocab_manifest must be a path string or None")
+    if starting_weights is None:
+        raise ValueError(
+            "source_vocab_manifest is valid only with starting_weights"
+        )
+    return source_vocab_manifest
+
+
 def _validate_non_negative_integer(value, field_name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{field_name} must be a non-negative integer")
     return value
+
+
+def _validate_stream_resume_boundary(
+    *,
+    samples_seen: int,
+    steps_per_epoch: int,
+    mode: str,
+) -> None:
+    if mode != "virtual_epoch_boundary":
+        raise ValueError(f"unsupported stream resume mode: {mode!r}")
+    samples_seen = _validate_non_negative_integer(
+        samples_seen,
+        "stream samples_seen",
+    )
+    if (
+        isinstance(steps_per_epoch, bool)
+        or not isinstance(steps_per_epoch, int)
+        or steps_per_epoch < 1
+    ):
+        raise ValueError("stream steps_per_epoch must be a positive integer")
+    if samples_seen % steps_per_epoch != 0:
+        raise ValueError(
+            "PDMX full resume requires a virtual epoch boundary: "
+            f"samples_seen={samples_seen}, steps_per_epoch={steps_per_epoch}"
+        )
+
+
+def _data_protocol_metadata(data) -> dict:
+    provider = getattr(data, "protocol_metadata", None)
+    if provider is None:
+        return {}
+    if not callable(provider):
+        raise TypeError("data protocol_metadata must be callable")
+    metadata = provider()
+    if not isinstance(metadata, dict):
+        raise TypeError("data protocol_metadata() must return a dictionary")
+    return copy.deepcopy(metadata)
 
 
 def _validate_protocol_version(value: str) -> str:
@@ -236,8 +315,15 @@ def _validate_run_contract(*, config, from_checkpoint, starting_weights,
                            source_checkpoint_sha256: str | None = None,
                            expected_protocol_snapshot: dict | None = None,
                            expected_model=None,
-                           optimizer_config: AdamWWSDConfig | None = None):
+                           optimizer_config: AdamWWSDConfig | None = None,
+                           vocabulary_migration: bool = False):
     protocol_version = _validate_protocol_version(protocol_version)
+    if not isinstance(vocabulary_migration, bool):
+        raise TypeError("vocabulary_migration must be a boolean")
+    if vocabulary_migration and starting_weights is None:
+        raise ValueError(
+            "vocabulary_migration is valid only with starting_weights"
+        )
     if from_checkpoint is not None:
         if source_curriculum_step is not None or source_checkpoint_sha256 is not None:
             raise ValueError(
@@ -320,7 +406,15 @@ def _validate_run_contract(*, config, from_checkpoint, starting_weights,
             raise ValueError(
                 "a weights-only experiment fork must use its own protocol_version"
             )
-        if config.data.skip_steps != source_curriculum_step:
+        if vocabulary_migration and config.data.skip_steps != 0:
+            raise ValueError(
+                "vocabulary migration starts a new run and requires "
+                "config data.skip_steps=0"
+            )
+        if (
+            not vocabulary_migration
+            and config.data.skip_steps != source_curriculum_step
+        ):
             raise ValueError(
                 "config data.skip_steps must equal source_curriculum_step: "
                 f"{config.data.skip_steps} != {source_curriculum_step}"
@@ -428,7 +522,8 @@ def _build_protocol_snapshot(*, max_steps, validation_every_n_epochs,
                              tokenization_mode, num_workers,
                              checkpoint_every_n_epochs, optimizer_metadata,
                              foundation_architecture=None,
-                             foundation_weights=None):
+                             foundation_weights=None,
+                             data_protocol=None):
     required_optimizer_fields = {
         "optimizer",
         "optimizer_implementation",
@@ -461,6 +556,18 @@ def _build_protocol_snapshot(*, max_steps, validation_every_n_epochs,
         expected_validation_count = max_steps // (
             expected_training_batches_per_epoch * validation_every_n_epochs
         )
+    if data_protocol is None:
+        data_protocol = {}
+    if not isinstance(data_protocol, dict):
+        raise TypeError("data_protocol must be a dictionary")
+    data_snapshot = {"num_workers": num_workers}
+    collisions = set(data_snapshot) & set(data_protocol)
+    if collisions:
+        raise ValueError(
+            f"data protocol metadata collides with base fields: {sorted(collisions)}"
+        )
+    data_snapshot.update(copy.deepcopy(data_protocol))
+
     snapshot = {
         "protocol_version": protocol_version,
         "optimizer": {
@@ -522,9 +629,7 @@ def _build_protocol_snapshot(*, max_steps, validation_every_n_epochs,
             "finetuning_technique": finetuning_technique,
             "attention_backend": attention_backend,
         },
-        "data": {
-            "num_workers": num_workers,
-        },
+        "data": data_snapshot,
         "checkpointing": {
             "every_n_epochs": checkpoint_every_n_epochs,
             "metric_save_top_k": 2,
@@ -553,7 +658,8 @@ def _build_protocol_metadata(*, max_steps, validation_every_n_epochs,
                              trainer_max_steps=None,
                              train=True,
                              foundation_architecture=None,
-                             foundation_weights=None):
+                             foundation_weights=None,
+                             data_protocol=None):
     if from_checkpoint is not None:
         checkpoint_source = from_checkpoint
         checkpoint_load_mode = "full" if train else "evaluation_weights_only"
@@ -612,6 +718,17 @@ def _build_protocol_metadata(*, max_steps, validation_every_n_epochs,
         "batch_size": batch_size,
         "accumulate_grad_batches": ACCUMULATE_GRAD_BATCHES,
     }
+    if data_protocol is None:
+        data_protocol = {}
+    if not isinstance(data_protocol, dict):
+        raise TypeError("data_protocol must be a dictionary")
+    data_collisions = set(metadata) & set(data_protocol)
+    if data_collisions:
+        raise ValueError(
+            "data protocol metadata collides with run metadata: "
+            f"{sorted(data_collisions)}"
+        )
+    metadata.update(copy.deepcopy(data_protocol))
     if optimizer_metadata is None:
         raise ValueError("optimizer_metadata is required for complete protocol metadata")
     collisions = set(metadata) & set(optimizer_metadata)
@@ -640,6 +757,7 @@ def _build_protocol_metadata(*, max_steps, validation_every_n_epochs,
         optimizer_metadata=optimizer_metadata,
         foundation_architecture=foundation_architecture,
         foundation_weights=foundation_weights,
+        data_protocol=data_protocol,
     )
     return metadata
 
@@ -818,6 +936,43 @@ def _run_test(trainer, model_wrapper, data, checkpoint_path):
         raise
 
 
+def _run_test_if_available(
+    trainer,
+    model_wrapper,
+    data,
+    checkpoint_path,
+) -> bool:
+    if getattr(data, "has_test_split", True) is False:
+        logger.info("Skipping test: data module explicitly declares no test split")
+        return False
+    _run_test(trainer, model_wrapper, data, checkpoint_path)
+    return True
+
+
+def _data_callbacks(data, run_instance_directory: str | Path) -> list[Callback]:
+    if not callable(getattr(data, "set_train_epoch", None)):
+        return []
+    callbacks: list[Callback] = [PDMXVirtualEpochCallback()]
+    data_protocol = _data_protocol_metadata(data)
+    if data_protocol.get("stream_resume_mode") == "virtual_epoch_boundary":
+        callbacks.append(
+            PDMXConsumptionAuditCallback(run_instance_directory)
+        )
+    return callbacks
+
+
+def _target_vocab_manifest_path(data) -> Path:
+    explicit = getattr(data, "vocab_manifest_path", None)
+    if explicit is not None:
+        return Path(explicit)
+    vocab_name = getattr(data, "vocab_name", None)
+    if not isinstance(vocab_name, str) or not vocab_name:
+        raise ValueError(
+            "vocabulary migration requires a target vocabulary manifest"
+        )
+    return Path(__file__).resolve().parent / "vocab" / f"{vocab_name}.json"
+
+
 def main(config: ExperimentConfig, experiment_name,
          foundation_architecture="ViTMAEBase", foundation_weights="carlospm12/LSMT-MAE-Base-1024-16",
          finetuning_technique="CL", from_checkpoint: str | None = None, resolution: int | None = None,
@@ -833,7 +988,8 @@ def main(config: ExperimentConfig, experiment_name,
          validation_every_n_epochs: int = 2_000,
          protocol_version: str = PROTOCOL_VERSION,
          source_curriculum_step: int | None = None,
-         source_checkpoint_sha256: str | None = None):
+         source_checkpoint_sha256: str | None = None,
+         source_vocab_manifest: str | None = None):
     checkpoint_every_n_epochs = _validate_checkpoint_every_n_epochs(checkpoint_every_n_epochs)
     validation_every_n_epochs = _validate_validation_every_n_epochs(
         validation_every_n_epochs
@@ -870,6 +1026,10 @@ def main(config: ExperimentConfig, experiment_name,
         from_checkpoint,
         starting_weights,
     )
+    source_vocab_manifest = _validate_source_vocab_manifest(
+        starting_weights,
+        source_vocab_manifest,
+    )
     if resolution is None:
         _globals.resolution = 1024
     else:
@@ -882,6 +1042,12 @@ def main(config: ExperimentConfig, experiment_name,
     logger.info(f"Using {finetuning_technique} technique, implementing {DATASETS_TYPE[finetuning_technique]}")
 
     data = DATASETS_TYPE[finetuning_technique](config)
+    _validate_data_regime_contract(
+        data,
+        protocol_version=protocol_version,
+        validation_every_n_epochs=validation_every_n_epochs,
+    )
+    data_protocol = _data_protocol_metadata(data)
     encoder_unfreeze_step = data.encoder_unfreeze_step
     curriculum_step_offset = data.curriculum_step_offset
     print("data_module_type:", type(data))
@@ -948,6 +1114,7 @@ def main(config: ExperimentConfig, experiment_name,
         train=train,
         foundation_architecture=foundation_architecture,
         foundation_weights=foundation_weights,
+        data_protocol=data_protocol,
     )
     protocol_snapshot = protocol_metadata["protocol_snapshot"]
     checkpoint_state = _validate_run_contract(
@@ -962,7 +1129,22 @@ def main(config: ExperimentConfig, experiment_name,
         expected_protocol_snapshot=protocol_snapshot,
         expected_model=model,
         optimizer_config=optimizer_config,
+        vocabulary_migration=source_vocab_manifest is not None,
     )
+    if (
+        checkpoint_state is not None
+        and from_checkpoint is not None
+        and train
+        and data_protocol.get("stream_resume_mode") is not None
+    ):
+        _validate_stream_resume_boundary(
+            samples_seen=(
+                checkpoint_state.curriculum_step
+                - checkpoint_state.curriculum_step_offset
+            ),
+            steps_per_epoch=data_protocol.get("steps_per_epoch"),
+            mode=data_protocol["stream_resume_mode"],
+        )
     if checkpoint_state is not None:
         protocol_metadata.update({
             "checkpoint_source": checkpoint_state.path,
@@ -978,6 +1160,13 @@ def main(config: ExperimentConfig, experiment_name,
             ),
         })
 
+    run_record_id = uuid.uuid4().hex
+    run_record_root = Path("logs") / "run_instances" / run_record_id
+    run_instance_directory = (
+        run_record_root / experiment_name / protocol_version
+    )
+    protocol_metadata["run_record_id"] = run_record_id
+
     optimizer_wrapper_kwargs = {
         "run_protocol_version": protocol_version,
         "optimizer_protocol": optimizer_config.protocol,
@@ -992,7 +1181,7 @@ def main(config: ExperimentConfig, experiment_name,
         "wsd_min_lr_ratio": optimizer_config.min_lr_ratio,
         "protocol_snapshot": protocol_snapshot,
     }
-    if starting_weights is None:
+    if starting_weights is None or source_vocab_manifest is not None:
         model_wrapper = SMTPP_Trainer(
             smt_config,
             model,
@@ -1003,6 +1192,26 @@ def main(config: ExperimentConfig, experiment_name,
             accumulate_grad_batches=ACCUMULATE_GRAD_BATCHES,
             **optimizer_wrapper_kwargs,
         )
+        if source_vocab_manifest is not None:
+            migration_report_path = (
+                run_instance_directory / "vocabulary_migration.json"
+            )
+            migration_report = load_vocabulary_aware_weights(
+                model_wrapper,
+                starting_weights,
+                source_vocab_manifest=source_vocab_manifest,
+                target_vocab_manifest=_target_vocab_manifest_path(data),
+                report_path=migration_report_path,
+            )
+            protocol_metadata.update(
+                {
+                    "source_vocab_manifest": source_vocab_manifest,
+                    "vocabulary_migration_report_path": str(
+                        migration_report_path.resolve()
+                    ),
+                    "vocabulary_migration": migration_report,
+                }
+            )
     else:
         model_wrapper = SMTPP_Trainer.load_from_checkpoint(
             starting_weights,
@@ -1030,9 +1239,6 @@ def main(config: ExperimentConfig, experiment_name,
         finetuning_technique,
     )
 
-    run_record_id = uuid.uuid4().hex
-    run_record_root = Path("logs") / "run_instances" / run_record_id
-    protocol_metadata["run_record_id"] = run_record_id
     resize_audit_path = _write_resize_audit(
         data,
         experiment_name=experiment_name,
@@ -1048,6 +1254,13 @@ def main(config: ExperimentConfig, experiment_name,
         "archived" if resize_audit_path is not None else "not-applicable-synthetic-only"
     )
     trainer_callbacks = [epoch_checkpointer, checkpointer]
+    if train:
+        trainer_callbacks.extend(
+            _data_callbacks(
+                data,
+                run_record_root / experiment_name / protocol_version,
+            )
+        )
     if train and finetuning_technique == "CL" and resize_audit_path is not None:
         first_batch_audit_path = resize_audit_path.parent / "first_train_batch.json"
         trainer_callbacks.append(_FirstTrainBatchInputAudit(first_batch_audit_path))
@@ -1093,7 +1306,7 @@ def main(config: ExperimentConfig, experiment_name,
             finetuning_technique,
         )
 
-    _run_test(trainer, model_wrapper, data, from_checkpoint)
+    _run_test_if_available(trainer, model_wrapper, data, from_checkpoint)
 
 
 def launch(config_path: str, experiment_name: str,
@@ -1111,7 +1324,8 @@ def launch(config_path: str, experiment_name: str,
            validation_every_n_epochs: int = 2_000,
            protocol_version: str = PROTOCOL_VERSION,
            source_curriculum_step: int | None = None,
-           source_checkpoint_sha256: str | None = None):
+           source_checkpoint_sha256: str | None = None,
+           source_vocab_manifest: str | None = None):
     checkpoint_every_n_epochs = _validate_checkpoint_every_n_epochs(checkpoint_every_n_epochs)
     validation_every_n_epochs = _validate_validation_every_n_epochs(
         validation_every_n_epochs
@@ -1126,6 +1340,10 @@ def launch(config_path: str, experiment_name: str,
     from_checkpoint, starting_weights = _validate_checkpoint_sources(
         from_checkpoint,
         starting_weights,
+    )
+    source_vocab_manifest = _validate_source_vocab_manifest(
+        starting_weights,
+        source_vocab_manifest,
     )
     with open(config_path, 'r') as file:
         config_dict = json.load(file)
@@ -1145,7 +1363,8 @@ def launch(config_path: str, experiment_name: str,
          validation_every_n_epochs=validation_every_n_epochs,
          protocol_version=protocol_version,
          source_curriculum_step=source_curriculum_step,
-         source_checkpoint_sha256=source_checkpoint_sha256)
+         source_checkpoint_sha256=source_checkpoint_sha256,
+         source_vocab_manifest=source_vocab_manifest)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,11 @@ from lightning.pytorch.trainer.states import TrainerFn
 from experiments.full_page_omr import data, entrypoint, finetune
 from experiments.full_page_omr import smt_trainer
 from experiments.full_page_omr.optimization import optimizer_protocol_metadata
+from experiments.full_page_omr.pdmx_data import (
+    PDMXConsumptionAuditCallback,
+    PDMXPretrainingDataModule,
+    PDMXVirtualEpochCallback,
+)
 from experiments.full_page_omr.smt_trainer import SMTPP_Trainer
 
 
@@ -118,6 +123,151 @@ class _TinyModel(torch.nn.Module):
 
 
 class FullPageOMRCheckpointTests(unittest.TestCase):
+    def test_pdmx_regime_is_registered(self):
+        self.assertIs(
+            finetune.DATASETS_TYPE["PDMX"],
+            PDMXPretrainingDataModule,
+        )
+
+    def test_final_evaluation_skips_explicit_no_test_datamodule(self):
+        trainer = Mock()
+        data_module = SimpleNamespace(has_test_split=False)
+
+        ran = finetune._run_test_if_available(
+            trainer,
+            Mock(),
+            data_module,
+            "model.ckpt",
+        )
+
+        self.assertFalse(ran)
+        trainer.test.assert_not_called()
+
+    def test_final_evaluation_preserves_legacy_default(self):
+        trainer = Mock()
+
+        ran = finetune._run_test_if_available(
+            trainer,
+            Mock(),
+            object(),
+            "model.ckpt",
+        )
+
+        self.assertTrue(ran)
+        trainer.test.assert_called_once()
+
+    def test_data_protocol_metadata_is_forwarded_without_aliasing(self):
+        source = {
+            "dataset_revision": "fixed",
+            "vocab_sha256": "a" * 64,
+            "stream_resume_mode": "virtual_epoch_boundary",
+            "steps_per_epoch": 10_000,
+        }
+        data_module = SimpleNamespace(protocol_metadata=lambda: source)
+
+        metadata = finetune._data_protocol_metadata(data_module)
+        metadata["dataset_revision"] = "mutated"
+
+        self.assertEqual(source["dataset_revision"], "fixed")
+
+    def test_pdmx_protocol_is_embedded_in_checkpoint_snapshot(self):
+        data_protocol = {
+            "dataset_revision": "7" * 40,
+            "dataset_manifest_sha256": "a" * 64,
+            "vocab_size": 223,
+            "vocab_sha256": "b" * 64,
+            "stream_resume_mode": "virtual_epoch_boundary",
+            "steps_per_epoch": 10_000,
+        }
+
+        metadata = finetune._build_protocol_metadata(
+            max_steps=4_000_000,
+            validation_every_n_epochs=2_000,
+            from_checkpoint=None,
+            starting_weights=None,
+            encoder_training_mode="fine_tune",
+            encoder_unfreeze_step=0,
+            resolution=1024,
+            reduce_ratio=1.0,
+            batch_size=1,
+            expected_training_batches_per_epoch=10_000,
+            curriculum_steady_mixture_step=320_000,
+            finetuning_technique="PDMX",
+            attention_backend="auto",
+            tokenization_mode="bekern",
+            num_workers=2,
+            checkpoint_every_n_epochs=100,
+            optimizer_metadata=optimizer_protocol_metadata(
+                _TinyModel(),
+                finetune.AdamWWSDConfig(),
+            ),
+            data_protocol=data_protocol,
+        )
+
+        self.assertEqual(metadata["vocab_size"], 223)
+        self.assertEqual(
+            metadata["protocol_snapshot"]["data"]["vocab_sha256"],
+            "b" * 64,
+        )
+        self.assertEqual(
+            metadata["protocol_snapshot"]["data"]["stream_resume_mode"],
+            "virtual_epoch_boundary",
+        )
+
+    def test_pdmx_full_resume_requires_virtual_epoch_boundary(self):
+        with self.assertRaisesRegex(ValueError, "virtual epoch boundary"):
+            finetune._validate_stream_resume_boundary(
+                samples_seen=10_001,
+                steps_per_epoch=10_000,
+                mode="virtual_epoch_boundary",
+            )
+
+        finetune._validate_stream_resume_boundary(
+            samples_seen=20_000,
+            steps_per_epoch=10_000,
+            mode="virtual_epoch_boundary",
+        )
+
+    def test_pdmx_callbacks_are_capability_based(self):
+        data_module = SimpleNamespace(
+            set_train_epoch=Mock(),
+            protocol_metadata=lambda: {
+                "stream_resume_mode": "virtual_epoch_boundary"
+            },
+        )
+
+        callbacks = finetune._data_callbacks(
+            data_module,
+            Path("run-instance"),
+        )
+
+        self.assertEqual(len(callbacks), 2)
+        self.assertIsInstance(callbacks[0], PDMXVirtualEpochCallback)
+        self.assertIsInstance(callbacks[1], PDMXConsumptionAuditCallback)
+
+    def test_validation_step_accepts_optional_batch_metadata(self):
+        model = _TinyModel()
+        model.i2w = {0: "<bos>", 1: "4c", 2: "<eos>"}
+        model.maxlen = 8
+        model.generate_token_ids = Mock(
+            return_value=SimpleNamespace(token_ids=[0, 1, 2])
+        )
+        module = SMTPP_Trainer(
+            SimpleNamespace(padding_token=0),
+            model,
+            encoder_training_mode="linear_probe",
+        )
+        batch = (
+            torch.zeros(1, 3, 2, 2),
+            torch.tensor([[0, 1, 2]]),
+            torch.tensor([[0, 1, 2]]),
+            {"renderer": "verovio"},
+        )
+
+        module.validation_step(batch)
+
+        self.assertEqual(len(module.grtrs), 1)
+
     def test_public_entrypoint_forwards_checkpoint_interval_and_attention_backend(self):
         signature = inspect.signature(entrypoint.run)
         self.assertEqual(signature.parameters["checkpoint_every_n_epochs"].default, 100)
@@ -150,8 +300,10 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                 wsd_warmup_steps=20_000,
                 wsd_decay_steps=500_000,
                 protocol_version="full_page_omr_resize_v1",
+                starting_weights="weights.ckpt",
                 source_curriculum_step=282200,
                 source_checkpoint_sha256="a" * 64,
+                source_vocab_manifest="source-vocab.json",
             )
 
         self.assertEqual(launch.call_args.kwargs["checkpoint_every_n_epochs"], 37)
@@ -169,6 +321,10 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
         )
         self.assertEqual(launch.call_args.kwargs["source_curriculum_step"], 282200)
         self.assertEqual(launch.call_args.kwargs["source_checkpoint_sha256"], "a" * 64)
+        self.assertEqual(
+            launch.call_args.kwargs["source_vocab_manifest"],
+            "source-vocab.json",
+        )
 
     def test_launch_forwards_checkpoint_interval_to_main(self):
         config = {
@@ -197,8 +353,10 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                     wsd_warmup_steps=20_000,
                     wsd_decay_steps=500_000,
                     protocol_version="full_page_omr_resize_v1",
+                    starting_weights="weights.ckpt",
                     source_curriculum_step=282200,
                     source_checkpoint_sha256="a" * 64,
+                    source_vocab_manifest="source-vocab.json",
                 )
 
         self.assertEqual(main.call_args.kwargs["checkpoint_every_n_epochs"], 37)
@@ -216,6 +374,86 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
         )
         self.assertEqual(main.call_args.kwargs["source_curriculum_step"], 282200)
         self.assertEqual(main.call_args.kwargs["source_checkpoint_sha256"], "a" * 64)
+        self.assertEqual(
+            main.call_args.kwargs["source_vocab_manifest"],
+            "source-vocab.json",
+        )
+
+    def test_source_vocab_manifest_requires_starting_weights(self):
+        with self.assertRaisesRegex(ValueError, "starting_weights"):
+            finetune._validate_source_vocab_manifest(
+                None,
+                "source-vocab.json",
+            )
+        self.assertEqual(
+            finetune._validate_source_vocab_manifest(
+                "weights.ckpt",
+                "source-vocab.json",
+            ),
+            "source-vocab.json",
+        )
+
+    def test_main_uses_fresh_wrapper_for_vocabulary_migration(self):
+        class SizedDataset(SimpleNamespace):
+            def __len__(self):
+                return 83
+
+        data_module = SimpleNamespace(
+            train_dataset=SizedDataset(
+                w2i={"<pad>": 0},
+                i2w={0: "<pad>"},
+            ),
+            encoder_unfreeze_step=0,
+            curriculum_step_offset=0,
+            tokenization_mode="bekern",
+            batch_size=1,
+            num_workers=0,
+            vocab_manifest_path=Path("target-vocab.json"),
+        )
+        config = SimpleNamespace(
+            data=SimpleNamespace(skip_steps=0, reduce_ratio=1.0)
+        )
+        model = _TinyModel()
+        model.encoder.config = SimpleNamespace(patch_size=16)
+        wrapper = Mock()
+        trainer_class = Mock(return_value=wrapper)
+
+        with (
+            patch.object(finetune, "_validate_run_contract", return_value=None),
+            patch.dict(finetune.DATASETS_TYPE, {"CL": lambda _: data_module}),
+            patch.object(finetune, "set_up_processor"),
+            patch.object(finetune, "SMTFoundationConfig", return_value=object()),
+            patch.object(
+                finetune,
+                "SMTFoundationModelForCausalLM",
+                return_value=model,
+            ),
+            patch.object(finetune, "SMTPP_Trainer", trainer_class),
+            patch.object(
+                finetune,
+                "load_vocabulary_aware_weights",
+                side_effect=RuntimeError("migration captured"),
+            ) as migrate,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "migration captured"):
+                finetune.main(
+                    config,
+                    "migration-run",
+                    starting_weights="weights.ckpt",
+                    source_vocab_manifest="source-vocab.json",
+                    protocol_version="vocab-migration-v1",
+                )
+
+        trainer_class.assert_called_once()
+        trainer_class.load_from_checkpoint.assert_not_called()
+        self.assertEqual(
+            migrate.call_args.kwargs["source_vocab_manifest"],
+            "source-vocab.json",
+        )
+        self.assertEqual(
+            migrate.call_args.kwargs["target_vocab_manifest"],
+            Path("target-vocab.json"),
+        )
 
     def test_checkpoint_interval_must_be_a_positive_integer(self):
         for value in (0, -1, True, 1.5):
@@ -283,6 +521,39 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                 max_steps=4_000_001,
             ),
             validation_every_n_epochs=2_001,
+        )
+
+    def test_pdmx_stream_requires_validation_each_virtual_epoch(self):
+        pdmx_data = SimpleNamespace(
+            stream_resume_mode="virtual_epoch_boundary"
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "validation_every_n_epochs=1",
+        ):
+            finetune._validate_data_regime_contract(
+                pdmx_data,
+                protocol_version="full_page_omr_pdmx_v1",
+                validation_every_n_epochs=2_000,
+            )
+
+        with self.assertRaisesRegex(ValueError, "distinct protocol_version"):
+            finetune._validate_data_regime_contract(
+                pdmx_data,
+                protocol_version=finetune.PROTOCOL_VERSION,
+                validation_every_n_epochs=1,
+            )
+
+        finetune._validate_data_regime_contract(
+            pdmx_data,
+            protocol_version="full_page_omr_pdmx_v1",
+            validation_every_n_epochs=1,
+        )
+        finetune._validate_data_regime_contract(
+            SimpleNamespace(),
+            protocol_version=finetune.PROTOCOL_VERSION,
+            validation_every_n_epochs=2_000,
         )
 
     def test_canonical_protocol_allows_wsd_endpoint_and_decay_overrides(self):
@@ -813,6 +1084,25 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
             )
 
         self.assertIsNone(state.protocol_snapshot)
+
+    def test_vocabulary_migration_starts_target_curriculum_at_zero(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint = Path(tmpdir) / "legacy-weights.ckpt"
+            torch.save({"global_step": 40}, checkpoint)
+
+            state = finetune._validate_run_contract(
+                config=SimpleNamespace(data=SimpleNamespace(skip_steps=0)),
+                from_checkpoint=None,
+                starting_weights=str(checkpoint),
+                max_steps=4_000_000,
+                train=True,
+                protocol_version="vocabulary_migration_v1",
+                source_curriculum_step=40,
+                source_checkpoint_sha256=_sha256_file(checkpoint),
+                vocabulary_migration=True,
+            )
+
+        self.assertEqual(state.curriculum_step, 40)
 
     def test_full_resume_rejects_curriculum_offset_mismatch(self):
         model = _TinyModel()

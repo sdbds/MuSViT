@@ -126,6 +126,114 @@ uv run musvit full-page-omr \
 
 Checkpoints and W&B logs are written inside `experiments/full_page_omr/` (`weights/`, `wandb_logs/`).
 
+### Full-page OMR pretraining with PDMX renders
+
+The PDMX path uses the fixed
+`tobiashornbogen/page-omr-pdmx-renders` revision
+`7da3ae5237963e57a8fe1c6ee375b1f10af34a09`. The download is about 96 GB.
+`prepare` is the only command below that may use the network. Scanning,
+vocabulary construction, training, and the official-data smoke test require
+the pinned snapshot to be present locally.
+
+```bash
+# 1. Download the two Kern renderers and curated validation shard.
+uv run python -m experiments.full_page_omr.pdmx_manifest prepare
+
+# 2. Validate every record and freeze shard hashes and split statistics.
+uv run python -m experiments.full_page_omr.pdmx_manifest scan \
+  --output=experiments/full_page_omr/config/Page_OMR_PDMX/dataset-manifest.v1.json
+
+# 3. Preserve the Polish 215-token prefix, add the six existing project
+# compatibility tokens, then append PDMX train-only tokens.
+uv run python -m experiments.full_page_omr.pdmx_manifest build-vocabulary \
+  --dataset_manifest=experiments/full_page_omr/config/Page_OMR_PDMX/dataset-manifest.v1.json \
+  --output=experiments/full_page_omr/vocab/FullPageOMR_BeKern_v1.json
+```
+
+The last command also writes the compatibility pair
+`FullPageOMR_BeKern_v1w2i.npy` and `FullPageOMR_BeKern_v1i2w.npy`. Validation
+tokens never extend the vocabulary. Existing artifacts with different
+digests are rejected; use a new output name for a new vocabulary version.
+
+Run a short local smoke train with a noncanonical protocol name:
+
+```bash
+uv run musvit full-page-omr \
+  --config_path=experiments/full_page_omr/config/Page_OMR_PDMX/pretraining.json \
+  --experiment_name=pdmx_smoke \
+  --finetuning=PDMX \
+  --max_steps=100 \
+  --validation_every_n_epochs=1 \
+  --wsd_warmup_steps=10 \
+  --wsd_decay_steps=20 \
+  --protocol_version=page_omr_pdmx_smoke_v1
+```
+
+PDMX has a curated validation split and no test split. Training records that
+fact in the run protocol and skips final test evaluation. Full checkpoint
+resume is supported only at a 10,000-sample virtual-epoch boundary with the
+same worker topology. A weights-only start may occur at any point.
+
+Legacy Polish, Mozarteum, and FP GrandStaff source manifests are checked in
+next to their `.npy` pairs. They pin both NumPy file hashes. To create one for
+another legacy vocabulary:
+
+```bash
+uv run python -m experiments.full_page_omr.migrate_vocabulary_checkpoint \
+  convert-legacy \
+  --w2i_path=/path/to/Legacyw2i.npy \
+  --i2w_path=/path/to/Legacyi2w.npy \
+  --output_path=/path/to/Legacy.source-vocab.json \
+  --name=Legacy
+```
+
+Start PDMX from a legacy checkpoint by supplying its source manifest and
+checkpoint provenance. Replace the example step and SHA-256 with values from
+the checkpoint:
+
+```bash
+uv run musvit full-page-omr \
+  --config_path=experiments/full_page_omr/config/Page_OMR_PDMX/pretraining.json \
+  --experiment_name=pdmx_from_polish \
+  --finetuning=PDMX \
+  --validation_every_n_epochs=1 \
+  --starting_weights=/path/to/polish.ckpt \
+  --source_vocab_manifest=vocab/Polish_Scores_BeKern.source-vocab.json \
+  --source_curriculum_step=282200 \
+  --source_checkpoint_sha256=<64-hex-digest> \
+  --protocol_version=page_omr_pdmx_from_polish_v1
+```
+
+The migration copies embedding and output rows by token text, initializes new
+rows with the target model's normal initializer, and starts a new run at step
+zero. Optimizer, scheduler, and stream state are not imported.
+
+After PDMX pretraining, fine-tune on a real dataset while retaining the full
+vocabulary:
+
+```bash
+uv run musvit full-page-omr \
+  --config_path=experiments/full_page_omr/config/Polish_Scores/pdmx_finetuning.json \
+  --experiment_name=pdmx_polish \
+  --finetuning=CL \
+  --starting_weights=/path/to/pdmx.ckpt \
+  --source_vocab_manifest=vocab/FullPageOMR_BeKern_v1.json \
+  --source_curriculum_step=<checkpoint-samples-seen> \
+  --source_checkpoint_sha256=<64-hex-digest> \
+  --protocol_version=page_omr_pdmx_polish_v1
+```
+
+Use `config/Mozarteum/pdmx_finetuning.json` for Mozarteum. These are separate
+downstream runs, not an implicit three-dataset mixture.
+
+The regular test suite never downloads PDMX. The opt-in smoke test uses only
+the pinned local revision and skips with a preparation command when its
+artifacts are absent:
+
+```bash
+uv run pytest tests/test_full_page_omr_pdmx_data.py -m pdmx_official -rs
+```
+
 ### Staff-level OMR (fine-tuning)
 
 Prepare a deterministic, group-disjoint dataset bundle first:

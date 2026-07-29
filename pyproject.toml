@@ -40,6 +40,7 @@ dependencies = [
     "wand>=0.6.13",
     "wandb>=0.22.2",
     "wonderwords>=2.2.0",
+    "webdataset>=1.0.2",
 ]
 
 [project.scripts]
@@ -60,6 +61,7 @@ include = ["musvit", "experiments", "README.md", "pyproject.toml"]
 [tool.pytest.ini_options]
 markers = [
     "slow: deterministic multiprocessing contract tests",
+    "pdmx_official: opt-in smoke tests against the pinned local PDMX snapshot",
 ]
 
 [tool.uv]

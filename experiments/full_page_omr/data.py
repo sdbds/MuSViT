@@ -1,4 +1,3 @@
-import re
 import cv2
 import torch
 import random
@@ -6,9 +5,14 @@ import multiprocessing
 import numpy as np
 from dataclasses import dataclass
 from .config.ExperimentConfigWrapper import ExperimentConfig
+from .batching import batch_preparation_img2seq
 from .Generator.SynthGenerator import VerovioGenerator, SyntheticScoreGenerationError
 from .data_augmentation.data_augmentation import augment, convert_img_to_tensor
-from .tokenization import validate_tokenization_mode
+from .tokenization import (
+    clean_kern,
+    parse_kern_file,
+    validate_tokenization_mode,
+)
 from .utils.vocab_utils import check_and_retrieveVocabulary
 
 from datasets import load_dataset
@@ -104,44 +108,6 @@ def _retry_synthetic_sample(generate, max_attempts: int = 5):
             if attempt == max_attempts - 1:
                 raise
 
-def clean_kern(krn, avoid_tokens=['*tremolo','*staff2', '*staff1','*Xped', '*tremolo', '*ped', '*Xtuplet', '*tuplet', "*Xtremolo", '*cue', '*Xcue', '*rscale:1/2', '*rscale:1', '*kcancel', '*below']):
-    krn = krn.split('\n')
-    newkrn = []
-    # Remove the lines that contain the avoid tokens
-    for idx, line in enumerate(krn):
-        if not any([token in line.split('\t') for token in avoid_tokens]):
-            #If all the tokens of the line are not '*'
-            if not all([token == '*' for token in line.split('\t')]):
-                newkrn.append(line.replace("\n", ""))
-                
-    return "\n".join(newkrn)
-
-def parse_kern_file(krn: str, tokenization_mode='bekern') -> str:
-    tokenization_mode = validate_tokenization_mode(tokenization_mode)
-    krn = clean_kern(krn)
-    krn = krn.replace(" ", " <s> ")
-    krn = krn.replace("\t", " <t> ")
-    krn = krn.replace("\n", " <b> ")
-    krn = krn.replace(" /", "")
-    krn = krn.replace(" \\", "")
-    krn = krn.replace("·/", "")
-    krn = krn.replace("·\\", "")
-    
-    if tokenization_mode == "kern":
-        krn = krn.replace("·", "").replace('@', '')
-    
-    if tokenization_mode == "ekern":
-        krn = krn.replace("·", " ").replace('@', '')
-    
-    if tokenization_mode == "bekern":
-        krn = krn.replace("·", " ").replace("@", " ")
-        
-    krn = krn.split(" ")[4:-1]
-    krn = [re.sub(r'(?<=\=)\d+', '', token) for token in krn]
-    
-    return krn
-
-
 class _ArrowOMRSource:
     def __init__(self, dataset_ref: str, split: str, tokenization_mode: str,
                  reduce_ratio: float) -> None:
@@ -210,32 +176,6 @@ class _ArrowOMRSource:
         for transcription in self.rows["transcription"]:
             yield self._tokenize(transcription)
 
-
-def batch_preparation_img2seq(data):
-    if len(data) != 1:
-        raise ValueError(
-            f"full-page OMR collate requires batch_size=1; received {len(data)} samples"
-        )
-    images = [sample[0] for sample in data]
-    dec_in = [sample[1] for sample in data]
-    gt = [sample[2] for sample in data]
-    input_metadata = data[0][3] if len(data[0]) == 4 else None
-
-    X_train = images[0]
-    
-    max_length_seq = max([len(w) for w in gt])
-
-    decoder_input = torch.zeros(size=[len(dec_in),max_length_seq])
-    y = torch.zeros(size=[len(gt),max_length_seq])
-
-    for i, seq in enumerate(dec_in):
-        decoder_input[i, 0:len(seq)-1] = torch.from_numpy(np.asarray([char for char in seq[:-1]]))
-    
-    for i, seq in enumerate(gt):
-        y[i, 0:len(seq)-1] = torch.from_numpy(np.asarray([char for char in seq[1:]]))
-    
-    batch = (X_train, decoder_input.long(), y.long())
-    return (*batch, input_metadata) if input_metadata is not None else batch
 
 class OMRIMG2SEQDataset(Dataset):
     def __init__(self, teacher_forcing_perc=0.2, augment=False) -> None:

@@ -1,0 +1,10 @@
+{
+  "data": {
+    "data_path": "antoniorv6/mozarteum",
+    "batch_size": 1,
+    "vocab_name": "FullPageOMR_BeKern_v1",
+    "num_workers": 24,
+    "tokenization_mode": "bekern",
+    "reduce_ratio": 1.0
+  }
+}

@@ -42,13 +42,14 @@ def run(config_path: str, experiment_name: str,
         validation_every_n_epochs: int = 2_000,
         protocol_version: str = "full_page_omr_adamw_wsd_4m_v1",
         source_curriculum_step: int | None = None,
-        source_checkpoint_sha256: str | None = None):
+        source_checkpoint_sha256: str | None = None,
+        source_vocab_manifest: str | None = None):
     """Fine-tune MuSViT for full-page Optical Music Recognition.
 
     Args:
         config_path: JSON config (e.g. config/Polish_Scores/finetuning.json).
         experiment_name: Name used for checkpoints and the W&B run.
-        finetuning: Finetuning regime: "CL", "SR", "CL1" or "R".
+        finetuning: Finetuning regime: "CL", "SR", "CL1", "PDMX" or "R".
         See experiments/full_page_omr/finetune.py:launch for the rest.
     """
     config_path = _resolve_config(config_path)  # resolve before chdir
@@ -80,4 +81,5 @@ def run(config_path: str, experiment_name: str,
             protocol_version=protocol_version,
             source_curriculum_step=source_curriculum_step,
             source_checkpoint_sha256=source_checkpoint_sha256,
+            source_vocab_manifest=source_vocab_manifest,
         )
