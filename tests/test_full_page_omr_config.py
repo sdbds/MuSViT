@@ -1,5 +1,6 @@
 import json
 import unittest
+from pathlib import Path
 
 from experiments.full_page_omr.config.ExperimentConfigWrapper import (
     experiment_config_from_dict,
@@ -62,6 +63,30 @@ class FullPageOMRConfigTests(unittest.TestCase):
     def test_boolean_is_not_accepted_as_an_integer(self):
         with self.assertRaisesRegex(TypeError, "skip_steps"):
             experiment_config_from_dict(self._config(skip_steps=True))
+
+    def test_fp_grandstaff_config_uses_independent_dataset_and_vocab(self):
+        experiment_root = (
+            Path(__file__).resolve().parents[1] / "experiments" / "full_page_omr"
+        )
+        config_path = experiment_root / "config" / "FP_GrandStaff" / "finetuning.json"
+        config = experiment_config_from_dict(
+            json.loads(config_path.read_text(encoding="utf-8"))
+        )
+
+        self.assertEqual(config.data.data_path, "PRAIG/fp-grandstaff")
+        self.assertEqual(config.data.vocab_name, "FP_GrandStaff_BeKern")
+        self.assertEqual(config.data.tokenization_mode, "bekern")
+        self.assertEqual(config.data.batch_size, 1)
+        self.assertEqual(config.data.num_workers, 24)
+        self.assertEqual(config.data.reduce_ratio, 1.0)
+
+        vocab_root = experiment_root / "vocab"
+        self.assertTrue(
+            (vocab_root / f"{config.data.vocab_name}w2i.npy").is_file()
+        )
+        self.assertTrue(
+            (vocab_root / f"{config.data.vocab_name}i2w.npy").is_file()
+        )
 
 
 if __name__ == "__main__":

@@ -46,9 +46,6 @@ CHECKPOINT_MONITOR = "val_SER_v2"
 PRECISION = "16-mixed"
 ACCUMULATE_GRAD_BATCHES = 1
 MAX_EPOCHS = 100_000
-CANONICAL_VALIDATION_EVERY_N_EPOCHS = 2_000
-
-
 @dataclass(frozen=True)
 class CheckpointRunState:
     path: str
@@ -101,14 +98,9 @@ def _validate_canonical_protocol_contract(
         if field.name not in {"max_steps", "decay_steps", "min_lr_ratio"}
         if getattr(optimizer_config, field.name) != getattr(locked, field.name)
     }
-    if validation_every_n_epochs != CANONICAL_VALIDATION_EVERY_N_EPOCHS:
-        mismatches["validation_every_n_epochs"] = (
-            validation_every_n_epochs,
-            CANONICAL_VALIDATION_EVERY_N_EPOCHS,
-        )
     if mismatches:
         raise ValueError(
-            f"{PROTOCOL_VERSION} has locked non-schedule optimizer and validation values; "
+            f"{PROTOCOL_VERSION} has locked non-schedule optimizer values; "
             f"use a new protocol_version for overrides: {mismatches}"
         )
 

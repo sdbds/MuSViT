@@ -200,21 +200,24 @@ def same_typed_value(actual, expected) -> bool:
     return actual == expected
 
 
-_RETARGETABLE_WSD_SNAPSHOT_FIELDS = (
+_MUTABLE_RESUME_SNAPSHOT_FIELDS = (
     ("scheduler", "max_steps"),
     ("scheduler", "stable_steps"),
     ("scheduler", "decay_steps"),
     ("scheduler", "min_lr_ratio"),
     ("trainer", "max_steps"),
+    ("validation", "every_n_epochs"),
+    ("validation", "first_epoch"),
     ("validation", "expected_count"),
+    ("checkpointing", "every_n_epochs"),
 )
 
 
-def _without_retargetable_wsd_fields(snapshot: dict) -> dict:
+def _without_mutable_resume_fields(snapshot: dict) -> dict:
     if not isinstance(snapshot, dict):
         raise ValueError("protocol_snapshot must be a dictionary")
     normalized = copy.deepcopy(snapshot)
-    for section_name, field_name in _RETARGETABLE_WSD_SNAPSHOT_FIELDS:
+    for section_name, field_name in _MUTABLE_RESUME_SNAPSHOT_FIELDS:
         section = normalized.get(section_name)
         if not isinstance(section, dict) or field_name not in section:
             raise ValueError(
@@ -225,14 +228,14 @@ def _without_retargetable_wsd_fields(snapshot: dict) -> dict:
     return normalized
 
 
-def validate_wsd_retarget_protocol_snapshots(saved_snapshot: dict,
-                                             expected_snapshot: dict) -> None:
-    """Allow only endpoint-derived WSD fields to differ on full resume."""
-    saved_invariants = _without_retargetable_wsd_fields(saved_snapshot)
-    expected_invariants = _without_retargetable_wsd_fields(expected_snapshot)
+def validate_resume_protocol_snapshots(saved_snapshot: dict,
+                                       expected_snapshot: dict) -> None:
+    """Allow optimizer-independent schedule and cadence fields to differ."""
+    saved_invariants = _without_mutable_resume_fields(saved_snapshot)
+    expected_invariants = _without_mutable_resume_fields(expected_snapshot)
     if not same_typed_value(saved_invariants, expected_invariants):
         raise ValueError(
-            "checkpoint protocol snapshot mismatch outside retargetable WSD fields: "
+            "checkpoint protocol snapshot mismatch outside mutable resume fields: "
             f"saved={saved_snapshot!r}, expected={expected_snapshot!r}"
         )
 
@@ -274,7 +277,7 @@ def prepare_adamw_wsd_resume_state(checkpoint: dict, model: nn.Module,
         raise ValueError(
             "checkpoint is missing protocol_snapshot evidence required for full resume"
         )
-    validate_wsd_retarget_protocol_snapshots(
+    validate_resume_protocol_snapshots(
         saved_snapshot,
         expected_protocol_snapshot,
     )

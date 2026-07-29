@@ -246,7 +246,7 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, "positive"):
                 finetune._normalize_task_learning_rate(value, None)
 
-    def test_canonical_protocol_still_rejects_non_schedule_overrides(self):
+    def test_canonical_protocol_still_rejects_optimizer_overrides(self):
         locked = finetune.AdamWWSDConfig()
         mutations = {
             "task_learning_rate": 2e-4,
@@ -267,12 +267,12 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                         validation_every_n_epochs=2_000,
                     )
 
-        with self.assertRaisesRegex(ValueError, "new protocol_version"):
-            finetune._validate_canonical_protocol_contract(
-                finetune.PROTOCOL_VERSION,
-                locked,
-                validation_every_n_epochs=2_001,
-            )
+    def test_canonical_protocol_allows_validation_cadence_override(self):
+        finetune._validate_canonical_protocol_contract(
+            finetune.PROTOCOL_VERSION,
+            finetune.AdamWWSDConfig(),
+            validation_every_n_epochs=200,
+        )
 
     def test_noncanonical_protocol_allows_optimizer_and_cadence_overrides(self):
         finetune._validate_canonical_protocol_contract(
@@ -713,6 +713,36 @@ class FullPageOMRCheckpointTests(unittest.TestCase):
                     decay_steps=340_000,
                     min_lr_ratio=0.1,
                 ),
+            )
+
+        self.assertEqual(state.global_step, 40)
+
+    def test_full_resume_accepts_runtime_cadence_changes(self):
+        model = _TinyModel()
+        saved_snapshot = _protocol_snapshot(model)
+        expected_snapshot = _protocol_snapshot(
+            model,
+            validation__every_n_epochs=200,
+            validation__first_epoch=200,
+            validation__expected_count=240,
+            checkpointing__every_n_epochs=25,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint = Path(tmpdir) / "resume.ckpt"
+            torch.save(_full_resume_payload(model, snapshot=saved_snapshot), checkpoint)
+
+            state = finetune._validate_run_contract(
+                config=SimpleNamespace(data=SimpleNamespace(skip_steps=0)),
+                from_checkpoint=str(checkpoint),
+                starting_weights=None,
+                max_steps=4_000_000,
+                train=True,
+                protocol_version=finetune.PROTOCOL_VERSION,
+                source_curriculum_step=None,
+                source_checkpoint_sha256=None,
+                expected_protocol_snapshot=expected_snapshot,
+                expected_model=model,
+                optimizer_config=finetune.AdamWWSDConfig(),
             )
 
         self.assertEqual(state.global_step, 40)

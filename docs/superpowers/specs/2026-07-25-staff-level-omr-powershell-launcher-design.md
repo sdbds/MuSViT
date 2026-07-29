@@ -17,7 +17,7 @@ staff-level OMR 实验的可配置入口。脚本沿用 `2.full_page_omr.ps1` �
 
 - 默认运行 `musvit`、`catedrales`、`lora`、`8 x 128` patch grid、batch size 8。
 - 支持 `-DryRun`，只显示最终命令，不启动训练。
-- 支持从脚本配置区指定可选的 `data_path`，不要求修改
+- 支持从脚本配置区或 `-DataPath` 参数指定可选的 `data_path`，不要求修改
   `experiments/staff_level_omr/config.py`。
 - 设置仓库级 `PYTHONPATH`、`HF_HOME`、Hugging Face token、CUDA 与 uv 缓存环境。
 - 校验模型、数据集、训练方法、patch grid、batch size、起始评测 epoch 和学习率。
@@ -38,10 +38,10 @@ staff-level OMR 实验的可配置入口。脚本沿用 `2.full_page_omr.ps1` �
 
 ## PowerShell 接口
 
-脚本保留一个公开开关：
+脚本提供两个公开参数：
 
 ```powershell
-.\4.staff_level_omr.ps1 -DryRun
+.\4.staff_level_omr.ps1 [-DryRun] [-DataPath <directory>]
 ```
 
 实验参数集中在 `$Config`，运行时参数集中在 `$Runtime`。最终命令形态为：
@@ -62,8 +62,9 @@ uv run --frozen musvit staff-level-omr
 
 ## 锁文件修复
 
-只修复 `flash-attn` 的 `requires-dist` 数组与后续 `fonttools` package 之间缺失的
-闭合符号和 `[[package]]` 声明，不重新生成整个锁文件，避免无关依赖漂移。
+修复合并造成的缺失 package 边界、未闭合 marker 数组及重复的解析结果，再用
+`uv lock` 规范化已修复的锁文件。依赖版本继续由现有 `pyproject.toml` 约束决定，
+不借机升级或新增项目依赖。
 
 ## 验证
 
@@ -72,4 +73,3 @@ uv run --frozen musvit staff-level-omr
 3. 对临时 staff 数据目录运行 `-DryRun`，确认路径与最终 CLI 参数正确。
 4. 运行 staff-level CLI 相关 pytest，确认 `data_path` 覆盖与旧配置回退。
 5. 运行现有 staff/full-page CLI 发现测试，确认新参数未破坏命令注册。
-
